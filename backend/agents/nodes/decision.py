@@ -200,6 +200,13 @@ async def decision_node(state: AgentState) -> dict:
     entry_high = current_price * 1.02 if current_price else 0.0
     take_profit = current_price * 1.20 if current_price else 0.0
 
+    # 所有工具失败（current_price=0）→ 不推半成品决策卡，标记 intent 让 runner 发 error 事件
+    if not current_price:
+        return {
+            "decision_card": None,
+            "intent": "decision_failed",
+        }
+
     # 仓位 + 节奏
     pos_r = await _invoke(risk_based_position, entry_price=current_price or 100.0, stop_price=stop_loss or 92.0)
     cad_r = await _invoke(batch_build, total_budget=100000.0, batches=3, schedule="weekly", start_price=current_price or 100.0)

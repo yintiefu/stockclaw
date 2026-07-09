@@ -70,3 +70,33 @@ def test_build_decision_card_basic():
     assert card["code"] == "600519"
     assert card["name"] == "贵州茅台"
     assert card["current_price"] == 1685.0
+
+
+@pytest.mark.asyncio
+async def test_decision_node_returns_none_when_all_tools_fail(monkeypatch):
+    """所有工具失败（current_price=0）→ 不推半成品决策卡。"""
+    from agents.nodes.decision import decision_node
+
+    async def fail_invoke(tool, **kwargs):
+        return {
+            "tool": tool.name, "error": "mock failure",
+            "basis_type": "model_fallback",
+            "model_version": f"{tool.name}.v1",
+            "outputs": {"fallback_reason": "tool_error"},
+            "citations": [], "model_assumptions": [],
+        }
+
+    # StructuredTool 是 Pydantic model，不能 setattr；直接 mock _invoke（graph ↔ tool 的接缝）
+    monkeypatch.setattr("agents.nodes.decision._invoke", fail_invoke)
+
+    async def fake_lookup(code):
+        return code
+    monkeypatch.setattr("agents.nodes.decision._lookup_name", fake_lookup)
+
+    state = {
+        "messages": [{"role": "user", "content": "分析 600519"}],
+        "context_codes": ["600519"],
+    }
+    result = await decision_node(state)
+    assert result["decision_card"] is None
+    assert result["intent"] == "decision_failed"
