@@ -51,7 +51,7 @@ export async function downloadReport(id: string, name: string): Promise<void> {
   URL.revokeObjectURL(url);
 }
 
-async function request<T>(path: string, method: "GET" | "POST" | "DELETE" = "GET", body?: unknown): Promise<T> {
+async function request<T>(path: string, method: "GET" | "POST" | "PATCH" | "DELETE" = "GET", body?: unknown): Promise<T> {
   let resp: Response;
   const headers: Record<string, string> = { ...authHeaders() };
   const opts: RequestInit = { method };
@@ -272,4 +272,25 @@ export const api = {
   uploadReport: (name: string, contentB64: string) =>
     request<MyReport>("/myreports", "POST", { name, content_b64: contentB64 }),
   deleteReport: (id: string) => request<{ ok: boolean }>(`/myreports/${id}`, "DELETE"),
+};
+
+// ---- Agent 工作台 ----
+// 注意：agent chat 走 NDJSON 流式，不在 `request<T>` 包装内——直接用 fetch + ReadableStream
+// 见 hooks/useAgentStream.ts（Task 11）
+import type { AgentThread, DecisionCardData } from "@/lib/types/agent";
+// AgentChatReq 由 Task 11 的 useAgentStream 直接使用，此处不引
+
+export const agentApi = {
+  listThreads: () => get<AgentThread[]>("/agent/threads"),
+  createThread: (title: string, model: string) =>
+    request<AgentThread>("/agent/threads", "POST", { title, model }),
+  renameThread: (tid: string, title: string) =>
+    request<{ ok: boolean }>(`/agent/threads/${tid}`, "PATCH", { title }),
+  deleteThread: (tid: string) =>
+    request<{ ok: boolean }>(`/agent/threads/${tid}`, "DELETE"),
+  listMessages: (tid: string) => get<unknown[]>(`/agent/threads/${tid}/messages`),
+  saveDecision: (card: DecisionCardData) =>
+    request<{ id: string }>("/agent/decisions", "POST", card),
+  listDecisions: (code?: string) =>
+    get<unknown[]>(`/agent/decisions${code ? `?code=${code}` : ""}`),
 };
