@@ -42,14 +42,15 @@ def forward_pe_target(code: str, target_pe: float = 20.0, eps_year: str = "27e")
     """
     fv = astock.full_valuation(code)
     eps = fv.get(f"eps_{eps_year}")
-    if not eps:
-        raise DataUnavailable(f"{code} 缺 {eps_year} 一致 EPS，前向 PE 目标价不可计算")
+    if not eps or eps <= 0:
+        raise DataUnavailable(f"{code} 缺 {eps_year} 一致 EPS 或为非正 EPS，前向 PE 目标价不可计算")
     target_price = target_pe * eps
+    target_price_rounded = round(target_price, 2)
     return _contract(
         tool="forward_pe_target",
         inputs={"code": code, "target_pe": target_pe, "eps_year": eps_year},
         outputs={
-            "target_price": round(target_price, 2),
+            "target_price": target_price_rounded,
             "current_price": fv.get("price"),
             "current_pe": fv.get("pe_ttm"),
             "eps_used": eps,
@@ -58,7 +59,7 @@ def forward_pe_target(code: str, target_pe: float = 20.0, eps_year: str = "27e")
         model_version="forward_pe_target.v1",
         assumptions=[f"目标前向 PE = {target_pe}x", f"一致 EPS（{eps_year}）= {eps}"],
         citations=[{"source": "astock.full_valuation", "code": code}],
-        explanation=f"目标价 {target_price:.2f} = 目标 PE {target_pe}x × 一致 EPS {eps}（{eps_year}）",
+        explanation=f"目标价 {target_price_rounded:.2f} = 目标 PE {target_pe}x × 一致 EPS {eps}（{eps_year}）",
     )
 
 
@@ -79,7 +80,9 @@ def pe_percentile_revert(code: str, revert_to: float = 0.50, period: str = "近�
 
     # 选目标分位对应的 PE：用线性插值近似（p20/p50/p80 是已知锚点）
     current_pe = pe_metric["current"]
-    current_pct = pe_metric.get("percentile", 0.5)
+    if not current_pe:   # None or 0.0（亏损股 pe_ttm=0）
+        raise DataUnavailable(f"{code} current_pe 为 0/None，无法计算目标价")
+    current_pct = pe_metric.get("percentile", 50.0) / 100.0   # astock 返回 [0,100]，内部用 [0,1]
     p20, p50, p80 = pe_metric.get("p20"), pe_metric.get("p50"), pe_metric.get("p80")
     revert_pe = _interp_percentile(revert_to, p20, p50, p80, pe_metric.get("min"), pe_metric.get("max"))
     if revert_pe is None:
@@ -92,12 +95,13 @@ def pe_percentile_revert(code: str, revert_to: float = 0.50, period: str = "近�
 
     # 目标价 = 当前价 × (目标 PE / 当前 PE)
     target_price = current_price * revert_pe / current_pe
+    target_price_rounded = round(target_price, 2)
 
     return _contract(
         tool="pe_percentile_revert",
         inputs={"code": code, "revert_to": revert_to, "period": period},
         outputs={
-            "target_price": round(target_price, 2),
+            "target_price": target_price_rounded,
             "current_price": current_price,
             "current_percentile": current_pct,
             "revert_to": revert_to,
@@ -110,7 +114,7 @@ def pe_percentile_revert(code: str, revert_to: float = 0.50, period: str = "近�
             {"source": "astock.valuation_percentile", "code": code, "range": period},
             {"source": "astock.tencent_quote", "code": code},
         ],
-        explanation=f"当前 PE {current_pe}（{current_pct:.0%} 分位），回复到 {revert_to:.0%} 分位 PE {revert_pe:.2f}，目标价 {target_price:.2f}",
+        explanation=f"当前 PE {current_pe}（{current_pct:.0%} 分位），回复到 {revert_to:.0%} 分位 PE {revert_pe:.2f}，目标价 {target_price_rounded:.2f}",
     )
 
 
@@ -122,7 +126,9 @@ def pb_percentile_revert(code: str, revert_to: float = 0.50, period: str = "近�
         raise DataUnavailable(f"{code} 缺 PB 历史分位数据")
 
     current_pb = pb_metric["current"]
-    current_pct = pb_metric.get("percentile", 0.5)
+    if not current_pb:   # None or 0.0
+        raise DataUnavailable(f"{code} current_pb 为 0/None，无法计算目标价")
+    current_pct = pb_metric.get("percentile", 50.0) / 100.0   # astock 返回 [0,100]，内部用 [0,1]
     p20, p50, p80 = pb_metric.get("p20"), pb_metric.get("p50"), pb_metric.get("p80")
     revert_pb = _interp_percentile(revert_to, p20, p50, p80, pb_metric.get("min"), pb_metric.get("max"))
     if revert_pb is None:
@@ -134,12 +140,13 @@ def pb_percentile_revert(code: str, revert_to: float = 0.50, period: str = "近�
         raise DataUnavailable(f"{code} 当前价缺失")
 
     target_price = current_price * revert_pb / current_pb
+    target_price_rounded = round(target_price, 2)
 
     return _contract(
         tool="pb_percentile_revert",
         inputs={"code": code, "revert_to": revert_to, "period": period},
         outputs={
-            "target_price": round(target_price, 2),
+            "target_price": target_price_rounded,
             "current_price": current_price,
             "current_percentile": current_pct,
             "revert_to": revert_to,
@@ -152,7 +159,7 @@ def pb_percentile_revert(code: str, revert_to: float = 0.50, period: str = "近�
             {"source": "astock.valuation_percentile", "code": code, "range": period},
             {"source": "astock.tencent_quote", "code": code},
         ],
-        explanation=f"当前 PB {current_pb}（{current_pct:.0%} 分位），回复到 {revert_to:.0%} 分位 PB {revert_pb:.2f}，目标价 {target_price:.2f}",
+        explanation=f"当前 PB {current_pb}（{current_pct:.0%} 分位），回复到 {revert_to:.0%} 分位 PB {revert_pb:.2f}，目标价 {target_price_rounded:.2f}",
     )
 
 

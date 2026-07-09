@@ -43,7 +43,7 @@ def test_pe_percentile_revert_basic():
     mock_pct = {
         "metrics": {
             "pe_ttm": {
-                "current": 30.0, "percentile": 0.80,
+                "current": 30.0, "percentile": 80.0,   # astock 返回 [0, 100]
                 "p20": 15.0, "p50": 22.0, "p80": 32.0, "min": 10.0, "max": 40.0, "n": 1200,
             }
         }
@@ -55,5 +55,32 @@ def test_pe_percentile_revert_basic():
     assert result["basis_type"] == "model"
     # 目标价 = 当前价 × (50 分位 PE / 当前 PE) = 1685 × (22 / 30) ≈ 1235.67
     assert result["outputs"]["target_price"] == pytest.approx(1685.0 * 22.0 / 30.0, rel=1e-3)
-    assert result["outputs"]["current_percentile"] == 0.80
+    assert result["outputs"]["current_percentile"] == 0.80   # 内部 /100 后应等于 0.80
     assert result["outputs"]["revert_to"] == 0.50
+
+
+def test_pe_percentile_revert_zero_pe_raises_data_unavailable():
+    """亏损股 current_pe=0 → 抛 DataUnavailable（防 ZeroDivisionError）。"""
+    mock_pct = {
+        "metrics": {
+            "pe_ttm": {
+                "current": 0.0, "percentile": 0.0,
+                "p20": 15.0, "p50": 22.0, "p80": 32.0, "min": 10.0, "max": 40.0, "n": 1200,
+            }
+        }
+    }
+    mock_quote = {"600519": {"price": 1685.0, "pe_ttm": 0.0, "name": "贵州茅台"}}
+    with patch("quant.valuation.astock.valuation_percentile", return_value=mock_pct), \
+         patch("quant.valuation.astock.tencent_quote", return_value=mock_quote):
+        with pytest.raises(v.DataUnavailable) as exc_info:
+            v.pe_percentile_revert("600519", revert_to=0.50)
+        assert "current_pe" in str(exc_info.value)
+
+
+def test_forward_pe_target_negative_eps_raises_data_unavailable():
+    """亏损公司一致 EPS<0 → 抛 DataUnavailable（防负目标价）。"""
+    with patch("quant.valuation.astock.full_valuation",
+               return_value=_mock_full_valuation(eps_27e=-5.0)):
+        with pytest.raises(v.DataUnavailable) as exc_info:
+            v.forward_pe_target("600519", target_pe=20.0, eps_year="27e")
+        assert "非正 EPS" in str(exc_info.value)
