@@ -39,6 +39,11 @@ export function AgentSidebar() {
     useAgentStore.setState((s) => ({
       messagesByThread: { ...s.messagesByThread, [tid]: [] },
     }));
+    // 立刻同步到后端——否则后续 saveMessage 会 FK 违反（thread_id 不存在）
+    // 失败时本地仍可用，但刷新会丢；console.error 让用户能定位
+    agentApi.createThread("新会话", "", tid).catch((e) => {
+      console.error("newThread 后端创建失败：", e);
+    });
   };
 
   const switchThread = async (tid: string) => {
