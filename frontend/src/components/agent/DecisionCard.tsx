@@ -25,7 +25,9 @@ export function DecisionCard({ card }: { card: DecisionCardData }) {
   const saveDecision = useAgentStore((s) => s.saveDecision);
 
   const basis = BASIS_COLORS[card.basis_type];
-  const changePct = ((card.target_price - card.current_price) / card.current_price) * 100;
+  const changePct = card.current_price > 0
+    ? ((card.target_price - card.current_price) / card.current_price) * 100
+    : 0;
 
   const handleSave = () => {
     saveDecision(card);
