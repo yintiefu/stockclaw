@@ -55,7 +55,10 @@ async def test_run_agent_emits_decision_artifact_for_decision_intent(monkeypatch
             "stop_loss": 1550.0, "take_profit": 2080.0, "cadence": [],
             "basis_type": "model", "model_versions_json": {},
             "assumptions": [], "citations": [], "explanation": "测试"
-        }}
+        }, "tool_traces": [
+            {"tool": "forward_pe_target", "status": "ok", "args": {"code": "600519"}},
+            {"tool": "atr_stop", "status": "ok", "args": {"code": "600519"}},
+        ]}
 
     # 真 SSE 流：吐 "分析中" + [DONE]
     sse_lines = [_sse_delta("分析中"), "data: [DONE]"]
@@ -110,3 +113,71 @@ async def test_run_agent_no_decision_card_for_general_intent(monkeypatch):
     assert "done" in types
     text_events = [e for e in events if e["type"] == "text_delta"]
     assert any("你好" in e["text"] for e in text_events)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_streams_llm_before_graph_finishes(monkeypatch):
+    """LLM 流必须在 graph 完成前就开始——验证并发。"""
+    import asyncio
+    graph_done_time = []
+    llm_start_time = []
+
+    async def slow_graph(input_state):
+        await asyncio.sleep(0.5)  # 模拟 5 工具 × 0.1s
+        graph_done_time.append(asyncio.get_event_loop().time())
+        return {"intent": "decision", "decision_card": None, "tool_traces": []}
+
+    async def fake_stream(*args, **kwargs):
+        llm_start_time.append(asyncio.get_event_loop().time())
+        yield "首字"
+
+    _patch_httpx_stream(monkeypatch, [_sse_delta("首字"), "data: [DONE]"])
+    monkeypatch.setattr("runner.agent_graph.ainvoke", slow_graph)
+    monkeypatch.setattr("runner._stream_llm_text", fake_stream)
+
+    req = runner.AgentChatReq(
+        thread_id=None,
+        messages=[{"role": "user", "content": "分析"}],
+        llm={"provider": "", "baseURL": "http://x", "apiKey": "k", "model": "m"},
+    )
+    events = []
+    async for ev in runner.run_agent(req):
+        events.append(ev)
+
+    # LLM 必须在 graph 完成前开始
+    assert llm_start_time and graph_done_time
+    assert llm_start_time[0] < graph_done_time[0], "LLM 应在 graph 完成前开始流式"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_emits_error_when_decision_fails(monkeypatch):
+    """Task 2 的 guard 触发时（intent=decision_failed），runner 必须发 error 事件。"""
+    async def failing_graph(input_state):
+        return {
+            "intent": "decision_failed",
+            "decision_card": None,
+            "tool_traces": [
+                {"tool": "forward_pe_target", "status": "error", "args": {}},
+            ],
+        }
+
+    _patch_httpx_stream(monkeypatch, [_sse_delta("分析中..."), "data: [DONE]"])
+    monkeypatch.setattr("runner.agent_graph.ainvoke", failing_graph)
+
+    req = runner.AgentChatReq(
+        thread_id=None,
+        messages=[{"role": "user", "content": "分析 XXXXXX"}],
+        llm={"provider": "", "baseURL": "http://x", "apiKey": "k", "model": "m"},
+    )
+    events = []
+    async for ev in runner.run_agent(req):
+        events.append(ev)
+
+    types = [e["type"] for e in events]
+    assert "error" in types, f"决策失败应发 error 事件，实际 {types}"
+    err = next(e for e in events if e["type"] == "error")
+    assert "数据失败" in err["message"] or "无法生成" in err["message"]
+    # 失败时仍应推 tool_trace（让用户看到哪些工具挂了）
+    assert "tool_trace" in types
+    # done 必须最后
+    assert types[-1] == "done"

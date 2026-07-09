@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import uuid
@@ -85,37 +86,49 @@ async def _stream_llm_text(cfg: dict, system_prompt: str, user_messages: list[di
 
 
 async def run_agent(req: AgentChatReq) -> AsyncGenerator[dict, None]:
-    """主入口：跑 graph + 流式输出 NDJSON 事件。"""
+    """运行 agent，吐 NDJSON 事件流。
+
+    Task 4 改造：graph 与 LLM 并发，消除 5s 首字延迟。
+    tool_trace 非实时（一次性 dump）；decision_failed 时发 error 事件。
+    """
     decision_id = uuid.uuid4().hex
     try:
-        # Step 1：调 graph 拿 decision_card
         graph_state = {
             "messages": req.messages,
             "context_codes": req.context_codes,
             "style": req.style,
             "thread_id": req.thread_id or decision_id,
         }
-        graph_result = await agent_graph.ainvoke(graph_state)
-        decision_card = graph_result.get("decision_card")
 
-        # 流式 LLM 文本（决策卡作 context 加强）
-        if decision_card:
-            summary = (
-                f"基于工具结果：目标价 {decision_card.get('target_price')}，"
-                f"止损 {decision_card.get('stop_loss')}，止盈 {decision_card.get('take_profit')}，"
-                f"依据 {decision_card.get('basis_type')}。"
-            )
-            # 注：用 user 角色 + 显式前缀，避免伪造 assistant turn 让 LLM 误以为是自己刚说的
-            enhanced_messages = list(req.messages) + [{
-                "role": "user", "content": f"[系统注入·工具结果摘要] {summary}"
-            }]
-        else:
-            enhanced_messages = req.messages
+        # 并发：graph 在后台跑，立刻开始流 LLM
+        graph_task = asyncio.create_task(agent_graph.ainvoke(graph_state))
 
+        # LLM 流式（不依赖 graph 结果——决策卡自己有结构化数字）
         async for text in _stream_llm_text(
-            req.llm.model_dump(), SYSTEM_PROMPT_AGENT, enhanced_messages, req.context_codes,
+            req.llm.model_dump(), SYSTEM_PROMPT_AGENT, req.messages, req.context_codes,
         ):
             yield {"type": "text_delta", "text": text}
+
+        # 等 graph 完成（如果还没好）
+        graph_result = await graph_task
+        decision_card = graph_result.get("decision_card")
+        graph_intent = graph_result.get("intent")
+
+        # 评审 #1：工具全失败时显式发 error，不静默 done
+        if graph_intent == "decision_failed":
+            # 先推 traces（让用户看到哪些工具挂了）
+            for trace in (graph_result.get("tool_traces") or []):
+                yield {"type": "tool_trace", **trace}
+            yield {
+                "type": "error",
+                "message": "获取股票数据失败，无法生成决策卡。请检查代码或稍后重试。",
+            }
+            yield {"type": "done", "summary": {"thread_id": req.thread_id or decision_id, "failed": True}}
+            return
+
+        # 推 tool_trace 事件（非实时——一次性 dump）
+        for trace in (graph_result.get("tool_traces") or []):
+            yield {"type": "tool_trace", **trace}
 
         # 推决策卡 artifact
         if decision_card:
