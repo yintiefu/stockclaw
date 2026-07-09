@@ -78,13 +78,17 @@ async def test_decision_node_returns_none_when_all_tools_fail(monkeypatch):
     from agents.nodes.decision import decision_node
 
     async def fail_invoke(tool, **kwargs):
-        return {
-            "tool": tool.name, "error": "mock failure",
-            "basis_type": "model_fallback",
-            "model_version": f"{tool.name}.v1",
-            "outputs": {"fallback_reason": "tool_error"},
-            "citations": [], "model_assumptions": [],
-        }
+        return (
+            {
+                "tool": tool.name, "error": "mock failure",
+                "basis_type": "model_fallback",
+                "model_version": f"{tool.name}.v1",
+                "outputs": {"fallback_reason": "tool_error"},
+                "citations": [], "model_assumptions": [],
+            },
+            {"tool": tool.name, "status": "error", "args": kwargs,
+             "summary": "mock failure"},
+        )
 
     # StructuredTool 是 Pydantic model，不能 setattr；直接 mock _invoke（graph ↔ tool 的接缝）
     monkeypatch.setattr("agents.nodes.decision._invoke", fail_invoke)
@@ -100,3 +104,78 @@ async def test_decision_node_returns_none_when_all_tools_fail(monkeypatch):
     result = await decision_node(state)
     assert result["decision_card"] is None
     assert result["intent"] == "decision_failed"
+
+
+@pytest.mark.asyncio
+async def test_decision_node_collects_tool_traces(monkeypatch):
+    """decision_node 应把每次工具调用的 tool/status/args 收集到 state['tool_traces']。"""
+    from agents.nodes.decision import decision_node
+
+    # 模拟 _invoke 返回 (result, trace) 元组——Task 3 改完 _invoke 才会这样返回
+    # 这个测试在改实现之前会 FAIL（_invoke 当前只返回 result dict）
+    async def fake_target_invoke(tool, **kwargs):
+        return (
+            {
+                "tool": "forward_pe_target", "basis_type": "model",
+                "model_version": "forward_pe_target.v1",
+                "outputs": {"target_price": 1900.0, "current_price": 1685.0},
+                "citations": [], "model_assumptions": [],
+            },
+            {"tool": "forward_pe_target", "status": "ok", "args": kwargs, "summary": "目标价 1900.0"},
+        )
+
+    async def fake_stop_invoke(tool, **kwargs):
+        return (
+            {
+                "tool": "atr_stop", "basis_type": "model",
+                "model_version": "atr_stop.v1",
+                "outputs": {"stop_price": 1550.0, "current_price": 1685.0},
+                "citations": [], "model_assumptions": [],
+            },
+            {"tool": "atr_stop", "status": "ok", "args": kwargs, "summary": "止损 1550.0"},
+        )
+
+    async def fake_other_invoke(tool, **kwargs):
+        return (
+            {
+                "tool": tool.name, "basis_type": "model_fallback",
+                "model_version": f"{tool.name}.v1",
+                "outputs": {},
+                "citations": [], "model_assumptions": [],
+            },
+            {"tool": tool.name, "status": "ok", "args": kwargs},
+        )
+
+    # 顺序：decision_node 调 _invoke 的顺序是 target → stop → entry → pos → cad
+    invoke_mocks = [fake_target_invoke, fake_stop_invoke, fake_other_invoke,
+                    fake_other_invoke, fake_other_invoke]
+    call_idx = {"i": 0}
+
+    async def mock_invoke(tool, **kwargs):
+        i = call_idx["i"]
+        call_idx["i"] += 1
+        if i < len(invoke_mocks):
+            return await invoke_mocks[i](tool, **kwargs)
+        return await fake_other_invoke(tool, **kwargs)
+
+    # mock _invoke 而非 tool.ainvoke（StructuredTool 是 Pydantic model 不让 set attr，Task 2 已验证）
+    monkeypatch.setattr("agents.nodes.decision._invoke", mock_invoke)
+
+    async def fake_lookup(code):
+        return "测试"
+    monkeypatch.setattr("agents.nodes.decision._lookup_name", fake_lookup)
+
+    state = {
+        "messages": [{"role": "user", "content": "分析 600519"}],
+        "context_codes": ["600519"],
+    }
+    result = await decision_node(state)
+    traces = result.get("tool_traces") or []
+    assert isinstance(traces, list)
+    assert len(traces) == 5, f"期望 5 条 trace，实际 {len(traces)}"
+    tools_called = [t["tool"] for t in traces]
+    assert "forward_pe_target" in tools_called
+    assert "atr_stop" in tools_called
+    for t in traces:
+        assert t["status"] in ("ok", "error")
+        assert "args" in t

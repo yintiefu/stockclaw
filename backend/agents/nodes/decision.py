@@ -133,18 +133,43 @@ def build_decision_card(
 _CODE_PATTERN = re.compile(r"\b(\d{6}|[A-Z]{1,5})\b")
 
 
-async def _invoke(tool, **kwargs) -> dict | None:
-    """安全调用 tool，失败返回降级 dict。"""
+async def _invoke(tool, **kwargs) -> tuple[dict, dict]:
+    """安全调用 tool，失败返回降级 dict。同时返回 trace 记录。
+
+    Returns:
+        (result, trace) 元组。
+        - result: 工具产物（成功时为工具输出，失败时为降级 dict）。
+        - trace: {tool, status, args, summary?} 供 runner emit 为 NDJSON tool_trace 事件。
+    """
+    trace: dict[str, Any] = {
+        "tool": tool.name,
+        "status": "ok",
+        "args": kwargs,
+    }
     try:
-        return await tool.ainvoke(kwargs)
+        result = await tool.ainvoke(kwargs)
+        # 加 summary：从前几个 outputs 字段拼一句话（用户面板预览用）
+        outs = (result or {}).get("outputs") or {}
+        if "target_price" in outs:
+            trace["summary"] = f"目标价 {outs['target_price']}"
+        elif "stop_price" in outs:
+            trace["summary"] = f"止损 {outs['stop_price']}"
+        elif "shares" in outs:
+            try:
+                trace["summary"] = f"{outs['shares']:.0f} 股"
+            except (TypeError, ValueError):
+                trace["summary"] = f"{outs['shares']} 股"
+        return result, trace
     except Exception as e:
+        trace["status"] = "error"
+        trace["summary"] = f"{type(e).__name__}: {e}"
         return {
             "tool": tool.name, "error": f"{tool.name} failed: {e}",
             "basis_type": "model_fallback",
             "model_version": f"{tool.name}.v1",
             "outputs": {"fallback_reason": f"tool_error: {type(e).__name__}"},
             "citations": [], "model_assumptions": [f"工具失败：{e}"],
-        }
+        }, trace
 
 
 def _extract_code_from_messages(msgs) -> str | None:
@@ -184,9 +209,9 @@ async def decision_node(state: AgentState) -> dict:
         return {"decision_card": None}
 
     # 并发调工具（每个工具内部走 Rate Limiter + asyncio.to_thread）
-    target_r = await _invoke(forward_pe_target, code=code, target_pe=20.0, eps_year="27e")
-    stop_r = await _invoke(atr_stop, code=code, period=14, multiplier=2.0)
-    entry_r = await _invoke(pe_percentile_revert, code=code, revert_to=0.50)
+    target_r, target_t = await _invoke(forward_pe_target, code=code, target_pe=20.0, eps_year="27e")
+    stop_r, stop_t = await _invoke(atr_stop, code=code, period=14, multiplier=2.0)
+    entry_r, entry_t = await _invoke(pe_percentile_revert, code=code, revert_to=0.50)
 
     # 取当前价 + 名称
     current_price = (target_r or {}).get("outputs", {}).get("current_price") or \
@@ -205,11 +230,12 @@ async def decision_node(state: AgentState) -> dict:
         return {
             "decision_card": None,
             "intent": "decision_failed",
+            "tool_traces": [target_t, stop_t, entry_t],
         }
 
     # 仓位 + 节奏
-    pos_r = await _invoke(risk_based_position, entry_price=current_price or 100.0, stop_price=stop_loss or 92.0)
-    cad_r = await _invoke(batch_build, total_budget=100000.0, batches=3, schedule="weekly", start_price=current_price or 100.0)
+    pos_r, pos_t = await _invoke(risk_based_position, entry_price=current_price or 100.0, stop_price=stop_loss or 92.0)
+    cad_r, cad_t = await _invoke(batch_build, total_budget=100000.0, batches=3, schedule="weekly", start_price=current_price or 100.0)
     cadence = (cad_r or {}).get("outputs", {}).get("plan") or []
 
     # 合并
@@ -225,4 +251,5 @@ async def decision_node(state: AgentState) -> dict:
         },
         explanation=f"基于前向 PE 目标价 {target_price:.2f} + ATR 止损 {stop_loss:.2f} + 分批 3 期建仓",
     )
-    return {"decision_card": card}
+    tool_traces = [target_t, stop_t, entry_t, pos_t, cad_t]
+    return {"decision_card": card, "tool_traces": tool_traces}

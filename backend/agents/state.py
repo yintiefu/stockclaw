@@ -23,3 +23,4 @@ class AgentState(TypedDict, total=False):
     thread_id: str
     # 流式输出用：runner 维护，不进 graph 传递
     decision_card: dict | None
+    tool_traces: list[dict]  # [{tool, status, args, summary?}, ...]
