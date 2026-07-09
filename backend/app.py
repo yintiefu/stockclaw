@@ -20,6 +20,8 @@ from pydantic import BaseModel
 import astock
 import chat_legacy as chat_layer
 import cli_runtime
+import runner
+from runner import AgentChatReq, run_agent
 import gstock
 import newsradar
 import portfolio as pf
@@ -118,6 +120,37 @@ def chat(req: ChatReq):
             yield json.dumps({"type": "error", "message": f"对话失败：{e}"}, ensure_ascii=False) + "\n"
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+
+@app.post("/api/agent/chat")
+async def agent_chat(req: AgentChatReq):
+    """AI 原生 Agent 工作台入口——NDJSON 流（text_delta / tool_trace / decision_artifact / done / error）。
+
+    鉴权失败：复用 _require_api_key 中间件，自动 401 + JSON（不进 SSE 流）。
+    CLI 模式（provider=cli-*）：返回 400 + JSON，不挂 SSE（提示前端配 API 模型）。
+    """
+    if not req.messages:
+        raise HTTPException(400, "messages 不能为空")
+    if not req.llm.model:
+        raise HTTPException(400, "缺少模型配置")
+
+    is_cli = req.llm.provider.startswith("cli-")
+    if is_cli:
+        raise HTTPException(
+            400,
+            "Agent 工作台需要 API 接入的模型工具链。请前往「接入 AI」页配置 API Key 或更换模型。",
+        )
+    if not req.llm.apiKey or not req.llm.baseURL:
+        raise HTTPException(400, "缺少 Base URL 或 API Key，请先在「接入 AI」里填写")
+
+    async def gen():
+        try:
+            async for ev in run_agent(req):
+                yield json.dumps(ev, ensure_ascii=False) + "\n"
+        except Exception as e:
+            yield json.dumps({"type": "error", "message": f"agent 流失败：{e}"}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(gen(), media_type="text/x-ndjson")
 
 
 class HoldingIn(BaseModel):
