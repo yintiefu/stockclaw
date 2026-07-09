@@ -1,6 +1,6 @@
 import { useCallback, useRef } from "react";
 import { useAgentStore } from "@/lib/stores/agent";
-import { authHeaders } from "@/lib/api";
+import { agentApi, authHeaders } from "@/lib/api";
 import { loadLlm } from "@/lib/llm";
 import type { AgentEvent } from "@/lib/types/agent";
 
@@ -40,12 +40,33 @@ export function useAgentStream() {
   }, []);
 
   const send = useCallback(async (opts: SendOpts) => {
-    const tid = opts.threadId || `local-${Date.now()}`;
+    // 1. 解析 / 生成 tid：没有 threadId 就 crypto.randomUUID 生成（评审 #6 简化）
+    let tid = opts.threadId;
+    if (!tid) {
+      tid = (globalThis.crypto?.randomUUID?.() ?? `local-${Date.now()}`);
+      const title = opts.content.slice(0, 30) + (opts.content.length > 30 ? "..." : "");
+      // 本地先建占位
+      useAgentStore.setState((s) => ({
+        threads: [
+          { id: tid!, title, model: "", created_at: Date.now(), updated_at: Date.now() },
+          ...s.threads,
+        ],
+        currentThreadId: tid,
+        messagesByThread: { ...s.messagesByThread, [tid!]: [] },
+      }));
+      // 后端建——立刻持久化，刷新页面也能看到
+      try {
+        await agentApi.createThread(title, "", tid);
+      } catch (e) {
+        console.error("createThread 失败，降级本地：", e);
+      }
+    }
+
     const userMsgId = `u-${Date.now()}`;
     const assistantMsgId = `a-${Date.now() + 1}`;
     const store = useAgentStore.getState();
 
-    // 1. 写入用户消息 + 占位 assistant 消息（streaming: true）
+    // 2. 写入用户消息 + 占位 assistant 消息（streaming: true）
     store.appendMessage(tid, {
       id: userMsgId, role: "user", content: opts.content, toolTraces: [],
     });
@@ -57,7 +78,7 @@ export function useAgentStream() {
       streaming: { active: true, toolCalls: [] },
     });
 
-    // 2. 构造请求
+    // 3. 构造请求
     const llm = loadLlm();
     if (!llm) {
       opts.onError?.("未配置 LLM");
@@ -66,12 +87,21 @@ export function useAgentStream() {
       return;
     }
     const body = {
-      thread_id: opts.threadId,
+      thread_id: tid,
       messages: [{ role: "user", content: opts.content }],
       context_codes: opts.contextCodes,
       llm,
       style: opts.style,
     };
+
+    // 评审 #4：user 消息在 SSE fetch 之前归档——断网 / 关 tab 都不会丢
+    if (!tid.startsWith("local-")) {
+      try {
+        await agentApi.saveMessage(tid, { role: "user", content: opts.content });
+      } catch (e) {
+        console.error("user 消息归档失败：", e);
+      }
+    }
 
     abortRef.current = new AbortController();
     let response: Response;
@@ -93,7 +123,7 @@ export function useAgentStream() {
       return;
     }
 
-    // 3. 鉴权失败 / CLI 拒绝：HTTP 4xx + JSON（不是 SSE 流）
+    // 4. 鉴权失败 / CLI 拒绝：HTTP 4xx + JSON（不是 SSE 流）
     if (!response.ok) {
       let detail = `HTTP ${response.status}`;
       try {
@@ -106,7 +136,7 @@ export function useAgentStream() {
       return;
     }
 
-    // 4. 流式解析 NDJSON：跨 chunk line buffer + TextDecoder{stream:true}
+    // 5. 流式解析 NDJSON：跨 chunk line buffer + TextDecoder{stream:true}
     const reader = response.body?.getReader();
     if (!reader) {
       opts.onError?.("无响应体");
@@ -161,6 +191,18 @@ export function useAgentStream() {
         }
       }
     } finally {
+      // assistant 归档：无论成功 / 失败，只要拿到内容就存
+      if (!tid.startsWith("local-")) {
+        try {
+          const finalContent =
+            useAgentStore.getState().messagesByThread[tid]?.find((m) => m.id === assistantMsgId)?.content || "";
+          if (finalContent) {
+            await agentApi.saveMessage(tid, { role: "assistant", content: finalContent });
+          }
+        } catch (e) {
+          console.error("assistant 归档失败：", e);
+        }
+      }
       useAgentStore.getState().finishStreaming(tid, assistantMsgId);
       useAgentStore.setState({ streaming: { active: false, toolCalls: [] } });
       opts.onDone?.(doneSummary || {});

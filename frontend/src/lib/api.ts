@@ -282,13 +282,16 @@ import type { AgentThread, DecisionCardData } from "@/lib/types/agent";
 
 export const agentApi = {
   listThreads: () => get<AgentThread[]>("/agent/threads"),
-  createThread: (title: string, model: string) =>
-    request<AgentThread>("/agent/threads", "POST", { title, model }),
+  // 第三个 id 形参：crypto.randomUUID() 生成的 tid 直接给后端（评审 #6 简化）
+  createThread: (title: string, model: string, id?: string) =>
+    request<AgentThread>("/agent/threads", "POST", id ? { id, title, model } : { title, model }),
   renameThread: (tid: string, title: string) =>
     request<{ ok: boolean }>(`/agent/threads/${tid}`, "PATCH", { title }),
   deleteThread: (tid: string) =>
     request<{ ok: boolean }>(`/agent/threads/${tid}`, "DELETE"),
   listMessages: (tid: string) => get<unknown[]>(`/agent/threads/${tid}/messages`),
+  saveMessage: (tid: string, message: { role: string; content: string }) =>
+    request<{ id: string }>(`/agent/threads/${tid}/messages`, "POST", message),
   saveDecision: (card: DecisionCardData) =>
     request<{ id: string }>("/agent/decisions", "POST", card),
   listDecisions: (code?: string) =>

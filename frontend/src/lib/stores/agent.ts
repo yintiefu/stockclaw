@@ -10,6 +10,7 @@ interface AgentState {
 
   // actions
   setThreads: (threads: AgentThread[]) => void;
+  loadThreads: (threads: AgentThread[]) => void;
   setCurrentThread: (tid: string | null) => void;
   appendMessage: (tid: string, msg: ChatMessage) => void;
   appendTextDelta: (tid: string, msgId: string, text: string) => void;
@@ -30,6 +31,7 @@ export const useAgentStore = create<AgentState>((set) => ({
   savedDecisions: [],
 
   setThreads: (threads) => set({ threads }),
+  loadThreads: (threads) => set({ threads }),
   setCurrentThread: (tid) => set({ currentThreadId: tid }),
 
   appendMessage: (tid, msg) =>
