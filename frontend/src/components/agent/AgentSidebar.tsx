@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Plus, MessageSquare, Trash2, Pencil, Check, X } from "lucide-react";
 import { useAgentStore } from "@/lib/stores/agent";
 import { agentApi } from "@/lib/api";
@@ -12,10 +12,21 @@ export function AgentSidebar() {
   const loadThreads = useAgentStore((s) => s.loadThreads);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState("");
+  const loadedOnce = useRef(false);
 
   // mount 时拉历史会话
   useEffect(() => {
-    agentApi.listThreads().then((items: AgentThread[]) => loadThreads(items)).catch(() => {});
+    agentApi.listThreads()
+      .then((items: AgentThread[]) => {
+        if (loadedOnce.current) return;  // 后到的响应丢弃，避免覆盖新建的 thread
+        loadedOnce.current = true;
+        // 保留用户刚 click 新建但后端还没建好的 local-xxx thread
+        const localOnly = useAgentStore.getState().threads.filter(
+          (t) => t.id.startsWith("local-") || !items.some((r) => r.id === t.id)
+        );
+        loadThreads([...items, ...localOnly]);
+      })
+      .catch(() => {});
   }, [loadThreads]);
 
   const newThread = () => {
@@ -65,7 +76,17 @@ export function AgentSidebar() {
   };
 
   const remove = async (tid: string) => {
-    loadThreads(useAgentStore.getState().threads.filter((x) => x.id !== tid));
+    const state = useAgentStore.getState();
+    loadThreads(state.threads.filter((x) => x.id !== tid));
+    // 清理孤儿状态
+    useAgentStore.setState((s) => {
+      const newMessages = { ...s.messagesByThread };
+      delete newMessages[tid];
+      return {
+        messagesByThread: newMessages,
+        currentThreadId: s.currentThreadId === tid ? null : s.currentThreadId,
+      };
+    });
     if (!tid.startsWith("local-")) {
       try { await agentApi.deleteThread(tid); } catch (e) {
         console.error("deleteThread 失败：", e);
