@@ -97,9 +97,18 @@ def remove_closed(index: int) -> dict:
 
 
 def get_portfolio() -> dict:
-    """读持仓 + 实时行情，算每笔与汇总的市值/浮动盈亏。"""
+    """读持仓 + 实时行情，算每笔与汇总的市值/浮动盈亏。
+
+    totals 字段含 spec §8 的扩展字段：
+    - available_cash：可用现金（用户手输，给 risk_based_position 用）
+    - risk_tolerance_pct：单笔风险容忍度，默认 1%
+    - total_equity_override：手动覆盖总净值（含港股美股时填）
+    老无这些字段的 JSON 兼容默认值。
+    """
     with _LOCK:
         d = _load()
+    # 用户在 portfolio.json 手填的 totals（spec §8 扩展字段）；老 JSON 无此键 → 空字典兼容
+    user_totals = d.get("totals") or {}
     hs = d.get("holdings", [])
     rows, tmv, tcost = [], 0.0, 0.0
     if hs:
@@ -129,6 +138,10 @@ def get_portfolio() -> dict:
             "market_value": round(tmv, 2), "cost": round(tcost, 2),
             "pnl": round(total_pnl, 2),
             "pnl_pct": round(total_pnl / tcost * 100, 2) if tcost else 0.0,
+            # spec §8 漏洞五修补：账户基础字段（risk_based_position 用）
+            "available_cash": float(user_totals.get("available_cash", 0.0) or 0.0),
+            "risk_tolerance_pct": float(user_totals.get("risk_tolerance_pct", 0.01) or 0.01),
+            "total_equity_override": user_totals.get("total_equity_override"),
         },
         "closed": closed,
         "realized_pnl": round(sum(c.get("pnl", 0) for c in closed), 2),
