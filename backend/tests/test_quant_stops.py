@@ -1,4 +1,5 @@
 """quant.stops 单测——含 A 股主路径 + 美港股 model_fallback 降级链。"""
+import json
 from unittest.mock import patch
 
 import pytest
@@ -82,3 +83,22 @@ def test_risk_based_position_falls_back_to_pct_when_no_cash():
     assert result["basis_type"] == "model_fallback"
     assert "shares" not in result["outputs"] or result["outputs"]["shares"] is None
     assert "position_pct" in result["outputs"]
+
+
+def test_risk_based_position_keeps_explicit_total_equity_when_pct_missing(tmp_path, monkeypatch):
+    """显式传 total_equity + 缺 risk_tolerance_pct → 不应被 portfolio.json 覆盖。"""
+    # 构造一个 portfolio.json 让 available_cash=999999；如果代码错误地覆盖，断言会失败
+    pf = tmp_path / "portfolio.json"
+    pf.write_text(json.dumps({"totals": {"available_cash": 999999.0, "risk_tolerance_pct": 0.5}}))
+    monkeypatch.setattr(s, "_PF_FILE", str(pf))
+
+    result = s.risk_based_position(
+        entry_price=100.0, stop_price=92.0,
+        total_equity=100000.0,   # 显式传
+        # risk_tolerance_pct 缺省，应从 portfolio.json 读 0.5
+    )
+    assert result["basis_type"] == "model"
+    # shares = 100000 × 0.5 / 8 = 6250；如果 total_equity 被覆盖为 999999，结果会不同
+    assert result["outputs"]["shares"] == pytest.approx(6250.0, rel=1e-3)
+    assert result["inputs"]["total_equity"] == 100000.0  # 没被覆盖
+    assert result["inputs"]["risk_tolerance_pct"] == 0.5  # 从 portfolio.json 读
