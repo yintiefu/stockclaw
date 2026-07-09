@@ -150,6 +150,43 @@ async def run_agent(req: AgentChatReq) -> AsyncGenerator[dict, None]:
                 "type": "citations",
                 "items": decision_card.get("citations") or [],
             }
+            # 入库 decisions 表（Phase 3 收益追踪用）
+            try:
+                from persistence import decisions as decisions_dao, threads as threads_dao
+                # 评审 #2：req.thread_id 为空时先建 thread 行，避免 FK 违反
+                effective_tid = req.thread_id
+                if not effective_tid:
+                    effective_tid = await threads_dao.create_thread(
+                        title=f"决策 · {decision_card.get('code', '')}",
+                        model=req.llm.model,
+                    )
+                else:
+                    # 已传 thread_id 但可能不在 threads 表（前端没先建）→ 兜底建
+                    if not await threads_dao.get_thread(effective_tid):
+                        await threads_dao.create_thread(
+                            tid=effective_tid,
+                            title=f"决策 · {decision_card.get('code', '')}",
+                            model=req.llm.model,
+                        )
+                await decisions_dao.create_decision(
+                    thread_id=effective_tid,
+                    code=decision_card.get("code", ""),
+                    name=decision_card.get("name"),
+                    target_price=decision_card.get("target_price") or 0.0,
+                    entry_low=decision_card.get("entry_low") or 0.0,
+                    entry_high=decision_card.get("entry_high") or 0.0,
+                    stop_loss=decision_card.get("stop_loss") or 0.0,
+                    take_profit=decision_card.get("take_profit") or 0.0,
+                    cadence=decision_card.get("cadence") or [],
+                    basis_type=decision_card.get("basis_type") or "model",
+                    model_versions_json=decision_card.get("model_versions_json") or {},
+                    assumptions=decision_card.get("assumptions") or [],
+                    citations=decision_card.get("citations") or [],
+                    raw_artifact=decision_card,
+                )
+            except Exception as persist_err:
+                # 入库失败不阻塞流（用 console 记录）
+                print(f"[runner] decision persist failed: {persist_err}", flush=True)
 
         yield {"type": "done", "summary": {"thread_id": req.thread_id or decision_id}}
 
