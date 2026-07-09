@@ -31,9 +31,9 @@ def classify_intent(state: AgentState) -> str:
         if isinstance(m, dict) and m.get("role") == "user":
             last_user = m.get("content", "") or ""
             break
-        # LangChain BaseMessage 兼容
+        # LangChain BaseMessage 兼容——HumanMessage.type == "human"（不是 "user"）
         role = getattr(m, "type", None) or getattr(m, "role", None)
-        if role == "user":
+        if role in ("user", "human"):
             last_user = getattr(m, "content", "") or ""
             break
 
