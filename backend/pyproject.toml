@@ -1,0 +1,31 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "Vibe-Research 后端 —— A股数据层 + 可插拔 AI 层（FastAPI）"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # 核心（轻量、秒装）—— 行情 + 研报即刻可用
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "requests",
+    # 全栈数据源（较重）—— 一致预期 / 新闻 / 公告 / K线 / 财务
+    # 未安装时对应端点会返回 501 + 安装提示，不影响行情/研报
+    "akshare>=1.10",
+    "mootdx>=0.10",
+    "pandas",
+    # AI native agent 层（Phase 1 起）
+    "langgraph>=1.0",
+    "langchain-core>=1.0",
+    "aiosqlite>=0.20",
+]
+
+[dependency-groups]
+dev = [
+    # 开发/测试依赖。
+    # 跑测试：uv run pytest -m "not live"（只跑离线单测/API 测，快且稳）
+    #         uv run pytest -m live      （联网核对数据源 shape，开源前/升级后用）
+    "pytest>=7",
+    "httpx>=0.24",  # fastapi TestClient 依赖
+    "pytest-asyncio>=1.0",
+]
