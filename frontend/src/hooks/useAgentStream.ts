@@ -62,6 +62,20 @@ export function useAgentStream() {
       }
     }
 
+    // 1.5. 首次发消息时把「新会话」placeholder 改成消息前 8 字
+    const existingThread = useAgentStore.getState().threads.find((t) => t.id === tid);
+    if (existingThread && (existingThread.title === "新会话" || existingThread.title === "")) {
+      const newTitle = opts.content.slice(0, 8) + (opts.content.length > 8 ? "..." : "");
+      useAgentStore.setState((s) => ({
+        threads: s.threads.map((t) => t.id === tid ? { ...t, title: newTitle } : t),
+      }));
+      if (!tid.startsWith("local-")) {
+        agentApi.renameThread(tid, newTitle).catch((e) => {
+          console.error("首次发消息 rename 失败：", e);
+        });
+      }
+    }
+
     const userMsgId = `u-${Date.now()}`;
     const assistantMsgId = `a-${Date.now() + 1}`;
     const store = useAgentStore.getState();
