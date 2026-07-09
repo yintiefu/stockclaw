@@ -18,6 +18,7 @@ dependencies = [
     "langgraph>=1.0",
     "langchain-core>=1.0",
     "aiosqlite>=0.20",
+    "httpx>=0.27",  # runner.py 流式 LLM 调用（异步）
 ]
 
 [dependency-groups]
@@ -26,6 +27,6 @@ dev = [
     # 跑测试：uv run pytest -m "not live"（只跑离线单测/API 测，快且稳）
     #         uv run pytest -m live      （联网核对数据源 shape，开源前/升级后用）
     "pytest>=7",
-    "httpx>=0.24",  # fastapi TestClient 依赖
+    # httpx 同时是 runtime dep（runner.py 流式 LLM）；列在 [project].dependencies
     "pytest-asyncio>=1.0",
 ]
