@@ -51,7 +51,7 @@ _ORIGINS = [o.strip() for o in os.environ.get("VR_ALLOW_ORIGINS", "*").split(","
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ORIGINS,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -163,6 +163,64 @@ async def agent_chat(req: AgentChatReq):
             yield json.dumps({"type": "error", "message": f"agent 流失败：{e}"}, ensure_ascii=False) + "\n"
 
     return StreamingResponse(gen(), media_type="text/x-ndjson")
+
+
+class ThreadCreateReq(BaseModel):
+    id: str | None = None       # 前端可选 crypto.randomUUID() 提供
+    title: str = "新会话"
+    model: str = ""
+
+
+class ThreadRenameReq(BaseModel):
+    title: str
+
+
+class AppendMessageReq(BaseModel):
+    role: str = "user"
+    content: str = ""
+
+
+@app.get("/api/agent/threads")
+async def agent_list_threads():
+    """列出所有会话，按 updated_at 倒序。"""
+    from persistence import threads
+    return await threads.list_threads()
+
+
+@app.post("/api/agent/threads")
+async def agent_create_thread(req: ThreadCreateReq):
+    """新建会话；前端可选提供 id（crypto.randomUUID）。返回完整 thread 对象。"""
+    from persistence import threads
+    tid = await threads.create_thread(title=req.title, model=req.model, tid=req.id)
+    return await threads.get_thread(tid)
+
+
+@app.patch("/api/agent/threads/{tid}")
+async def agent_rename_thread(tid: str, req: ThreadRenameReq):
+    from persistence import threads
+    await threads.rename_thread(tid, req.title)
+    return {"ok": True}
+
+
+@app.delete("/api/agent/threads/{tid}")
+async def agent_delete_thread(tid: str):
+    from persistence import threads
+    await threads.delete_thread(tid)
+    return {"ok": True}
+
+
+@app.get("/api/agent/threads/{tid}/messages")
+async def agent_list_messages(tid: str):
+    from persistence import conversations
+    return await conversations.list_messages(tid)
+
+
+@app.post("/api/agent/threads/{tid}/messages")
+async def agent_append_message(tid: str, req: AppendMessageReq):
+    """归档一条消息（user 或 assistant）。"""
+    from persistence import conversations
+    mid = await conversations.append_message(tid, {"role": req.role, "content": req.content})
+    return {"id": mid}
 
 
 class HoldingIn(BaseModel):
