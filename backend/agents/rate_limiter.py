@@ -28,7 +28,7 @@ class EastmoneyRateLimiter:
         # 1. acquire，不进 with 块——锁释放延后到 __aexit__
         await self._lock.acquire()
         # 2. cool-down 等待：距上次 release 不足 cool_down 秒就补足
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
         wait = max(0.0, self._last_release + self._cool_down - now)
         if wait > 0:
             await asyncio.sleep(wait)
@@ -37,7 +37,7 @@ class EastmoneyRateLimiter:
     async def __aexit__(self, *exc) -> None:
         try:
             # 3. 业务结束才更新 last_release
-            self._last_release = asyncio.get_event_loop().time()
+            self._last_release = asyncio.get_running_loop().time()
         finally:
             # 4. 确保锁一定被释放——用 try/finally 防 last_release 赋值抛异常时锁泄漏
             self._lock.release()
