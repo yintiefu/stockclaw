@@ -83,7 +83,11 @@ export function useAgentStream() {
         signal: abortRef.current.signal,
       });
     } catch (e) {
-      opts.onError?.(`连接失败：${e instanceof Error ? e.message : "未知错误"}`);
+      // 用户主动 abort：不报错，只清理 streaming 状态
+      const aborted = e instanceof DOMException && e.name === "AbortError";
+      if (!aborted) {
+        opts.onError?.(`连接失败：${e instanceof Error ? e.message : "未知错误"}`);
+      }
       useAgentStore.getState().finishStreaming(tid, assistantMsgId);
       useAgentStore.setState({ streaming: { active: false, toolCalls: [] } });
       return;
