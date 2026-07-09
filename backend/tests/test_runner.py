@@ -268,6 +268,13 @@ async def test_run_agent_persists_decision_card(monkeypatch, tmp_path):
     assert items[0]["target_price"] == 1900.0
     assert items[0]["status"] == "active"
     assert items[0]["thread_id"] == "test-thread"
+    # 评审 M2: 验证 raw_artifact_json 真的存了完整 card（不只是字段平铺）
+    from persistence import decisions as d_dao
+    row = await d_dao.get_decision(items[0]["id"])
+    assert row is not None
+    assert row["raw_artifact_json"]["code"] == "600519"
+    assert row["raw_artifact_json"]["explanation"] == "测试"
+    assert row["raw_artifact_json"]["target_price"] == 1900.0
     await db.close_db()
 
 
@@ -306,4 +313,11 @@ async def test_run_agent_creates_thread_when_none_provided(monkeypatch, tmp_path
     assert len(items) == 1
     new_tid = items[0]["thread_id"]
     assert await threads_dao.get_thread(new_tid) is not None
+    # 评审 M2: 验证 raw_artifact_json 真的存了完整 card（不只是字段平铺）
+    from persistence import decisions as d_dao
+    row = await d_dao.get_decision(items[0]["id"])
+    assert row is not None
+    assert row["raw_artifact_json"]["code"] == "000001"
+    assert row["raw_artifact_json"]["explanation"] == "测试"
+    assert row["raw_artifact_json"]["target_price"] == 14.0
     await db.close_db()
