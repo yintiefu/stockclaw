@@ -2,14 +2,12 @@ import { useEffect, useState } from "react";
 import { Link, Outlet, useLocation } from "react-router-dom";
 import {
   Activity, Radar, LayoutGrid, Wallet, Settings, Search, NotebookPen,
-  Moon, Sun, ChevronsLeft, ChevronsRight, LineChart, Github, UserRound,
-  Cog, Cpu, Database, Cable, Rocket, FlaskConical, Star, FileText, Bot,
+  ChevronsLeft, ChevronsRight, LineChart, UserRound,
+  Cog, Cpu, Database, Cable, Rocket, FlaskConical, Star, FileText,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useDarkMode } from "@/hooks/useDarkMode";
 
 const APP_VERSION = "v0.1.1";
-const REPO_URL = "https://github.com/simonlin1212/Vibe-Research";
 const SITE_URL = "https://www.simonlin.net"; // 作者主页
 
 const NAV = [
@@ -21,7 +19,6 @@ const NAV = [
   { to: "/portfolio", icon: Wallet, label: "我的持仓" },
   { to: "/my-reports", icon: FileText, label: "我的研报" },
   { to: "/notes", icon: NotebookPen, label: "研究记录" },
-  { to: "/agent", icon: Bot, label: "股神" },
   { to: "/settings", icon: Settings, label: "接入 AI" },
 ];
 
@@ -37,7 +34,6 @@ const SECTOR_LINKS = [
 
 export function Layout() {
   const { pathname } = useLocation();
-  const { dark, toggle } = useDarkMode();
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem("vr-sidebar") === "collapsed");
 
   useEffect(() => {
@@ -45,23 +41,16 @@ export function Layout() {
   }, [collapsed]);
 
   return (
-    <div className="flex h-screen">
+    <div className="flex h-full">
       {/* Sidebar */}
       <aside className={cn(
         "glass z-10 m-2 flex shrink-0 flex-col rounded-2xl transition-all duration-200",
         collapsed ? "w-14" : "w-60",
       )}>
-        {/* Brand */}
+        {/* Brand（折叠时显示图标，展开时显示副标题）—— 主品牌已移到顶部 AppShell */}
         <div className={cn("border-b border-border/50", collapsed ? "flex justify-center p-3" : "p-4")}>
-          <Link to="/daily-review" className={cn("flex items-center", collapsed ? "justify-center" : "gap-2")}>
-            <LineChart className="h-6 w-6 shrink-0 text-primary text-glow" />
-            {!collapsed && (
-              <span className="text-lg font-extrabold tracking-tight">
-                Vibe-<span className="text-primary">Research</span>
-              </span>
-            )}
-          </Link>
-          {!collapsed && <p className="mt-1 text-[11px] text-muted-foreground">个人 AI 投研系统 · A股/美股/港股</p>}
+          <LineChart className={cn("shrink-0 text-primary text-glow", collapsed ? "h-5 w-5" : "h-5 w-5 mb-1")} />
+          {!collapsed && <p className="text-[11px] text-muted-foreground">个人 AI 投研系统 · A股/美股/港股</p>}
         </div>
 
         {/* Nav */}
@@ -119,9 +108,6 @@ export function Layout() {
         <div className={cn("border-t border-border/50", collapsed ? "flex flex-col items-center gap-2 p-2" : "space-y-2 p-3")}>
           {collapsed ? (
             <>
-              <button onClick={toggle} className="rounded p-1.5 text-muted-foreground transition-colors hover:text-foreground" title={dark ? "亮色" : "暗色"}>
-                {dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-              </button>
               <a href={SITE_URL} target="_blank" rel="noreferrer" className="rounded p-1.5 text-muted-foreground transition-colors hover:text-foreground" title="联系作者">
                 <UserRound className="h-4 w-4" />
               </a>
@@ -132,27 +118,15 @@ export function Layout() {
           ) : (
             <>
               <div className="flex items-center justify-between">
-                <button onClick={toggle} className="flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground">
-                  {dark ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
-                  {dark ? "亮色" : "暗色"}
+                <a href={SITE_URL} target="_blank" rel="noreferrer" className="text-[11px] text-primary/80 transition-colors hover:text-primary">
+                  联系作者 · simonlin.net
+                </a>
+                <button onClick={() => setCollapsed(true)} className="rounded p-1 text-muted-foreground transition-colors hover:text-foreground" title="收起">
+                  <ChevronsLeft className="h-3.5 w-3.5" />
                 </button>
-                <div className="flex items-center gap-2">
-                  <a href={SITE_URL} target="_blank" rel="noreferrer" className="text-muted-foreground transition-colors hover:text-foreground" title="联系作者">
-                    <UserRound className="h-3.5 w-3.5" />
-                  </a>
-                  <a href={REPO_URL} target="_blank" rel="noreferrer" className="text-muted-foreground transition-colors hover:text-foreground" title="GitHub">
-                    <Github className="h-3.5 w-3.5" />
-                  </a>
-                  <button onClick={() => setCollapsed(true)} className="rounded p-1 text-muted-foreground transition-colors hover:text-foreground" title="收起">
-                    <ChevronsLeft className="h-3.5 w-3.5" />
-                  </button>
-                </div>
               </div>
-              <a href={SITE_URL} target="_blank" rel="noreferrer" className="block text-[11px] text-primary/80 transition-colors hover:text-primary">
-                联系作者 · simonlin.net
-              </a>
               <p className="text-[11px] leading-relaxed text-muted-foreground/60">
-                {APP_VERSION} · 个人本地部署 · 非投资建议风格
+                {APP_VERSION} · 个人本地部署
               </p>
             </>
           )}

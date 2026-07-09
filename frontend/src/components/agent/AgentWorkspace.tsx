@@ -16,7 +16,7 @@ export function AgentWorkspace() {
   }
 
   return (
-    <div className="flex h-[calc(100vh-3rem)] gap-2 p-2">
+    <div className="flex h-full gap-2 p-2">
       <AgentSidebar />
       <AgentMain />
       {drawerOpen && <ContextDrawer onClose={() => setDrawerOpen(false)} />}

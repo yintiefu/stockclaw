@@ -3,7 +3,7 @@ import { AlertCircle } from "lucide-react";
 
 export function CliBlocker() {
   return (
-    <div className="flex h-[calc(100vh-3rem)] items-center justify-center p-6">
+    <div className="flex h-full items-center justify-center p-6">
       <div className="glass max-w-md rounded-2xl p-6 text-center">
         <AlertCircle className="mx-auto mb-3 h-10 w-10 text-amber-500" />
         <h2 className="text-lg font-bold">需要 API 接入的模型</h2>
