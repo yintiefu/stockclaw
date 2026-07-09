@@ -7,13 +7,15 @@
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any
 
 from agents.state import AgentState
 from agents.tools import (
-    forward_pe_target, pe_percentile_revert, atr_stop, structure_stop,
-    risk_based_position, pyramid_buy, batch_build, dca_plan,
+    forward_pe_target, pe_percentile_revert, atr_stop,
+    risk_based_position, batch_build,
+    # Phase 2 reserved: structure_stop, pyramid_buy, dca_plan (LLM tool selection)
 )
 
 # 归并优先级（越大越优先）
@@ -92,24 +94,12 @@ def build_decision_card(
     field_basis = [r.get("basis_type") for r in tool_results.values() if r.get("basis_type")]
     merged_basis = merge_basis_type(field_basis)
 
-    # 收集所有 citations（保证决策卡至少有一条引用——basis_type 来源即最直接的 citation）
+    # 收集所有 citations（审计来源必须可追溯，不能凭空生成）
     citations = []
     for r in tool_results.values():
         for c in (r.get("citations") or []):
             if c not in citations:
                 citations.append(c)
-    if not citations:
-        # 兜底：合成一条 basis 引用（如 forward_pe_target.v1 / atr_stop.v1）
-        versions = [
-            f"{r.get('model_version', 'unknown')}"
-            for r in tool_results.values()
-            if r.get("model_version")
-        ]
-        if versions:
-            citations.append({
-                "source": "internal.model_basis",
-                "note": f"决策字段版本来源：{', '.join(versions)}",
-            })
 
     # 收集所有 model_assumptions
     assumptions = []
@@ -167,12 +157,14 @@ def _extract_code_from_messages(msgs) -> str | None:
     return None
 
 
-def _lookup_name(code: str) -> str:
+async def _lookup_name(code: str) -> str:
     """从 astock.tencent_quote 查股票名（同步调用，由 to_thread 卸载）。"""
     if code.isdigit() and len(code) == 6:
         try:
+            from agents.rate_limiter import eastmoney_limiter
             import astock
-            q = astock.tencent_quote([code])
+            async with eastmoney_limiter:
+                q = await asyncio.to_thread(astock.tencent_quote, [code])
             return q.get(code, {}).get("name", code)
         except Exception:
             pass
@@ -199,7 +191,7 @@ async def decision_node(state: AgentState) -> dict:
     # 取当前价 + 名称
     current_price = (target_r or {}).get("outputs", {}).get("current_price") or \
                     (stop_r or {}).get("outputs", {}).get("current_price") or 0.0
-    name = _lookup_name(code)
+    name = await _lookup_name(code)
 
     # 若工具都失败，current_price=0；用 fallback 值兜底，让卡仍可生成
     target_price = (target_r or {}).get("outputs", {}).get("target_price") or (current_price * 1.15 if current_price else 0.0)

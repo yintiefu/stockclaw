@@ -24,6 +24,7 @@ def test_build_decision_card_basic():
             "tool": "forward_pe_target", "basis_type": "model",
             "model_version": "forward_pe_target.v1",
             "outputs": {"target_price": 1900.0, "current_price": 1685.0},
+            "citations": [{"source": "astock.full_valuation", "code": "600519"}],
         },
         "stop": {  # 来自 atr_stop（fallback）
             "tool": "atr_stop", "basis_type": "model_fallback",
