@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 import astock
-import chat as chat_layer
+import chat_legacy as chat_layer
 import cli_runtime
 import gstock
 import newsradar

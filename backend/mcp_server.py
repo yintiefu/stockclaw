@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import sys
 
-import chat  # 复用 TOOLS 定义 + _exec_tool 执行逻辑（内含 astock）
+import chat_legacy as chat  # 复用 TOOLS 定义 + _exec_tool 执行逻辑（内含 astock）
 
 SERVER_INFO = {"name": "vibe-research", "version": "0.1.1"}
 DEFAULT_PROTOCOL = "2024-11-05"
