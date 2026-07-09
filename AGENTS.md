@@ -18,7 +18,7 @@ stockclaw/
 │   ├── newsradar.py        RSS news radar (12 tracks, 108 sources)
 │   ├── portfolio.py        local holdings + closed positions (cached locally)
 │   ├── myreports.py        user-uploaded research reports (local only)
-│   ├── chat.py             AI function-calling loop (OpenAI-compatible) + TOOLS
+│   ├── chat_legacy.py     AI function-calling loop (OpenAI-compatible) + TOOLS
 │   ├── cli_runtime.py      subscription access via local CLIs (claude/codex/qwen/deepseek)
 │   ├── mcp_server.py       MCP server over stdio (for Claude Code etc.)
 │   └── tests/              pytest; conftest.py registers the `live` marker
@@ -67,7 +67,7 @@ claude mcp add vibe-research -- "$(pwd)/.venv/bin/python" "$(pwd)/mcp_server.py"
   - Missing lazy deps raise `DependencyMissing` → endpoint returns **501 + install hint**, never crashes the service. Do not make heavy deps hard requirements.
 - **All routes under `/api`.** A-share codes are validated as 6 digits (`_validate()`, regex `^\d{6}$`). US/HK/Korea go through `/api/global/stock?symbol=` (e.g. `AAPL`, `00700`, `005930.KS`).
 - **Caching is in `app.py`**, per-code with explicit TTLs (valuation 30min, announcements 15min, financials 30min, data-center 30min, fund-flow/hot-concepts/investor-qa 15min, industry 5min, market overview/emotion/turnover/global-indices 5min). Respect these — East-money has a ~1s rate limit.
-- **Three AI channels** (configured by user, backend never persists keys): (1) API access with function-calling (`chat.py`), (2) subscription access via local CLI subprocess (`cli_runtime.py`), (3) MCP server (`mcp_server.py`, reuses `chat.TOOLS`). CLI channel is one-shot, no tool-calling — only suitable when data is already in the prompt context.
+- **Three AI channels** (configured by user, backend never persists keys): (1) API access with function-calling (`chat_legacy.py`), (2) subscription access via local CLI subprocess (`cli_runtime.py`), (3) MCP server (`mcp_server.py`, reuses `chat_legacy.TOOLS`). CLI channel is one-shot, no tool-calling — only suitable when data is already in the prompt context.
 
 ## Coding conventions
 

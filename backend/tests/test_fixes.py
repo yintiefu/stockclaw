@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 import app as app_module
 import astock
-import chat
+import chat_legacy as chat
 import cli_runtime
 import market
 import portfolio as pf

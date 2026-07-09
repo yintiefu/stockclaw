@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app as app_module
-import chat
+import chat_legacy as chat
 import myreports as mr
 
 client = TestClient(app_module.app)
