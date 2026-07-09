@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Any, AsyncGenerator
 
@@ -45,7 +46,8 @@ async def _stream_llm_text(cfg: dict, system_prompt: str, user_messages: list[di
     那会阻塞 FastAPI event loop。
     """
     base = cfg["baseURL"].rstrip("/")
-    if not base.endswith(("/v1", "/v3", "/api/v3", "/api/paas/v4")):
+    # 任何 /vN 结尾都视为已带版本段（覆盖 /v1, /v3, /api/paas/v4, /api/coding/paas/v4 等）
+    if not re.search(r"/v\d+$", base):
         base = base + "/v1"
     context_str = "；".join(context_codes) if context_codes else "（无）"
     messages = [{"role": "system", "content": system_prompt.format(context=context_str)}]
