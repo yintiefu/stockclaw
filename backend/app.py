@@ -28,10 +28,22 @@ import portfolio as pf
 import market
 import myreports as mr
 
-app = FastAPI(title="Vibe-Research API", version="0.1.1")
+from contextlib import asynccontextmanager
 
-# 每半小时后台刷新持仓数据
-pf.start_scheduler(1800)
+
+@asynccontextmanager
+async def _lifespan(_app):
+    # 启动：初始化 SQLite（spec §9 Phase 1 #9）
+    from persistence import db
+    await db.init_db()
+    # 每半小时后台刷新持仓数据
+    pf.start_scheduler(1800)
+    yield
+    # 关闭：释放 SQLite 连接
+    await db.close_db()
+
+
+app = FastAPI(title="Vibe-Research API", version="0.1.1", lifespan=_lifespan)
 
 # CORS：默认放开（本地自托管友好）；公网部署时用 VR_ALLOW_ORIGINS 收紧成白名单。
 #   例：VR_ALLOW_ORIGINS="https://myhost"  （逗号分隔多个）
