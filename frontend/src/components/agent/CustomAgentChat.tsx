@@ -5,11 +5,16 @@ import { useAgentStore } from "@/lib/stores/agent";
 import { ToolTrace } from "./ToolTrace";
 import { DecisionCard } from "./DecisionCard";  // Task 12 实现但本任务先 import
 import { Bot, User } from "lucide-react";
+import type { ChatMessage } from "@/lib/types/agent";
+
+// 模块级常量——selector 返回值必须保持引用稳定，
+// 否则 useSyncExternalStore 每次都判"变化了"导致 Maximum update depth exceeded。
+const EMPTY_MESSAGES: ChatMessage[] = [];
 
 export function CustomAgentChat() {
   const currentThreadId = useAgentStore((s) => s.currentThreadId);
   const messages = useAgentStore((s) =>
-    currentThreadId ? s.messagesByThread[currentThreadId] || [] : [],
+    currentThreadId ? s.messagesByThread[currentThreadId] ?? EMPTY_MESSAGES : EMPTY_MESSAGES,
   );
   const scrollRef = useRef<HTMLDivElement>(null);
 

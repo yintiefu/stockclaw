@@ -3,7 +3,9 @@ import { useAgentStore } from "@/lib/stores/agent";
 import { cn } from "@/lib/utils";
 
 export function AgentSidebar() {
-  const { threads, currentThreadId, setCurrentThread } = useAgentStore();
+  const threads = useAgentStore((s) => s.threads);
+  const currentThreadId = useAgentStore((s) => s.currentThreadId);
+  const setCurrentThread = useAgentStore((s) => s.setCurrentThread);
 
   const newThread = () => {
     const tid = `local-${Date.now()}`;
