@@ -14,7 +14,7 @@ import json
 import uuid
 from typing import Any, AsyncGenerator
 
-import requests
+import httpx
 from pydantic import BaseModel
 
 from agents.graph import agent_graph
@@ -41,8 +41,8 @@ async def _stream_llm_text(cfg: dict, system_prompt: str, user_messages: list[di
                            context_codes: list[str]) -> AsyncGenerator[str, None]:
     """调上游 OpenAI 兼容端点的流式接口，逐 chunk yield 文本 delta。
 
-    Phase 1 简化版：不接 function-calling（决策路径由 graph 直接调 quant 工具）。
-    Phase 2 改为接 tools 参数走 ReAct 多轮。
+    用 httpx.AsyncClient 真正异步流式——不能退化到 requests.post(stream=True)，
+    那会阻塞 FastAPI event loop。
     """
     base = cfg["baseURL"].rstrip("/")
     if not base.endswith(("/v1", "/v3", "/api/v3", "/api/paas/v4")):
@@ -51,38 +51,35 @@ async def _stream_llm_text(cfg: dict, system_prompt: str, user_messages: list[di
     messages = [{"role": "system", "content": system_prompt.format(context=context_str)}]
     messages.extend(user_messages)
 
-    resp = requests.post(
-        f"{base}/chat/completions",
-        headers={"Authorization": f"Bearer {cfg['apiKey']}", "Content-Type": "application/json"},
-        json={"model": cfg["model"], "messages": messages, "temperature": 0.3, "stream": True},
-        timeout=120, stream=True,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"模型接口 HTTP {resp.status_code}: {resp.text[:300]}")
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        async with client.stream(
+            "POST",
+            f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {cfg['apiKey']}", "Content-Type": "application/json"},
+            json={"model": cfg["model"], "messages": messages, "temperature": 0.3, "stream": True},
+        ) as resp:
+            if resp.status_code != 200:
+                body = await resp.aread()
+                raise RuntimeError(f"模型接口 HTTP {resp.status_code}: {body.decode('utf-8', errors='replace')[:300]}")
 
-    buf = b""
-    for chunk in resp.iter_content(chunk_size=None):
-        if not chunk:
-            continue
-        buf += chunk
-        while b"\n" in buf:
-            raw, buf = buf.split(b"\n", 1)
-            line = raw.decode("utf-8", errors="replace").strip()
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                return
-            try:
-                j = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-            choices = j.get("choices") or []
-            if choices:
-                delta = choices[0].get("delta") or {}
-                text = delta.get("content")
-                if text:
-                    yield text
+            # SSE 流式解析：按行读，data: 前缀 + [DONE] 结束
+            async for raw_line in resp.aiter_lines():
+                line = raw_line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    return
+                try:
+                    j = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = j.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    text = delta.get("content")
+                    if text:
+                        yield text
 
 
 async def run_agent(req: AgentChatReq) -> AsyncGenerator[dict, None]:
@@ -106,8 +103,9 @@ async def run_agent(req: AgentChatReq) -> AsyncGenerator[dict, None]:
                 f"止损 {decision_card.get('stop_loss')}，止盈 {decision_card.get('take_profit')}，"
                 f"依据 {decision_card.get('basis_type')}。"
             )
+            # 注：用 user 角色 + 显式前缀，避免伪造 assistant turn 让 LLM 误以为是自己刚说的
             enhanced_messages = list(req.messages) + [{
-                "role": "assistant", "content": f"[工具结果摘要] {summary}"
+                "role": "user", "content": f"[系统注入·工具结果摘要] {summary}"
             }]
         else:
             enhanced_messages = req.messages
