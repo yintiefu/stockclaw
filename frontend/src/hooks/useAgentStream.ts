@@ -136,6 +136,8 @@ export function useAgentStream() {
             const event = JSON.parse(trimmed) as AgentEvent;
             if (event.type === "done") {
               doneSummary = event.summary;
+            } else if (event.type === "error") {
+              opts.onError?.(event.message ?? "Agent 运行失败");
             }
             dispatch(tid, assistantMsgId, event);
           } catch (e) {
@@ -148,7 +150,11 @@ export function useAgentStream() {
       if (lineBuffer.trim()) {
         try {
           const event = JSON.parse(lineBuffer.trim()) as AgentEvent;
-          if (event.type === "done") doneSummary = event.summary;
+          if (event.type === "done") {
+            doneSummary = event.summary;
+          } else if (event.type === "error") {
+            opts.onError?.(event.message ?? "Agent 运行失败");
+          }
           dispatch(tid, assistantMsgId, event);
         } catch (e) {
           console.error("NDJSON flush 帧解析失败:", lineBuffer, e);

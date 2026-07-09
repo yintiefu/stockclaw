@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Send, Loader2 } from "lucide-react";
+import { toast } from "sonner";
 import { useAgentStore } from "@/lib/stores/agent";
 import { useAgentStream } from "@/hooks/useAgentStream";
 
@@ -13,6 +14,11 @@ export function AgentComposer() {
   const [content, setContent] = useState("");
   const [style, setStyle] = useState<"conservative" | "balanced" | "aggressive">("balanced");
   const { send, abort } = useAgentStream();
+
+  const onError = (msg: string) => {
+    console.error("[agent]", msg);
+    toast.error(msg);
+  };
   const streaming = useAgentStore((s) => s.streaming.active);
   const currentThreadId = useAgentStore((s) => s.currentThreadId);
 
@@ -23,6 +29,7 @@ export function AgentComposer() {
       content: content.trim(),
       contextCodes: [],
       style,
+      onError,
     });
     setContent("");
   };

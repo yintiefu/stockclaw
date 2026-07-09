@@ -64,7 +64,7 @@ export interface CitationsEvent {
 
 export interface DoneEvent {
   type: "done";
-  summary: { thread_id?: string; rounds?: number };
+  summary: { thread_id?: string; rounds?: number; failed?: boolean };
 }
 
 export interface ErrorEvent {

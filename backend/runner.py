@@ -103,32 +103,41 @@ async def run_agent(req: AgentChatReq) -> AsyncGenerator[dict, None]:
         # 并发：graph 在后台跑，立刻开始流 LLM
         graph_task = asyncio.create_task(agent_graph.ainvoke(graph_state))
 
-        # LLM 流式（不依赖 graph 结果——决策卡自己有结构化数字）
-        async for text in _stream_llm_text(
-            req.llm.model_dump(), SYSTEM_PROMPT_AGENT, req.messages, req.context_codes,
-        ):
-            yield {"type": "text_delta", "text": text}
+        try:
+            # LLM 流式（不依赖 graph 结果——决策卡自己有结构化数字）
+            async for text in _stream_llm_text(
+                req.llm.model_dump(), SYSTEM_PROMPT_AGENT, req.messages, req.context_codes,
+            ):
+                yield {"type": "text_delta", "text": text}
 
-        # 等 graph 完成（如果还没好）
-        graph_result = await graph_task
+            # 等 graph 完成（如果还没好）
+            graph_result = await graph_task
+        except BaseException:
+            # LLM 流挂了 / 用户 abort：取消 graph 防 leak
+            # （否则后台工具继续跑：rate-limiter 占用、可能写脏数据、
+            # GC 时报 "Task was destroyed but it is pending!"）
+            graph_task.cancel()
+            try:
+                await graph_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            raise
+
         decision_card = graph_result.get("decision_card")
         graph_intent = graph_result.get("intent")
 
+        # tool_traces 都推（失败/成功都看）——评审 Minor #1 合并两处循环
+        for trace in (graph_result.get("tool_traces") or []):
+            yield {"type": "tool_trace", **trace}
+
         # 评审 #1：工具全失败时显式发 error，不静默 done
         if graph_intent == "decision_failed":
-            # 先推 traces（让用户看到哪些工具挂了）
-            for trace in (graph_result.get("tool_traces") or []):
-                yield {"type": "tool_trace", **trace}
             yield {
                 "type": "error",
-                "message": "获取股票数据失败，无法生成决策卡。请检查代码或稍后重试。",
+                "message": "未能获取股票数据，无法生成决策卡。请确认代码是否正确（如 600519）或稍后重试。",
             }
             yield {"type": "done", "summary": {"thread_id": req.thread_id or decision_id, "failed": True}}
             return
-
-        # 推 tool_trace 事件（非实时——一次性 dump）
-        for trace in (graph_result.get("tool_traces") or []):
-            yield {"type": "tool_trace", **trace}
 
         # 推决策卡 artifact
         if decision_card:

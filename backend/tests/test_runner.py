@@ -181,3 +181,49 @@ async def test_run_agent_emits_error_when_decision_fails(monkeypatch):
     assert "tool_trace" in types
     # done 必须最后
     assert types[-1] == "done"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_cancels_graph_on_llm_failure(monkeypatch):
+    """LLM 流挂时 graph_task 必须被取消，不能 leak。
+
+    场景：_stream_llm_text raise（httpx 错误、LLM 404 等）。
+    若 graph_task 没 cancel：
+    - 后台工具继续跑（rate-limiter 占用、可能写脏数据）
+    - GC 时报 "Task was destroyed but it is pending!"
+    """
+    import asyncio
+
+    graph_cancelled = []
+
+    async def slow_graph(input_state):
+        try:
+            await asyncio.sleep(10)  # 模拟长跑
+        except asyncio.CancelledError:
+            graph_cancelled.append(True)
+            raise
+
+    async def failing_stream(*args, **kwargs):
+        yield "首字"
+        # 让事件循环调度一下——让 graph_task 真的进入 body
+        # （否则 create_task 后从未被 await，cancel 时不会触发 CancelledError）
+        await asyncio.sleep(0)
+        raise RuntimeError("LLM 404")
+
+    _patch_httpx_stream(monkeypatch, [])  # 不会真用 httpx
+    monkeypatch.setattr("runner.agent_graph.ainvoke", slow_graph)
+    monkeypatch.setattr("runner._stream_llm_text", failing_stream)
+
+    req = runner.AgentChatReq(
+        thread_id=None,
+        messages=[{"role": "user", "content": "x"}],
+        llm={"provider": "", "baseURL": "http://x", "apiKey": "k", "model": "m"},
+    )
+    events = []
+    async for ev in runner.run_agent(req):
+        events.append(ev)
+
+    # graph 必须被取消（CancelledError 真的进入 body）
+    assert graph_cancelled, "graph_task 应在 LLM 失败时被 cancel，不能 leak"
+    # 顶层 error 事件仍要发（外层 try/except 兜底）
+    assert any(e["type"] == "error" for e in events)
