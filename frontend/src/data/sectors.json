@@ -70,7 +70,43 @@
       "tagline": "算力基建的产业链——芯片、光互连、封装、散热",
       "hot": true,
       "verified": true,
-      "nodes": ["AI芯片", "光模块", "CPO光互连", "HBM存储", "先进封装", "PCB", "液冷散热"]
+      "nodes": ["AI芯片", "光模块", "CPO光互连", "HBM存储", "先进封装", "PCB", "液冷散热"],
+      "chain_id": 9610020,
+      "tiers": [
+        { "id": "ai-upstream", "name": "上游 · 算力基础设施", "items": [
+          { "id": "ai-chip-group", "name": "芯片", "desc": "算力/存储", "children": [
+            { "id": "ai-aichip", "name": "AI 芯片", "source": "futu" },
+            { "id": "ai-hbm", "name": "内存芯片/HBM", "source": "futu" }
+          ]},
+          { "id": "ai-network", "name": "网络互连", "children": [
+            { "id": "ai-optical", "name": "光模块与网络设备", "source": "futu" },
+            { "id": "ai-cpo", "name": "光互联(CPO)", "source": "futu" }
+          ]},
+          { "id": "ai-cooling", "name": "散热", "children": [
+            { "id": "ai-liquid", "name": "液冷散热", "source": "futu" },
+            { "id": "ai-heatsink", "name": "散热系统", "source": "futu" }
+          ]},
+          { "id": "ai-infra", "name": "基础设施", "children": [
+            { "id": "ai-server", "name": "服务器/算力中心", "source": "futu" },
+            { "id": "ai-cloud", "name": "云基础建设", "source": "futu" },
+            { "id": "ai-datacenter", "name": "数据中心及服务", "source": "futu" }
+          ]},
+          { "id": "ai-energy", "name": "能源", "children": [
+            { "id": "ai-power", "name": "能源供给", "source": "futu" },
+            { "id": "ai-grid", "name": "电网设备", "source": "futu" },
+            { "id": "ai-storage-e", "name": "能源存储", "source": "futu" }
+          ]}
+        ]},
+        { "id": "ai-mid", "name": "中游 · 算法与模型", "items": [
+          { "id": "ai-algo", "name": "算法模型", "plate_id": "10010163", "source": "futu" }
+        ]},
+        { "id": "ai-down", "name": "下游 · AI 应用", "items": [
+          { "id": "ai-agent", "name": "Agent", "source": "manual" },
+          { "id": "ai-office", "name": "办公", "source": "manual" },
+          { "id": "ai-edu", "name": "教育", "source": "manual" },
+          { "id": "ai-vertical", "name": "垂类应用", "source": "manual" }
+        ]}
+      ]
     },
     { "key": "hbm", "label": "HBM", "tagline": "高带宽存储——AI 芯片的内存瓶颈", "hot": true, "verified": false, "nodes": [] },
     { "key": "cpo", "label": "光互联", "tagline": "光电共封装（CPO）——突破铜互连的带宽墙", "hot": true, "verified": false, "nodes": [] },
