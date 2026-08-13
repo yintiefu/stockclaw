@@ -188,7 +188,10 @@ export function SectorDetail() {
   useEffect(() => {
     if (!openLeaf) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpenLeaf(null);
+      if (e.key !== "Escape") return;
+      // 「如何导入」对话框打开时，让原生 <dialog> 自行处理 Esc，不连带收起已展开的叶子面板
+      if (importDialogRef.current?.open) return;
+      setOpenLeaf(null);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
