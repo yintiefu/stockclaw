@@ -241,3 +241,139 @@ def test_corrupt_json_write_is_refused_then_self_heals(tmp_path, monkeypatch):
     # 自愈：下次写入在新空态成功
     ss.add_mine("humanoid", "harmonic", "SH.688017", "x")
     _json.loads((tmp_path / "sector-stocks.json").read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# 路由契约（app.py）
+# ---------------------------------------------------------------------------
+from fastapi.testclient import TestClient  # noqa: E402
+import app as app_module  # noqa: E402
+
+# 注意：TestClient 与 sectorstocks 共享 rebind 后的路径（autouse fixture）
+
+
+def test_route_get_empty():
+    client = TestClient(app_module.app)
+    r = client.get("/api/sectors/stocks?key=humanoid")
+    assert r.status_code == 200
+    body = r.json()["data"]
+    assert body["leaves"] == {}
+    assert body["meta"] == {}
+
+
+def test_route_add_mine_then_get():
+    client = TestClient(app_module.app)
+    r = client.post(
+        "/api/sectors/stocks/mine",
+        json={"key": "humanoid", "leaf": "harmonic", "code": "SH.688017", "name": "绿的谐波"},
+    )
+    assert r.status_code == 200
+    data = r.json()["data"]
+    assert data["leaves"]["harmonic"]["mine"][0]["code"] == "SH.688017"
+    assert "meta" in data
+
+
+def test_route_add_mine_bad_prefix_400():
+    client = TestClient(app_module.app)
+    r = client.post(
+        "/api/sectors/stocks/mine",
+        json={"key": "humanoid", "leaf": "harmonic", "code": "600519", "name": "茅台"},
+    )
+    assert r.status_code == 400
+
+
+def test_route_add_mine_missing_field_422():
+    client = TestClient(app_module.app)
+    r = client.post("/api/sectors/stocks/mine", json={"key": "humanoid", "leaf": "harmonic"})
+    assert r.status_code == 422
+
+
+def test_route_hide_restore_via_query():
+    client = TestClient(app_module.app)
+    client.post(
+        "/api/sectors/stocks/hide",
+        json={"key": "humanoid", "leaf": "harmonic", "code": "SZ.002008", "name": ""},
+    )
+    g = client.get("/api/sectors/stocks?key=humanoid").json()["data"]
+    assert "SZ.002008" in g["leaves"]["harmonic"]["hidden"]
+    client.delete("/api/sectors/stocks/hide?key=humanoid&leaf=harmonic&code=SZ.002008")
+    g2 = client.get("/api/sectors/stocks?key=humanoid").json()["data"]
+    assert g2["leaves"]["harmonic"]["hidden"] == []
+
+
+def test_route_import_preserves_and_shape():
+    client = TestClient(app_module.app)
+    client.post(
+        "/api/sectors/stocks/hide",
+        json={"key": "humanoid", "leaf": "harmonic", "code": "SZ.002008"},
+    )
+    r = client.post(
+        "/api/sectors/stocks/import",
+        json={
+            "key": "humanoid",
+            "base": {"harmonic": [{"code": "SH.688017", "name": "绿的谐波"}]},
+            "meta": {"fetched_at": "2026-08-13", "import_note": "数据源返回原序截取；非市值排名"},
+        },
+    )
+    assert r.status_code == 200
+    data = r.json()["data"]
+    assert data["leaves"]["harmonic"]["base"][0]["code"] == "SH.688017"
+    assert data["leaves"]["harmonic"]["hidden"] == ["SZ.002008"]
+    assert data["meta"]["fetched_at"] == "2026-08-13"
+
+
+def test_route_key_too_long_400():
+    client = TestClient(app_module.app)
+    r = client.post(
+        "/api/sectors/stocks/mine",
+        json={"key": "x" * 65, "leaf": "harmonic", "code": "SH.688017", "name": "a"},
+    )
+    assert r.status_code == 400
+
+
+def test_route_name_too_long_400():
+    client = TestClient(app_module.app)
+    r = client.post(
+        "/api/sectors/stocks/mine",
+        json={"key": "humanoid", "leaf": "harmonic", "code": "SH.688017", "name": "x" * 65},
+    )
+    assert r.status_code == 400
+
+
+def test_route_import_too_many_leaves_400():
+    client = TestClient(app_module.app)
+    huge = {f"l{i:03d}": [] for i in range(201)}
+    r = client.post("/api/sectors/stocks/import", json={"key": "humanoid", "base": huge, "meta": {}})
+    assert r.status_code == 400
+
+
+def test_route_import_too_many_stocks_per_leaf_400():
+    client = TestClient(app_module.app)
+    leaf = [{"code": f"SH.{i:06d}", "name": str(i)} for i in range(201)]  # 上限 200
+    r = client.post(
+        "/api/sectors/stocks/import",
+        json={"key": "humanoid", "base": {"harmonic": leaf}, "meta": {}},
+    )
+    assert r.status_code == 400
+
+
+def test_all_mutations_return_meta_and_leaves():
+    """每个 mutation 与 GET 都必须返回 {meta, leaves}，禁止裸 leaf map。"""
+    client = TestClient(app_module.app)
+    client.post(
+        "/api/sectors/stocks/import",
+        json={"key": "humanoid", "base": {"harmonic": [{"code": "SH.688017", "name": "绿"}]}, "meta": {"sdk": "x"}},
+    )
+    for body in [
+        client.post("/api/sectors/stocks/mine", json={"key": "humanoid", "leaf": "harmonic", "code": "SZ.300124", "name": "汇川"}).json()["data"],
+        client.post("/api/sectors/stocks/hide", json={"key": "humanoid", "leaf": "harmonic", "code": "SH.688017", "name": ""}).json()["data"],
+        client.delete("/api/sectors/stocks/hide?key=humanoid&leaf=harmonic&code=SH.688017").json()["data"],
+        client.delete("/api/sectors/stocks/mine?key=humanoid&leaf=harmonic&code=SZ.300124").json()["data"],
+        client.get("/api/sectors/stocks?key=humanoid").json()["data"],
+    ]:
+        assert set(body.keys()) >= {"meta", "leaves"}
+        assert isinstance(body["leaves"], dict)
+
+
+# 注：`test_sectors_json_schema_contracts` 不在本任务——它要求 humanoid(Task4) 与
+# ai-computing(Task9) 的 tiers 已落盘，故移至 Task 9 之后的「Task 9.5」统一跑。
