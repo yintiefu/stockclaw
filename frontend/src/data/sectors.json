@@ -37,14 +37,22 @@
           ]},
           { "id": "bearing", "name": "轴承", "plate_id": "10104262", "source": "futu" },
           { "id": "encoder", "name": "编码器", "plate_id": "10104263", "source": "futu" },
-          { "id": "chip", "name": "芯片", "desc": "算力/存储", "children": [
+          { "id": "chip", "name": "芯片", "desc": "算力/存储/模拟", "children": [
             { "id": "ai-chip", "name": "AI 芯片", "plate_id": "10104250", "source": "futu" },
-            { "id": "storage", "name": "存储芯片", "plate_id": "10104251", "source": "futu" }
+            { "id": "storage", "name": "存储芯片", "plate_id": "10104251", "source": "futu" },
+            { "id": "analog-semi", "name": "模拟半导体", "plate_id": "10104269", "source": "futu" }
           ]},
-          { "id": "struct", "name": "结构件", "desc": "机身与能源", "children": [
+          { "id": "cognition", "name": "大脑 · 算法与模型", "desc": "智能层", "children": [
+            { "id": "large-model", "name": "大模型", "plate_id": "10104249", "source": "futu" },
+            { "id": "simulation", "name": "仿真软件", "plate_id": "10104252", "source": "futu" },
+            { "id": "vision-algo", "name": "视觉算法", "plate_id": "10104253", "source": "futu" }
+          ]},
+          { "id": "struct", "name": "结构件", "desc": "机身/能源/材料", "children": [
             { "id": "body", "name": "机身结构件", "plate_id": "10104272", "source": "futu" },
             { "id": "battery", "name": "电池系统", "plate_id": "10104270", "source": "futu" },
-            { "id": "thermal", "name": "热管理", "plate_id": "10104273", "source": "futu" }
+            { "id": "thermal", "name": "热管理", "plate_id": "10104273", "source": "futu" },
+            { "id": "harness", "name": "线束&连接器", "plate_id": "10104271", "source": "futu" },
+            { "id": "bionic-material", "name": "人工肌腱/仿生皮肤", "plate_id": "10104268", "source": "futu" }
           ]},
           { "id": "dexterous-hand", "name": "灵巧手", "source": "manual" }
         ]},
