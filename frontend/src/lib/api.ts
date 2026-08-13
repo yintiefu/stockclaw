@@ -1,6 +1,8 @@
 // Vibe-Research 后端 API 客户端。/api → vite 代理到本地 FastAPI（默认 8900）。
 // 后端未启动或数据源异常时抛 ApiError，页面据此优雅降级。
 
+import type { SectorStocksData } from "./sectorStocks";
+
 export class ApiError extends Error {
   constructor(message: string, readonly status: number) {
     super(message);
@@ -283,4 +285,20 @@ export const api = {
   uploadReport: (name: string, contentB64: string) =>
     request<MyReport>("/myreports", "POST", { name, content_b64: contentB64 }),
   deleteReport: (id: string) => request<{ ok: boolean }>(`/myreports/${id}`, "DELETE"),
+  sectorStocks: (key: string) =>
+    get<SectorStocksData>(`/sectors/stocks?key=${encodeURIComponent(key)}`),
+  addSectorMine: (key: string, leaf: string, code: string, name: string) =>
+    request<SectorStocksData>("/sectors/stocks/mine", "POST", { key, leaf, code, name }),
+  removeSectorMine: (key: string, leaf: string, code: string) =>
+    request<SectorStocksData>(
+      `/sectors/stocks/mine?key=${encodeURIComponent(key)}&leaf=${encodeURIComponent(leaf)}&code=${encodeURIComponent(code)}`,
+      "DELETE",
+    ),
+  hideSector: (key: string, leaf: string, code: string) =>
+    request<SectorStocksData>("/sectors/stocks/hide", "POST", { key, leaf, code, name: "" }),
+  restoreSector: (key: string, leaf: string, code: string) =>
+    request<SectorStocksData>(
+      `/sectors/stocks/hide?key=${encodeURIComponent(key)}&leaf=${encodeURIComponent(leaf)}&code=${encodeURIComponent(code)}`,
+      "DELETE",
+    ),
 };
