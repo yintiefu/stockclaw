@@ -377,3 +377,38 @@ def test_all_mutations_return_meta_and_leaves():
 
 # 注：`test_sectors_json_schema_contracts` 不在本任务——它要求 humanoid(Task4) 与
 # ai-computing(Task9) 的 tiers 已落盘，故移至 Task 9 之后的「Task 9.5」统一跑。
+
+
+def test_sectors_json_schema_contracts():
+    """读取真实 sectors.json，校验试点板块 tiers 的层级/children/id 唯一性/无禁词。"""
+    import json
+    import re
+    from pathlib import Path
+
+    sectors_path = Path(__file__).resolve().parents[2] / "frontend/src/data/sectors.json"
+    data = json.loads(sectors_path.read_text(encoding="utf-8"))
+    id_re = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+    def walk(items, depth, seen):
+        for it in items:
+            assert it.get("id") and id_re.match(it["id"]), f"非法 id: {it.get('id')}"
+            assert it["id"] not in seen, f"sector 内 id 重复: {it['id']}"
+            seen.add(it["id"])
+            children = it.get("children")
+            if children is not None:
+                assert isinstance(children, list) and len(children) > 0, f"禁止 children:[] @ {it['id']}"
+                assert depth < 2, f"分组块最多一层 @ {it['id']}"
+                walk(children, depth + 1, seen)
+
+    for key in ("humanoid", "ai-computing"):
+        sec = next(s for s in data["sectors"] if s["key"] == key)
+        assert sec.get("tiers"), f"{key} 缺 tiers"
+        seen: set[str] = set()
+        for tier in sec["tiers"]:
+            assert tier.get("id") and id_re.match(tier["id"])
+            assert tier["id"] not in seen
+            seen.add(tier["id"])
+            walk(tier["items"], 1, seen)
+        blob = json.dumps(sec, ensure_ascii=False)
+        for bad in ("market_value", "市值", "前 8", "前8"):
+            assert bad not in blob, f"{key} 骨架出现禁用词 {bad}"
