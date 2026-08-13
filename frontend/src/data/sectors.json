@@ -83,26 +83,26 @@
       "tiers": [
         { "id": "ai-upstream", "name": "上游 · 算力基础设施", "items": [
           { "id": "ai-chip-group", "name": "芯片", "desc": "算力/存储", "children": [
-            { "id": "ai-aichip", "name": "AI 芯片", "source": "futu" },
-            { "id": "ai-hbm", "name": "内存芯片/HBM", "source": "futu" }
+            { "id": "ai-aichip", "name": "AI 芯片", "plate_id": "10010158", "source": "futu" },
+            { "id": "ai-hbm", "name": "内存芯片/HBM", "plate_id": "10010159", "source": "futu" }
           ]},
           { "id": "ai-network", "name": "网络互连", "children": [
-            { "id": "ai-optical", "name": "光模块与网络设备", "source": "futu" },
-            { "id": "ai-cpo", "name": "光互联(CPO)", "source": "futu" }
+            { "id": "ai-optical", "name": "光模块与网络设备", "plate_id": "10104063", "source": "futu" },
+            { "id": "ai-cpo", "name": "光互联(CPO)", "plate_id": "10104067", "source": "futu" }
           ]},
           { "id": "ai-cooling", "name": "散热", "children": [
-            { "id": "ai-liquid", "name": "液冷散热", "source": "futu" },
-            { "id": "ai-heatsink", "name": "散热系统", "source": "futu" }
+            { "id": "ai-liquid", "name": "液冷散热", "plate_id": "10104068", "source": "futu" },
+            { "id": "ai-heatsink", "name": "散热系统", "plate_id": "10104064", "source": "futu" }
           ]},
           { "id": "ai-infra", "name": "基础设施", "children": [
-            { "id": "ai-server", "name": "服务器/算力中心", "source": "futu" },
-            { "id": "ai-cloud", "name": "云基础建设", "source": "futu" },
-            { "id": "ai-datacenter", "name": "数据中心及服务", "source": "futu" }
+            { "id": "ai-server", "name": "服务器/算力中心", "plate_id": "10010160", "source": "futu" },
+            { "id": "ai-cloud", "name": "云基础建设", "plate_id": "10010161", "source": "futu" },
+            { "id": "ai-datacenter", "name": "数据中心及服务", "plate_id": "10010162", "source": "futu" }
           ]},
           { "id": "ai-energy", "name": "能源", "children": [
-            { "id": "ai-power", "name": "能源供给", "source": "futu" },
-            { "id": "ai-grid", "name": "电网设备", "source": "futu" },
-            { "id": "ai-storage-e", "name": "能源存储", "source": "futu" }
+            { "id": "ai-power", "name": "能源供给", "plate_id": "10010149", "source": "futu" },
+            { "id": "ai-grid", "name": "电网设备", "plate_id": "10010150", "source": "futu" },
+            { "id": "ai-storage-e", "name": "能源存储", "plate_id": "10010151", "source": "futu" }
           ]}
         ]},
         { "id": "ai-mid", "name": "中游 · 算法与模型", "items": [
