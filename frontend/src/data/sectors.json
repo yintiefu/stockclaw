@@ -299,7 +299,7 @@
                 },
                 {
                   "id": "ai-cpo",
-                  "name": "光互联",
+                  "name": "光通信",
                   "plate_id": "10104067",
                   "source": "futu"
                 },
@@ -397,11 +397,74 @@
     },
     {
       "key": "cpo",
-      "label": "光互联",
-      "tagline": "光电共封装（CPO）——突破铜互连的带宽墙",
+      "label": "光通信",
+      "tagline": "光通信产业链——光芯片、光器件、光模块到 CPO 共封装",
       "hot": true,
       "verified": false,
-      "nodes": []
+      "nodes": [
+        "光芯片",
+        "光器件",
+        "光模块",
+        "光纤光缆",
+        "CPO封装",
+        "封装测试"
+      ],
+      "chain_id": 9610087,
+      "tiers": [
+        {
+          "id": "ic-design",
+          "name": "IC 设计与制造",
+          "items": [
+            { "id": "asic-xpu", "name": "ASIC与xPU设计", "plate_id": "10104185", "source": "futu" },
+            { "id": "photonic-ic", "name": "光子集成电路设计", "plate_id": "10104186", "source": "futu" },
+            { "id": "electronic-ic", "name": "电子集成电路（光模块配套电芯片）", "plate_id": "10104187", "source": "futu" },
+            { "id": "wafer-foundry", "name": "晶圆代工", "plate_id": "10104188", "source": "futu" }
+          ]
+        },
+        {
+          "id": "semi-material",
+          "name": "半导体材料",
+          "items": [
+            { "id": "inp-substrate", "name": "磷化铟衬底", "plate_id": "10104189", "source": "futu" },
+            { "id": "inp-epitaxial", "name": "磷化铟外延片", "plate_id": "10104190", "source": "futu" },
+            { "id": "gaas-substrate", "name": "砷化镓衬底", "plate_id": "10104191", "source": "futu" },
+            { "id": "copper-foil", "name": "铜箔", "plate_id": "10104192", "source": "futu" }
+          ]
+        },
+        {
+          "id": "optical-components",
+          "name": "光组件",
+          "items": [
+            { "id": "laser-silicon", "name": "激光器 / 光源（硅光方案）", "plate_id": "10104193", "source": "futu" },
+            { "id": "laser-eml", "name": "激光器 / 光源（电吸收调制激光器方案）", "plate_id": "10104194", "source": "futu" },
+            { "id": "fiber-array", "name": "光纤阵列单元", "plate_id": "10104195", "source": "futu" },
+            {
+              "id": "passive-optical",
+              "name": "无源光器件",
+              "children": [
+                { "id": "coupler", "name": "耦合器 / 分路器", "plate_id": "10104196", "source": "futu" },
+                { "id": "filter", "name": "滤波器", "plate_id": "10104197", "source": "futu" },
+                { "id": "attenuator", "name": "衰减器", "plate_id": "10104198", "source": "futu" },
+                { "id": "wdm", "name": "波分复用器", "plate_id": "10104199", "source": "futu" }
+              ]
+            },
+            { "id": "module-assembly", "name": "光模块组装与集成", "plate_id": "10104200", "source": "futu" },
+            { "id": "fiber", "name": "光纤", "plate_id": "10104201", "source": "futu" },
+            { "id": "mt-ferrule", "name": "MT插芯", "plate_id": "10104202", "source": "futu" },
+            { "id": "mpo-connector", "name": "MPO连接器", "plate_id": "10104203", "source": "futu" },
+            { "id": "vsff-connector", "name": "VSFF连接器", "plate_id": "10104204", "source": "futu" }
+          ]
+        },
+        {
+          "id": "packaging-test",
+          "name": "封装与测试",
+          "items": [
+            { "id": "packaging-service", "name": "封装与测试服务", "plate_id": "10104205", "source": "futu" },
+            { "id": "packaging-equipment", "name": "封装设备", "plate_id": "10104206", "source": "futu" },
+            { "id": "test-equipment", "name": "测试设备", "plate_id": "10104207", "source": "futu" }
+          ]
+        }
+      ]
     },
     {
       "key": "semiconductor",
