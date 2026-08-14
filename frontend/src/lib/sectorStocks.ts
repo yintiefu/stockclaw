@@ -6,7 +6,6 @@ export interface SectorStock {
 
 export interface LeafStocks {
   base: SectorStock[];
-  hidden: string[];
   mine: SectorStock[];
 }
 
@@ -41,13 +40,28 @@ export interface SectorTier {
   items: SectorItem[];
 }
 
+export function leavesOf(item: SectorItem): SectorItem[] {
+  return item.children && item.children.length > 0 ? item.children : [item];
+}
+
+export function firstLeafId(item: SectorItem): string {
+  return leavesOf(item)[0].id;
+}
+
+export function countItemStocks(
+  item: SectorItem,
+  leaves: Record<string, LeafStocks>,
+): number {
+  return leavesOf(item).reduce((total, leaf) => {
+    const merged = mergeLeaf(leaves[leaf.id]);
+    return total + merged.source.length + merged.mine.length;
+  }, 0);
+}
+
 export function mergeLeaf(
   lf: LeafStocks | undefined | null,
 ): { source: SectorStock[]; mine: SectorStock[] } {
-  const base = lf?.base ?? [];
-  const hidden = new Set(lf?.hidden ?? []);
-  const mine = lf?.mine ?? [];
-  return { source: base.filter((s) => !hidden.has(s.code)), mine };
+  return { source: lf?.base ?? [], mine: lf?.mine ?? [] };
 }
 
 // ============================================================================
@@ -62,18 +76,16 @@ export function mergeLeaf(
 // ============================================================================
 
 export type SectorOp =
-  | { kind: "hide"; leaf: string; code: string }
-  | { kind: "restore"; leaf: string; code: string }
+  | { kind: "delete"; leaf: string; code: string }
   | { kind: "addMine"; leaf: string; code: string; name: string }
   | { kind: "removeMine"; leaf: string; code: string };
 
 /** 一次操作相对当前 displayed 态实际产生的增量（none=幂等无变化）。 */
 export type OpDiff =
   | { type: "none" }
-  | { type: "hidden-add"; leaf: string; code: string }
-  | { type: "hidden-remove"; leaf: string; code: string }
+  | { type: "delete"; leaf: string; entry: SectorStock } // entry 含被删项原 name/ts，回滚可完整恢复
   | { type: "mine-add"; leaf: string; entry: SectorStock }
-  | { type: "mine-remove"; leaf: string; entry: SectorStock }; // entry 含被删项原 name/ts，回滚可完整恢复
+  | { type: "mine-remove"; leaf: string; entry: SectorStock };
 
 export interface PendingOp {
   token: number; // 全局单调递增（跨 key 不重置）
@@ -93,17 +105,17 @@ export function initState(key: string): OptimisticState {
 }
 
 function leafOf(d: SectorStocksData, leaf: string): LeafStocks {
-  return d.leaves[leaf] ?? { base: [], hidden: [], mine: [] };
+  return d.leaves[leaf] ?? { base: [], mine: [] };
 }
 
 /** 计算 op 对 displayed 态产生的 diff（纯）。幂等情形返回 none。 */
 export function captureDiff(displayed: SectorStocksData, op: SectorOp): OpDiff {
   const l = leafOf(displayed, op.leaf);
   switch (op.kind) {
-    case "hide":
-      return l.hidden.includes(op.code) ? { type: "none" } : { type: "hidden-add", leaf: op.leaf, code: op.code };
-    case "restore":
-      return l.hidden.includes(op.code) ? { type: "hidden-remove", leaf: op.leaf, code: op.code } : { type: "none" };
+    case "delete": {
+      const existing = l.base.find((s) => s.code === op.code);
+      return existing ? { type: "delete", leaf: op.leaf, entry: existing } : { type: "none" };
+    }
     case "addMine":
       return l.mine.some((s) => s.code === op.code)
         ? { type: "none" }
@@ -120,13 +132,10 @@ export function applyDiff(state: SectorStocksData, diff: OpDiff): SectorStocksDa
   if (diff.type === "none") return state;
   const leaves = { ...state.leaves };
   const cur = leafOf(state, diff.leaf);
-  const next: LeafStocks = { base: [...cur.base], hidden: [...cur.hidden], mine: [...cur.mine] };
+  const next: LeafStocks = { base: [...cur.base], mine: [...cur.mine] };
   switch (diff.type) {
-    case "hidden-add":
-      if (!next.hidden.includes(diff.code)) next.hidden = [...next.hidden, diff.code];
-      break;
-    case "hidden-remove":
-      next.hidden = next.hidden.filter((c) => c !== diff.code);
+    case "delete":
+      next.base = next.base.filter((s) => s.code !== diff.entry.code);
       break;
     case "mine-add":
       if (!next.mine.some((s) => s.code === diff.entry.code)) next.mine = [...next.mine, diff.entry];

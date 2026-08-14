@@ -1,4 +1,4 @@
-"""sectorstocks：base/hidden/mine、per-sector meta、原子写、并发、返回形状。"""
+"""sectorstocks：base/mine、per-sector meta、原子写、并发、返回形状。"""
 from __future__ import annotations
 
 import json
@@ -46,26 +46,28 @@ def test_remove_mine():
     assert ss.get_sector("humanoid")["leaves"]["harmonic"]["mine"] == []
 
 
-def test_hide_restore_idempotent():
-    ss.hide("humanoid", "harmonic", "SZ.002008")
-    ss.hide("humanoid", "harmonic", "SZ.002008")
-    assert ss.get_sector("humanoid")["leaves"]["harmonic"]["hidden"] == ["SZ.002008"]
-    ss.restore("humanoid", "harmonic", "SZ.002008")
-    assert ss.get_sector("humanoid")["leaves"]["harmonic"]["hidden"] == []
+def test_delete_removes_from_base():
+    ss.import_base("humanoid", {"harmonic": [{"code": "SH.688017", "name": "绿的谐波"}, {"code": "SZ.002008", "name": "大族激光"}]}, {})
+    ss.delete_stock("humanoid", "harmonic", "SZ.002008")
+    ss.delete_stock("humanoid", "harmonic", "SZ.002008")  # 幂等：删不存在的无副作用
+    codes = [s["code"] for s in ss.get_sector("humanoid")["leaves"]["harmonic"]["base"]]
+    assert codes == ["SH.688017"]  # base 真移除
+    assert "hidden" not in ss.get_sector("humanoid")["leaves"]["harmonic"]  # 无 hidden 字段
 
 
-def test_import_base_preserves_hidden_mine():
-    ss.hide("humanoid", "harmonic", "SZ.002008")
+def test_import_base_restores_deleted():
+    """删除后重导会恢复（import 覆盖 base）。mine 不受影响。"""
+    ss.import_base("humanoid", {"harmonic": [{"code": "SH.688017", "name": "绿的谐波"}, {"code": "SZ.002008", "name": "大族激光"}]}, {})
+    ss.delete_stock("humanoid", "harmonic", "SZ.002008")
     ss.add_mine("humanoid", "harmonic", "SZ.300124", "汇川技术")
     ss.import_base(
         "humanoid",
-        {"harmonic": [{"code": "SH.688017", "name": "绿的谐波"}]},
+        {"harmonic": [{"code": "SH.688017", "name": "绿的谐波"}, {"code": "SZ.002008", "name": "大族激光"}]},
         {"sdk": "futu-api==10.9.6908", "fetched_at": "2026-08-13"},
     )
     leaf = ss.get_sector("humanoid")["leaves"]["harmonic"]
-    assert leaf["base"] == [{"code": "SH.688017", "name": "绿的谐波"}]
-    assert leaf["hidden"] == ["SZ.002008"]
-    assert leaf["mine"][0]["code"] == "SZ.300124"
+    assert [s["code"] for s in leaf["base"]] == ["SH.688017", "SZ.002008"]  # 重导恢复被删的
+    assert leaf["mine"][0]["code"] == "SZ.300124"  # mine 保留
 
 
 def test_import_meta_is_per_sector():
@@ -75,9 +77,9 @@ def test_import_meta_is_per_sector():
     assert ss.get_sector("ai-computing")["meta"]["sdk"] == "b"
 
 
-def test_concurrent_import_and_hide_no_lost_update():
-    """多线程交错：import 反复改 base、hide/restore 改 hidden。
-    期望：无异常，且 import 与 hide 的最终效果都保留（非互相覆盖）。"""
+def test_concurrent_import_and_delete_no_corruption():
+    """多线程：import 反复覆盖 base、delete 反复删除（都改 base，竞争同一字段）。
+    期望：无异常、无半截 JSON、base 始终是合法 list（文件锁串行化每个操作）。"""
     ss.import_base("humanoid", {"harmonic": [{"code": "SH.000001", "name": "seed"}]}, {"sdk": "x"})
     errors: list[BaseException] = []
 
@@ -92,24 +94,22 @@ def test_concurrent_import_and_hide_no_lost_update():
         except BaseException as e:  # noqa: BLE001
             errors.append(e)
 
-    def do_hide():
+    def do_delete():
         try:
-            for _ in range(30):
-                ss.hide("humanoid", "harmonic", "SH.000001")
-                ss.restore("humanoid", "harmonic", "SH.000001")
+            for i in range(30):
+                ss.delete_stock("humanoid", "harmonic", f"SH.{i:06d}")
         except BaseException as e:  # noqa: BLE001
             errors.append(e)
 
-    threads = [threading.Thread(target=do_import), threading.Thread(target=do_hide)]
+    threads = [threading.Thread(target=do_import), threading.Thread(target=do_delete)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
     assert not errors
     leaf = ss.get_sector("humanoid")["leaves"]["harmonic"]
-    # import 写入的 base 与 hide 写过又恢复的 hidden 都必须落盘（lost update 会丢其中之一）
-    assert len(leaf["base"]) == 1 and leaf["base"][0]["code"].startswith("SH.")
-    assert leaf["hidden"] == []  # 最后一次 restore 已移除
+    assert isinstance(leaf["base"], list)  # 合法 list，无损坏
+    assert len(leaf["base"]) <= 1  # import 写 1 只，delete 可能删 → 0 或 1
 
 
 def test_cross_process_lock_serializes_writes(tmp_path):
@@ -288,24 +288,27 @@ def test_route_add_mine_missing_field_422():
     assert r.status_code == 422
 
 
-def test_route_hide_restore_via_query():
+def test_route_delete_removes_from_base():
     client = TestClient(app_module.app)
     client.post(
-        "/api/sectors/stocks/hide",
+        "/api/sectors/stocks/import",
+        json={"key": "humanoid", "base": {"harmonic": [{"code": "SH.688017", "name": "绿的谐波"}, {"code": "SZ.002008", "name": "大族激光"}]}, "meta": {}},
+    )
+    client.post(
+        "/api/sectors/stocks/delete",
         json={"key": "humanoid", "leaf": "harmonic", "code": "SZ.002008", "name": ""},
     )
     g = client.get("/api/sectors/stocks?key=humanoid").json()["data"]
-    assert "SZ.002008" in g["leaves"]["harmonic"]["hidden"]
-    client.delete("/api/sectors/stocks/hide?key=humanoid&leaf=harmonic&code=SZ.002008")
-    g2 = client.get("/api/sectors/stocks?key=humanoid").json()["data"]
-    assert g2["leaves"]["harmonic"]["hidden"] == []
+    codes = [s["code"] for s in g["leaves"]["harmonic"]["base"]]
+    assert codes == ["SH.688017"]  # base 真移除
+    assert "hidden" not in g["leaves"]["harmonic"]
 
 
 def test_route_import_preserves_and_shape():
     client = TestClient(app_module.app)
     client.post(
-        "/api/sectors/stocks/hide",
-        json={"key": "humanoid", "leaf": "harmonic", "code": "SZ.002008"},
+        "/api/sectors/stocks/mine",
+        json={"key": "humanoid", "leaf": "harmonic", "code": "SZ.300124", "name": "汇川"},
     )
     r = client.post(
         "/api/sectors/stocks/import",
@@ -318,7 +321,7 @@ def test_route_import_preserves_and_shape():
     assert r.status_code == 200
     data = r.json()["data"]
     assert data["leaves"]["harmonic"]["base"][0]["code"] == "SH.688017"
-    assert data["leaves"]["harmonic"]["hidden"] == ["SZ.002008"]
+    assert data["leaves"]["harmonic"]["mine"][0]["code"] == "SZ.300124"  # import 保留 mine
     assert data["meta"]["fetched_at"] == "2026-08-13"
 
 
@@ -366,8 +369,7 @@ def test_all_mutations_return_meta_and_leaves():
     )
     for body in [
         client.post("/api/sectors/stocks/mine", json={"key": "humanoid", "leaf": "harmonic", "code": "SZ.300124", "name": "汇川"}).json()["data"],
-        client.post("/api/sectors/stocks/hide", json={"key": "humanoid", "leaf": "harmonic", "code": "SH.688017", "name": ""}).json()["data"],
-        client.delete("/api/sectors/stocks/hide?key=humanoid&leaf=harmonic&code=SH.688017").json()["data"],
+        client.post("/api/sectors/stocks/delete", json={"key": "humanoid", "leaf": "harmonic", "code": "SH.688017", "name": ""}).json()["data"],
         client.delete("/api/sectors/stocks/mine?key=humanoid&leaf=harmonic&code=SZ.300124").json()["data"],
         client.get("/api/sectors/stocks?key=humanoid").json()["data"],
     ]:

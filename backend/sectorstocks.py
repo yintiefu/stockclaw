@@ -135,7 +135,7 @@ def _bucket(data: dict, key: str) -> dict:
 
 def _leaf(data: dict, key: str, leaf_id: str) -> dict:
     bucket = _bucket(data, key)
-    return bucket["leaves"].setdefault(leaf_id, {"base": [], "hidden": [], "mine": []})
+    return bucket["leaves"].setdefault(leaf_id, {"base": [], "mine": []})
 
 
 def _view(data: dict, key: str) -> dict:
@@ -175,35 +175,26 @@ def remove_mine(key: str, leaf_id: str, code: str) -> dict:
             return _view(data, key)
 
 
-def hide(key: str, leaf_id: str, code: str) -> dict:
+def delete_stock(key: str, leaf_id: str, code: str) -> dict:
+    """从 base 真正移除一只来源成分股（base 数组减少，幂等）。
+    重导 import_base 会用富途完整数据覆盖 base，已删除的会恢复。"""
     with _LOCK:
         with _file_lock():
             data = _load()
             leaf = _leaf(data, key, leaf_id)
-            if code not in leaf["hidden"]:
-                leaf["hidden"].append(code)
-            _save(data)
-            return _view(data, key)
-
-
-def restore(key: str, leaf_id: str, code: str) -> dict:
-    with _LOCK:
-        with _file_lock():
-            data = _load()
-            leaf = _leaf(data, key, leaf_id)
-            leaf["hidden"] = [c for c in leaf["hidden"] if c != code]
+            leaf["base"] = [s for s in leaf["base"] if s.get("code") != code]
             _save(data)
             return _view(data, key)
 
 
 def import_base(key: str, base_map: dict, meta: dict) -> dict:
-    """替换 base_map 中各叶子的 base（保留 hidden/mine），写入该 key 的 meta。"""
+    """替换 base_map 中各叶子的 base（保留 mine），写入该 key 的 meta。"""
     with _LOCK:
         with _file_lock():
             data = _load()
             bucket = _bucket(data, key)
             for leaf_id, stocks in base_map.items():
-                leaf = bucket["leaves"].setdefault(leaf_id, {"base": [], "hidden": [], "mine": []})
+                leaf = bucket["leaves"].setdefault(leaf_id, {"base": [], "mine": []})
                 leaf["base"] = list(stocks)
             if meta:
                 bucket["meta"] = dict(meta)

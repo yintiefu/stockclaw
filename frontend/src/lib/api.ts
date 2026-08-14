@@ -294,11 +294,6 @@ export const api = {
       `/sectors/stocks/mine?key=${encodeURIComponent(key)}&leaf=${encodeURIComponent(leaf)}&code=${encodeURIComponent(code)}`,
       "DELETE",
     ),
-  hideSector: (key: string, leaf: string, code: string) =>
-    request<SectorStocksData>("/sectors/stocks/hide", "POST", { key, leaf, code, name: "" }),
-  restoreSector: (key: string, leaf: string, code: string) =>
-    request<SectorStocksData>(
-      `/sectors/stocks/hide?key=${encodeURIComponent(key)}&leaf=${encodeURIComponent(leaf)}&code=${encodeURIComponent(code)}`,
-      "DELETE",
-    ),
+  deleteSector: (key: string, leaf: string, code: string) =>
+    request<SectorStocksData>("/sectors/stocks/delete", "POST", { key, leaf, code, name: "" }),
 };

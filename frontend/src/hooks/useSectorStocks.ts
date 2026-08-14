@@ -81,12 +81,11 @@ export function useSectorStocks(key: string) {
     [],
   );
 
-  const hide = useCallback((leaf: string, code: string) => run({ kind: "hide", leaf, code }, () => api.hideSector(key, leaf, code)), [run, key]);
-  const restore = useCallback((leaf: string, code: string) => run({ kind: "restore", leaf, code }, () => api.restoreSector(key, leaf, code)), [run, key]);
+  const deleteStock = useCallback((leaf: string, code: string) => run({ kind: "delete", leaf, code }, () => api.deleteSector(key, leaf, code)), [run, key]);
   const addMine = useCallback((leaf: string, code: string, name: string) => run({ kind: "addMine", leaf, code, name }, () => api.addSectorMine(key, leaf, code, name)), [run, key]);
   const removeMine = useCallback((leaf: string, code: string) => run({ kind: "removeMine", leaf, code }, () => api.removeSectorMine(key, leaf, code)), [run, key]);
 
-  return { data, loading, error, refresh, hide, restore, addMine, removeMine };
+  return { data, loading, error, refresh, deleteStock, addMine, removeMine };
 }
 
 export type UseSectorStocks = ReturnType<typeof useSectorStocks>;

@@ -785,17 +785,9 @@ def sector_stocks_remove_mine(key: str = Query(...), leaf: str = Query(...), cod
     return {"data": sectorstocks.remove_mine(key, leaf, code)}
 
 
-@app.post("/api/sectors/stocks/hide")
-def sector_stocks_hide(req: SectorStockIn):
+@app.post("/api/sectors/stocks/delete")
+def sector_stocks_delete(req: SectorStockIn):
     key = _validate_key_or_leaf(req.key, "key")
     leaf = _validate_key_or_leaf(req.leaf, "leaf")
     code = _validate_stock_code(req.code)
-    return {"data": sectorstocks.hide(key, leaf, code)}
-
-
-@app.delete("/api/sectors/stocks/hide")
-def sector_stocks_restore(key: str = Query(...), leaf: str = Query(...), code: str = Query(...)):
-    key = _validate_key_or_leaf(key, "key")
-    leaf = _validate_key_or_leaf(leaf, "leaf")
-    code = _validate_stock_code(code)
-    return {"data": sectorstocks.restore(key, leaf, code)}
+    return {"data": sectorstocks.delete_stock(key, leaf, code)}
