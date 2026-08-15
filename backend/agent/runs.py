@@ -649,6 +649,120 @@ class RunCoordinator:
                 )
             )
 
+    async def acquire_retry(
+        self,
+        *,
+        model_ref: ModelRef,
+        secrets: RunSecrets,
+        model_builder,
+        tools,
+        thread_id: str,
+        middleware=(),
+        protocol_run_id: str,
+        retry_of: str,
+        client_revision: int,
+    ) -> StartAdmission:
+        """严格重试：校验目标/revision → 新产品 run + 新 MemorySaver → 服务端历史重建输入。
+
+        不追加用户消息、不改写/不重开目标 run。
+        """
+        threads, runs = self._require_stores()
+        async with self._lock(thread_id):
+            existing = self._handles.get(thread_id)
+            if existing is not None and existing.phase in ("running", "awaiting_approval"):
+                raise ThreadBusy(f"{ThreadBusy.code}: thread {thread_id} already has an active run")
+            self._check_protocol_duplicate(protocol_run_id)
+            try:
+                target = runs.get(retry_of)
+            except DocumentNotFound:
+                raise RetryNotAllowed(f"{RetryNotAllowed.code}: 目标 run 不存在")
+
+            def reject(reason: str) -> None:
+                raise RetryNotAllowed(f"{RetryNotAllowed.code}: {reason}")
+
+            if target.thread_id != thread_id:
+                reject("目标 run 属于另一个线程")
+            if target.status not in ("failed", "cancelled", "interrupted"):
+                reject("只能重试 failed/cancelled/interrupted 的 run")
+            thread_runs = runs.runs_for_thread(thread_id)
+            latest = max(thread_runs, key=lambda r: (r.updated_at, r.id))
+            if latest.id != target.id:
+                reject("目标 run 不是线程最新的产品 run")
+
+            thread = self._load_thread(thread_id)
+            if thread is None:
+                reject("线程不存在")
+            if thread.revision != client_revision:
+                raise RevisionConflict(
+                    f"线程 {thread_id} 期望 revision {client_revision}，实际 {thread.revision}"
+                )
+
+            run_id = f"run-{uuid4().hex}"
+            now = utc_now()
+            run = RunDocument.start(
+                run_id=run_id,
+                thread_id=thread_id,
+                protocol_run_id=protocol_run_id,
+                model_ref=model_ref,
+                trigger_message_id=target.trigger_message_id,
+                history_head_id=thread.messages[-1].id if thread.messages else None,
+                now=now,
+                retry_of=retry_of,
+            )
+            runs.replace(run)
+
+            def refresh_summary(doc: ThreadDocument) -> ThreadDocument:
+                return doc.model_copy(update={"last_run": RunSummary(
+                    id=run_id, status="running", updated_at=utc_now(), retry_of=retry_of,
+                )})
+
+            updated_thread = threads.update(thread_id, thread.revision, refresh_summary)
+
+            try:
+                runtime = self._factory.create(
+                    model_ref=model_ref,
+                    secrets=secrets,
+                    model_builder=model_builder,
+                    tools=tools,
+                    thread_id=thread_id,
+                    middleware=middleware,
+                )
+            except Exception:
+                runs.replace(run.model_copy(update={
+                    "status": "failed",
+                    "updated_at": utc_now(),
+                    "ended_at": utc_now(),
+                    "error_code": "GRAPH_BUILD_FAILED",
+                    "error_message": "Graph 构建失败",
+                }))
+                threads.update(
+                    thread_id,
+                    updated_thread.revision,
+                    lambda doc: doc.model_copy(update={"last_run": RunSummary(
+                        id=run_id, status="failed", updated_at=utc_now(), retry_of=retry_of,
+                    )}),
+                )
+                raise
+
+            model_history = updated_thread.model_history()
+            handle = ActiveRunHandle(
+                runtime=runtime,
+                phase="running",
+                thread_revision=updated_thread.revision,
+                product_run_id=run_id,
+                protocol_run_ids=[protocol_run_id],
+                trigger_message_id=target.trigger_message_id,
+                history_snapshot=tuple(model_history),
+            )
+            handle.journal = RunJournal(threads=threads, runs=runs, handle=handle)
+            self._handles[thread_id] = handle
+            return StartAdmission(
+                handle=handle,
+                run=runs.get(run_id),
+                input=runtime.run_input(protocol_run_id=protocol_run_id, messages=model_history),
+                revisions=[updated_thread.revision],
+            )
+
     async def mark_awaiting_approval(self, thread_id: str) -> None:
         async with self._lock(thread_id):
             handle = self._handles.get(thread_id)

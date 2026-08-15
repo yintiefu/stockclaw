@@ -287,14 +287,24 @@ def test_trusted_proxy_https_is_allowed(monkeypatch):
     assert response.status_code == 200
 
 
-def test_retry_is_rejected_until_1b(monkeypatch):
+def test_retry_requires_revision_and_durable_target(monkeypatch):
     reset_coordinator()
     patch_plain(monkeypatch)
+    # 1B：retry 必须携带权威 revision；缺省 → 400
     payload = deepcopy(START)
+    payload["messages"] = []  # retry 不得携带新消息
     payload["forwardedProps"]["runtime"]["retryOf"] = "run-old"
+    payload["forwardedProps"]["runtime"].pop("threadRevision", None)  # 缺省 revision 的 retry
     response = client.post("/api/agent/run", json=payload, headers=HEADERS)
     assert response.status_code == 400
-    assert response.json()["code"] == "RETRY_REQUIRES_DURABLE_HISTORY"
+    assert response.json()["code"] == "INVALID_RUNTIME_PROPS"
+
+    # 带 revision 但目标 run 不存在 → 409 RETRY_NOT_ALLOWED（结构化冲突体）
+    payload["forwardedProps"]["runtime"]["threadRevision"] = 0
+    response = client.post("/api/agent/run", json=payload, headers=HEADERS)
+    assert response.status_code == 409
+    assert response.json()["code"] == "RETRY_NOT_ALLOWED"
+    assert set(response.json().keys()) == {"code", "detail", "thread_id", "product_run_id", "status"}
 
 
 async def post_then_disconnect(app, payload: dict) -> list[dict]:

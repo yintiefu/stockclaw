@@ -25,6 +25,7 @@ from agent.runs import (
     DuplicateRunTerminal,
     MessageConflict,
     ResumeRejected,
+    RetryNotAllowed,
     RunCoordinator,
     ThreadBusy,
 )
@@ -102,6 +103,18 @@ def _error_response(code: str, detail: str, status: int = 400) -> JSONResponse:
     return JSONResponse(status_code=status, content={"code": code, "detail": detail})
 
 
+def _conflict_response(code: str, detail: str, *, thread_id: str | None = None,
+                       product_run_id: str | None = None, run_status: str | None = None) -> JSONResponse:
+    """结构化 409：snake_case 线格式（code/detail/thread_id/product_run_id/status）。"""
+    return JSONResponse(status_code=409, content={
+        "code": code,
+        "detail": detail,
+        "thread_id": thread_id,
+        "product_run_id": product_run_id,
+        "status": run_status,
+    })
+
+
 def _error_event(message: str) -> RunErrorEvent:
     return RunErrorEvent(message=message, code="AGENT_RUN_FAILED")
 
@@ -160,6 +173,12 @@ def _classify(input_data: RunAgentInput) -> str:
     messages = input_data.messages or []
 
     has_cancelled = any(isinstance(e, dict) and e.get("status") == "cancelled" for e in resume_entries)
+    runtime_raw = forwarded_props.get("runtime") or {}
+    retry_of = runtime_raw.get("retryOf") if isinstance(runtime_raw, dict) else None
+    if retry_of is not None:
+        if resume_entries or messages:
+            raise ValueError("retry 不得携带 resume 或新消息")
+        return "retry"
 
     if resume_entries and has_cancelled:
         # steer-away：全部 cancelled + 最后一条是新 user message（前面是客户端历史前缀）
@@ -198,11 +217,6 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
 
     forwarded_props = input_data.forwarded_props or {}
     runtime_props_raw = forwarded_props.get("runtime") or {}
-    if isinstance(runtime_props_raw, dict) and runtime_props_raw.get("retryOf"):
-        return _error_response(
-            "RETRY_REQUIRES_DURABLE_HISTORY",
-            "重试需要 1B 的持久化运行历史，1A 暂不支持",
-        )
     try:
         runtime_props = RuntimeForwardedProps.model_validate(runtime_props_raw or {})
     except Exception:
@@ -215,6 +229,9 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
         mode = _classify(input_data)
     except ValueError as exc:
         return _error_response("INVALID_REQUEST_SHAPE", str(exc))
+    if mode == "retry" and runtime_props.thread_revision is None:
+        # 1A 兼容缺省 revision 只覆盖 start/resume/steer-away；retry 必须带权威 revision
+        return _error_response("INVALID_RUNTIME_PROPS", "retry 请求必须携带 runtime.threadRevision")
 
     secrets = RunSecrets(model_api_key=model_key)
     model_ref: ModelRef = runtime_props.model
@@ -226,7 +243,21 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
     middleware = build_middleware()
 
     try:
-        if mode == "steer_away":
+        if mode == "retry":
+            admission = await services.coordinator.acquire_retry(
+                model_ref=model_ref,
+                secrets=secrets,
+                model_builder=model_builder,
+                tools=tools,
+                thread_id=thread_id,
+                middleware=middleware,
+                protocol_run_id=run_id,
+                retry_of=runtime_props.retry_of or "",
+                client_revision=runtime_props.thread_revision or 0,
+            )
+            handle = admission.handle
+            adapter_input = admission.input
+        elif mode == "steer_away":
             admission = await services.coordinator.acquire_steer_away(
                 thread_id,
                 entries=resume_entries,
@@ -268,18 +299,36 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
             handle = admission.handle
             adapter_input = admission.input
     except ThreadBusy as exc:
-        return _error_response(exc.code, str(exc), 409)
+        return _conflict_response(exc.code, str(exc), thread_id=thread_id)
     except ResumeRejected as exc:
-        return _error_response(exc.code, str(exc), 409)
-    except (DuplicateRunActive, DuplicateRunTerminal, MessageConflict) as exc:
-        return _error_response(exc.code, str(exc), 409)
+        return _conflict_response(exc.code, str(exc), thread_id=thread_id)
+    except RetryNotAllowed as exc:
+        status = None
+        product_run_id = runtime_props.retry_of
+        if product_run_id:
+            try:
+                status = services.runs.get(product_run_id).status
+            except Exception:
+                status = None
+        return _conflict_response(exc.code, str(exc), thread_id=thread_id,
+                                  product_run_id=product_run_id, run_status=status)
+    except DuplicateRunActive as exc:
+        return _conflict_response(exc.code, str(exc), thread_id=thread_id,
+                                  product_run_id=run_id, run_status="running")
+    except DuplicateRunTerminal as exc:
+        persisted = services.runs.find_by_protocol_run_id(run_id)
+        return _conflict_response(exc.code, str(exc), thread_id=thread_id,
+                                  product_run_id=persisted.id if persisted else None,
+                                  run_status=persisted.status if persisted else "completed")
+    except MessageConflict as exc:
+        return _conflict_response(exc.code, str(exc), thread_id=thread_id)
     except RevisionConflict as exc:
-        return _error_response(exc.code, str(exc), 409)
+        return _conflict_response(exc.code, str(exc), thread_id=thread_id)
     except ValueError as exc:
         return _error_response("RESUME_REJECTED", str(exc))
     except RunConfigMismatch as exc:
-        # spec：resume 的 ModelRef 与活动线程不一致 → 409
-        return _error_response(exc.code, str(exc), 409)
+        # spec：resume 的 ModelRef 与活动线程不一致 → 409（前端统一走权威重载）
+        return _conflict_response(exc.code, str(exc), thread_id=thread_id)
 
     bridge = AgentProtocolBridge(thread_id, run_id, pending=handle.pending_interrupts)
     adapter = handle.runtime.new_adapter(run_id)

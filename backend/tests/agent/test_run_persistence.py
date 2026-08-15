@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from ag_ui.core.types import UserMessage
 
-from agent.models import AgentMessage, ModelRef, RunSecrets, ThreadDocument
+from agent.models import AgentMessage, ModelRef, RunDocument, RunSecrets, ThreadDocument
 from agent.protocol import PendingInterrupt
 from agent.runs import (
     DuplicateRunActive,
@@ -326,7 +326,14 @@ def http(tmp_path, monkeypatch):
 
 
 def start_payload_json(thread_id="thread-http", run_id="protocol-http", content="hello", revision=0, prefix=(), user_id="user-http"):
-    messages = [{"id": m[0], "role": "user", "content": m[1]} for m in prefix]
+    # prefix 元素：(id, content) 视为 user；(id, role, content) 保留原角色
+    prefix_messages = []
+    for item in prefix:
+        if len(item) == 3:
+            prefix_messages.append({"id": item[0], "role": item[1], "content": item[2]})
+        else:
+            prefix_messages.append({"id": item[0], "role": "user", "content": item[1]})
+    messages = prefix_messages
     messages.append({"id": user_id, "role": "user", "content": content})
     return {
         "threadId": thread_id,
@@ -549,3 +556,159 @@ async def test_patch_during_active_run_adopts_revision(tmp_path, monkeypatch):
     assert thread.title == "运行中改名"
     assert thread.last_run.status == "completed"
     assert thread.revision >= 3
+
+
+# ---- Task 6：严格重试与完整准入 ----
+
+
+def retry_payload(thread_id, protocol_run_id, revision, retry_of):
+    return {
+        "threadId": thread_id,
+        "runId": protocol_run_id,
+        "state": {},
+        "messages": [],
+        "tools": [],
+        "context": [],
+        "forwardedProps": {"runtime": {
+            "model": {"provider": "fixture", "baseURL": "https://example.com/v1", "model": "fixture-model"},
+            "threadRevision": revision,
+            "retryOf": retry_of,
+        }},
+    }
+
+
+@pytest.mark.asyncio
+async def test_retry_creates_new_product_run_without_duplicate_user_message(tmp_path, monkeypatch):
+    services = build_services(tmp_path / "agent")
+    monkeypatch.setattr(router_module, "services", services)
+    monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [])
+    monkeypatch.setattr("agent.router.build_middleware", lambda: ())
+    RECORDED_INPUTS.clear()
+    monkeypatch.setattr(
+        "agent.router.build_chat_model",
+        lambda ref, sec: ScriptedChatModel([]),  # 空脚本 → 模型异常
+    )
+    client = TestClient(app_module.app, client=("127.0.0.1", 50013))
+    failed = client.post("/api/agent/run", json=start_payload_json(thread_id="thread-retry", run_id="protocol-retry-1"), headers={
+        "X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"})
+    assert failed.status_code == 200 and "RUN_ERROR" in failed.text
+    failed_run = services.runs.list_documents()[0]
+    assert failed_run.status == "failed"
+    thread = services.threads.get("thread-retry")
+
+    monkeypatch.setattr(
+        "agent.router.build_chat_model",
+        lambda ref, sec: RecordingModel([AIMessage(content="重试后的完整回答")]),
+    )
+    retry_response = client.post("/api/agent/run", json=retry_payload(
+        "thread-retry", "protocol-retry", thread.revision, failed_run.id,
+    ), headers={"X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"})
+    assert retry_response.status_code == 200, retry_response.text
+
+    retry_run = [r for r in services.runs.list_documents() if r.id != failed_run.id][0]
+    assert retry_run.retry_of == failed_run.id
+    assert retry_run.id != failed_run.id
+    assert retry_run.protocol_run_ids == ["protocol-retry"]
+    thread = services.threads.get("thread-retry")
+    assert [m.id for m in thread.messages].count("user-http") == 1
+    first_user_input = RECORDED_INPUTS[0]
+    retry_input = RECORDED_INPUTS[-1]
+    assert [getattr(m, "content", None) for m in retry_input] == [getattr(m, "content", None) for m in first_user_input]
+    assert thread.last_run.id == retry_run.id
+    assert thread.last_run.status == "completed"
+    assert services.runs.get(failed_run.id).status == "failed"  # 原运行不被改动
+
+
+@pytest.mark.asyncio
+async def test_retry_rejections_are_409_with_structured_body(tmp_path, monkeypatch):
+    services = build_services(tmp_path / "agent")
+    monkeypatch.setattr(router_module, "services", services)
+    monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [])
+    monkeypatch.setattr("agent.router.build_middleware", lambda: ())
+    monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: PausingChatModel([AIMessage(content="ok")]))
+    client = TestClient(app_module.app, client=("127.0.0.1", 50014))
+    hdrs = {"X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"}
+    ok = client.post("/api/agent/run", json=start_payload_json(thread_id="thread-r2", run_id="protocol-r2-1"), headers=hdrs)
+    assert ok.status_code == 200
+    completed = sorted(services.runs.list_documents(), key=lambda r: r.updated_at)[-1]
+    thread = services.threads.get("thread-r2")
+
+    older = RunDocument.start(
+        run_id="run-older", thread_id="thread-r2", protocol_run_id="protocol-old",
+        model_ref=MODEL_REF, trigger_message_id="user-http", history_head_id=None, now="2026-08-15T00:00:00Z",
+    )
+    services.runs.replace(older.model_copy(update={"status": "failed", "updated_at": "2026-08-15T00:00:01Z"}))
+    resp = client.post("/api/agent/run", json=retry_payload("thread-r2", "protocol-x", thread.revision, "run-older"), headers=hdrs)
+    assert resp.status_code == 409 and resp.json()["code"] == "RETRY_NOT_ALLOWED"
+    assert set(resp.json().keys()) == {"code", "detail", "thread_id", "product_run_id", "status"}
+
+    resp = client.post("/api/agent/run", json=retry_payload("thread-r2", "protocol-y", thread.revision, completed.id), headers=hdrs)
+    assert resp.status_code == 409 and resp.json()["code"] == "RETRY_NOT_ALLOWED"
+
+    services.threads.create(ThreadDocument.new("thread-other", "别的线程", now="2026-08-15T00:00:00Z"))
+    other = RunDocument.start(
+        run_id="run-other", thread_id="thread-other", protocol_run_id="protocol-other",
+        model_ref=MODEL_REF, trigger_message_id="u-o", history_head_id=None, now="2026-08-15T00:00:00Z",
+    )
+    services.runs.replace(other.model_copy(update={"status": "failed", "updated_at": "2026-08-15T00:00:02Z"}))
+    resp = client.post("/api/agent/run", json=retry_payload("thread-r2", "protocol-z", thread.revision, "run-other"), headers=hdrs)
+    assert resp.status_code == 409 and resp.json()["code"] == "RETRY_NOT_ALLOWED"
+
+    def _content(m):
+        return m.content if isinstance(m.content, str) else json.dumps(m.content, ensure_ascii=False)
+    prefix = [(m.id, m.role, _content(m)) for m in thread.messages]
+    resp = client.post("/api/agent/run", json=start_payload_json(
+        thread_id="thread-r2", run_id="protocol-r2-2", content="第二轮", user_id="user-r2-2",
+        revision=thread.revision, prefix=prefix,
+    ), headers=hdrs)
+    assert resp.status_code == 200, resp.text
+    thread = services.threads.get("thread-r2")
+    resp = client.post("/api/agent/run", json=retry_payload("thread-r2", "protocol-w", thread.revision, completed.id), headers=hdrs)
+    assert resp.status_code == 409 and resp.json()["code"] == "RETRY_NOT_ALLOWED"
+
+    latest = sorted(services.runs.list_documents(), key=lambda r: r.updated_at)[-1]
+    latest_failed = latest.model_copy(update={
+        "status": "failed",
+        "updated_at": utc_now(),
+    })
+    services.runs.replace(latest_failed)
+    thread = services.threads.get("thread-r2")
+    resp = client.post("/api/agent/run", json=retry_payload("thread-r2", "protocol-v", 0, latest_failed.id), headers=hdrs)
+    assert resp.status_code == 409 and resp.json()["code"] == "THREAD_REVISION_CONFLICT"
+    assert thread.revision >= 1
+
+
+def test_retry_without_revision_is_invalid_runtime_props(tmp_path, monkeypatch):
+    services = build_services(tmp_path / "agent")
+    monkeypatch.setattr(router_module, "services", services)
+    monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [])
+    monkeypatch.setattr("agent.router.build_middleware", lambda: ())
+    monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: ScriptedChatModel([]))
+    client = TestClient(app_module.app, client=("127.0.0.1", 50015))
+    payload = retry_payload("thread-r3", "protocol-r3", None, "run-missing")
+    resp = client.post("/api/agent/run", json=payload, headers={
+        "X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"})
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "INVALID_RUNTIME_PROPS"
+
+
+@pytest.mark.asyncio
+async def test_lost_revision_event_converges_via_409_without_duplicate_write(tmp_path, monkeypatch):
+    services = build_services(tmp_path / "agent")
+    monkeypatch.setattr(router_module, "services", services)
+    monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [])
+    monkeypatch.setattr("agent.router.build_middleware", lambda: ())
+    monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: PausingChatModel([AIMessage(content="ok")]))
+    client = TestClient(app_module.app, client=("127.0.0.1", 50016))
+    hdrs = {"X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"}
+    ok = client.post("/api/agent/run", json=start_payload_json(thread_id="thread-cv", run_id="protocol-cv-1"), headers=hdrs)
+    assert ok.status_code == 200
+    server_revision = services.threads.get("thread-cv").revision
+
+    stale = client.post("/api/agent/run", json=start_payload_json(
+        thread_id="thread-cv", run_id="protocol-cv-2", content="第二轮", user_id="user-cv-2", revision=0,
+    ), headers=hdrs)
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "THREAD_REVISION_CONFLICT"
+    assert services.threads.get("thread-cv").revision == server_revision
+    assert len(services.runs.list_documents()) == 1
