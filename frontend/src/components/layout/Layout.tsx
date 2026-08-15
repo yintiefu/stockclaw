@@ -3,8 +3,7 @@ import { Link, Outlet, useLocation } from "react-router-dom";
 import {
   Activity, Radar, LayoutGrid, Wallet, Settings, Search, NotebookPen,
   Moon, Sun, ChevronsLeft, ChevronsRight, LineChart, Github, UserRound,
-  Cog, Cpu, Database, Cable, Rocket, FlaskConical, Star, FileText, Swords,
-} from "lucide-react";
+  Cog, Cpu, Database, Cable, Rocket, FlaskConical, Star, FileText, Swords, Bot } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useDarkMode } from "@/hooks/useDarkMode";
 import { storageGet, storageSet } from "@/lib/storage";
@@ -30,6 +29,7 @@ const NAV = [
   { to: "/my-reports", icon: FileText, label: "我的研报" },
   { to: "/notes", icon: NotebookPen, label: "研究记录" },
   { to: "/settings", icon: Settings, label: "接入 AI" },
+  { to: "/agent", icon: Bot, label: "Agent 工作台" },
 ];
 
 // 常看的板块，作为「板块中心」下的快捷入口（缩进显示）。
