@@ -3,25 +3,58 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import os
-from typing import Any, Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Literal
 
 from ag_ui.core.events import RunErrorEvent, RunFinishedEvent
 from ag_ui.core.types import RunAgentInput
 from ag_ui.encoder import EventEncoder
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import BaseTool
+from pydantic import BaseModel, Field
 
-from agent.models import ModelRef, RuntimeForwardedProps, RunSecrets
+from agent.models import ModelRef, RunSecrets, RunSummary, RuntimeForwardedProps, ThreadDocument
 from agent.protocol import AgentProtocolBridge, PendingInterrupt
 from agent.runs import ResumeRejected, RunCoordinator, ThreadBusy
 from agent.runtime import AgentFactory, RunConfigMismatch, build_chat_model
+from agent.stores import (
+    AgentPaths,
+    DocumentCorrupt,
+    DocumentNotFound,
+    InvalidDocumentId,
+    RecoveryWarning,
+    RevisionConflict,
+    RunStore,
+    ThreadStore,
+    default_agent_root,
+    reconcile_agent_data,
+    utc_now,
+)
 from agent.tool_registry import build_builtin_tools
 
 router = APIRouter(prefix="/api/agent")
 
-coordinator = RunCoordinator(factory=AgentFactory())
+
+@dataclass
+class AgentServices:
+    paths: AgentPaths
+    threads: ThreadStore
+    runs: RunStore
+    coordinator: RunCoordinator
+
+
+def build_services(root: Path | None = None) -> AgentServices:
+    paths = AgentPaths(Path(root) if root is not None else default_agent_root())
+    threads = ThreadStore(paths)
+    runs = RunStore(paths)
+    coordinator = RunCoordinator(factory=AgentFactory(), threads=threads, runs=runs)
+    return AgentServices(paths, threads, runs, coordinator)
+
+
+services = build_services()
 
 
 def build_middleware() -> tuple[Any, ...]:
@@ -145,7 +178,7 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
 
     try:
         if mode == "steer_away":
-            handle = await coordinator.acquire_steer_away(
+            handle = await services.coordinator.acquire_steer_away(
                 thread_id,
                 entries=resume_entries,
                 validate=_validate_steer_away,
@@ -157,7 +190,7 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
             )
             adapter_input = _without_resume_command(input_data)
         elif mode == "resume":
-            handle, resume_value = await coordinator.acquire_resume(
+            handle, resume_value = await services.coordinator.acquire_resume(
                 thread_id,
                 model_ref=model_ref,
                 secrets=secrets,
@@ -166,7 +199,7 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
             )
             adapter_input = handle.runtime.resume_input(run_id, resume_value)
         else:
-            handle = await coordinator.acquire_start(
+            handle = await services.coordinator.acquire_start(
                 model_ref=model_ref,
                 secrets=secrets,
                 model_builder=model_builder,
@@ -194,18 +227,18 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
         try:
             async for event in adapter.run(adapter_input):
                 if await request.is_disconnected():
-                    await coordinator.cancel(thread_id)
+                    await services.coordinator.cancel(thread_id)
                     return
                 converted_events = bridge.convert(event)
                 if isinstance(event, RunFinishedEvent) and bridge.pending:
                     handle.pending_interrupts = list(bridge.pending)
-                    await coordinator.mark_awaiting_approval(thread_id)
+                    await services.coordinator.mark_awaiting_approval(thread_id)
                     terminal = "awaiting_approval"
                 for converted in converted_events:
                     yield encoder.encode(converted)
         except asyncio.CancelledError:
             # anyio 取消作用域里不能 await，用同步路径清理
-            coordinator.cancel_sync(thread_id)
+            services.coordinator.cancel_sync(thread_id)
             raise
         except Exception as exc:
             message = str(exc).replace(model_key, "[redacted]")[:1000]
@@ -213,6 +246,148 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
             terminal = "failed"
         finally:
             if terminal != "awaiting_approval":
-                await coordinator.finish_if_terminal(thread_id, terminal)
+                await services.coordinator.finish_if_terminal(thread_id, terminal)
 
     return StreamingResponse(event_generator(), media_type=encoder.get_content_type())
+
+
+# ---- 1B：线程 / 运行 REST ----
+
+
+class ThreadCreate(BaseModel):
+    title: str = "新会话"
+
+
+class ThreadPatch(BaseModel):
+    revision: int = Field(ge=0)
+    title: str = Field(min_length=1)
+
+
+class ThreadSummaryResponse(BaseModel):
+    id: str
+    title: str
+    updated_at: str
+    revision: int
+    last_run: RunSummary | None = None
+
+
+class RecoveryWarningResponse(BaseModel):
+    code: Literal["DOCUMENT_CORRUPT"]
+    document_type: Literal["thread", "run"]
+    filename: str
+
+
+class ThreadListResponse(BaseModel):
+    threads: list[ThreadSummaryResponse]
+    warnings: list[RecoveryWarningResponse]
+
+
+def _store_error_response(exc: Exception, status: int) -> JSONResponse:
+    code = getattr(exc, "code", "AGENT_STORE_ERROR")
+    return JSONResponse(status_code=status, content={"code": code, "detail": str(exc)})
+
+
+def _summary_of(thread: ThreadDocument) -> ThreadSummaryResponse:
+    return ThreadSummaryResponse(
+        id=thread.id,
+        title=thread.title,
+        updated_at=thread.updated_at,
+        revision=thread.revision,
+        last_run=thread.last_run,
+    )
+
+
+@router.get("/threads", response_model=ThreadListResponse)
+async def list_threads():
+    threads, thread_warnings = await asyncio.to_thread(services.threads.list_documents)
+    run_scan = await asyncio.to_thread(services.runs.scan)
+    # run 的 last_run 已经写在线程文档里；这里只把 run 侧隔离文件一并向 UI 报告
+    summaries = [_summary_of(t) for t in threads]
+    warnings = [
+        RecoveryWarningResponse(code=w.code, document_type=w.document_type, filename=w.filename)
+        for w in list(thread_warnings) + list(run_scan.warnings)
+    ]
+    return ThreadListResponse(threads=summaries, warnings=warnings)
+
+
+@router.post("/threads", status_code=201)
+async def create_thread(payload: ThreadCreate):
+    thread_id = _new_thread_id()
+    doc = ThreadDocument.new(thread_id, payload.title, now=utc_now())
+    await asyncio.to_thread(services.threads.create, doc)
+    return doc.model_dump(mode="json")
+
+
+@router.get("/threads/{thread_id}")
+async def get_thread(thread_id: str):
+    try:
+        doc = await asyncio.to_thread(services.threads.get, thread_id)
+    except InvalidDocumentId as exc:
+        return _store_error_response(exc, 400)
+    except DocumentNotFound as exc:
+        return _store_error_response(exc, 404)
+    except DocumentCorrupt as exc:
+        return _store_error_response(exc, 500)
+    return doc.model_dump(mode="json")
+
+
+@router.patch("/threads/{thread_id}")
+async def patch_thread(thread_id: str, payload: ThreadPatch):
+    try:
+        updated = await services.coordinator.patch_thread(thread_id, payload.revision, payload.title)
+    except InvalidDocumentId as exc:
+        return _store_error_response(exc, 400)
+    except DocumentNotFound as exc:
+        return _store_error_response(exc, 404)
+    except RevisionConflict as exc:
+        return _store_error_response(exc, 409)
+    except DocumentCorrupt as exc:
+        return _store_error_response(exc, 500)
+    return updated.model_dump(mode="json")
+
+
+@router.delete("/threads/{thread_id}", status_code=204)
+async def delete_thread(thread_id: str):
+    try:
+        await services.coordinator.delete_thread(thread_id)
+    except InvalidDocumentId as exc:
+        return _store_error_response(exc, 400)
+    except ThreadBusy as exc:
+        return _store_error_response(exc, 409)
+    except DocumentNotFound as exc:
+        return _store_error_response(exc, 404)
+    except DocumentCorrupt as exc:
+        return _store_error_response(exc, 500)
+    return Response(status_code=204)
+
+
+@router.get("/runs/{run_id}")
+async def get_run(run_id: str):
+    try:
+        run = await asyncio.to_thread(services.runs.get, run_id)
+    except InvalidDocumentId as exc:
+        return _store_error_response(exc, 400)
+    except DocumentNotFound as exc:
+        return _store_error_response(exc, 404)
+    except DocumentCorrupt as exc:
+        return _store_error_response(exc, 500)
+    return run.model_dump(mode="json")
+
+
+def _new_thread_id() -> str:
+    from uuid import uuid4
+
+    return f"th-{uuid4().hex}"
+
+
+# ---- 1B：FastAPI 生命周期（启动对账 / 退出清理） ----
+
+
+async def startup_agent_services() -> None:
+    # 调用时再解引用模块级 services，测试可先 monkeypatch 再进入 lifespan
+    current = services
+    await asyncio.to_thread(reconcile_agent_data, current.paths, current.threads, current.runs)
+
+
+async def shutdown_agent_services() -> None:
+    await services.coordinator.shutdown()

@@ -1,6 +1,7 @@
 """1A 垂直切片：离线驱动 POST /api/agent/run，校验事件顺序与边界行为。"""
 
 import json
+import tempfile
 
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
@@ -50,7 +51,11 @@ def parse_events(text: str) -> list[dict]:
 
 
 def patch_model(monkeypatch, replies):
-    router_module.coordinator = RunCoordinator()
+    from agent.router import build_services
+
+    services = build_services(tempfile.mkdtemp())
+    router_module.services = services
+    router_module.coordinator = services.coordinator  # 测试兼容别名
     CALLS.clear()
     monkeypatch.setattr("agent.router.build_chat_model", lambda a, b: ScriptedChatModel(replies))
     monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [slice_tool])

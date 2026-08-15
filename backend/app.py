@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,13 +30,25 @@ import myreports as mr
 import reflection as reflect_layer
 
 from agent.router import router as agent_router
+from agent.router import shutdown_agent_services, startup_agent_services
 
 
 from version import read_version
 
 __version__ = read_version()
 
-app = FastAPI(title="Vibe-Research API", version=__version__)
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # 1B：启动对账（活跃 run → interrupted）+ 退出时释放活动句柄
+    await startup_agent_services()
+    try:
+        yield
+    finally:
+        await shutdown_agent_services()
+
+
+app = FastAPI(title="Vibe-Research API", version=__version__, lifespan=_lifespan)
 
 # 每半小时后台刷新持仓数据
 pf.start_scheduler(1800)

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
 from agent.models import ModelRef, RunSecrets
 from agent.protocol import PendingInterrupt
 from agent.runtime import AgentFactory, RuntimeHandle
+
+if TYPE_CHECKING:
+    from agent.stores import RunStore, ThreadStore
 
 Phase = Literal["running", "awaiting_approval", "completed", "failed", "cancelled"]
 
@@ -18,6 +21,7 @@ class ActiveRunHandle:
     runtime: RuntimeHandle
     phase: Phase
     pending_interrupts: list[PendingInterrupt] = field(default_factory=list)
+    thread_revision: int | None = None
 
 
 class ThreadBusy(RuntimeError):
@@ -37,10 +41,18 @@ class RunCoordinator:
     持锁内完成校验与写入，避免并发请求通过校验后彼此覆盖。
     """
 
-    def __init__(self, factory: AgentFactory | None = None):
+    def __init__(
+        self,
+        factory: AgentFactory | None = None,
+        threads: "ThreadStore | None" = None,
+        runs: "RunStore | None" = None,
+    ):
         self._factory = factory or AgentFactory()
         self._locks: dict[str, asyncio.Lock] = {}
         self._handles: dict[str, ActiveRunHandle] = {}
+        # 1B：可选持久化引用；1A 测试仍可 RunCoordinator() 纯内存构造
+        self._threads = threads
+        self._runs = runs
 
     def _lock(self, thread_id: str) -> asyncio.Lock:
         if thread_id not in self._locks:
@@ -196,3 +208,39 @@ class RunCoordinator:
 
     def active(self, thread_id: str) -> ActiveRunHandle | None:
         return self._handles.get(thread_id)
+
+    # ---- 1B：线程 CRUD 走与 run 准入相同的每线程锁 ----
+
+    def _require_stores(self) -> tuple["ThreadStore", "RunStore"]:
+        if self._threads is None or self._runs is None:
+            raise RuntimeError("RunCoordinator 未注入 ThreadStore/RunStore（1A 纯内存构造）")
+        return self._threads, self._runs
+
+    async def patch_thread(self, thread_id: str, revision: int, title: str):
+        threads, _ = self._require_stores()
+        async with self._lock(thread_id):
+            updated = await asyncio.to_thread(
+                threads.update, thread_id, revision,
+                lambda doc: doc.model_copy(update={"title": title}),
+            )
+            handle = self._handles.get(thread_id)
+            if handle is not None:
+                # 活动 run 后续写入从 PATCH 后的 revision 继续，避免下次写冲突
+                handle.thread_revision = updated.revision
+            return updated
+
+    async def delete_thread(self, thread_id: str) -> None:
+        threads, runs = self._require_stores()
+        async with self._lock(thread_id):
+            handle = self._handles.get(thread_id)
+            if handle is not None and handle.phase in ("running", "awaiting_approval"):
+                raise ThreadBusy(f"{ThreadBusy.code}: thread {thread_id} has an active run")
+            thread_runs = await asyncio.to_thread(runs.runs_for_thread, thread_id)
+            for run in thread_runs:
+                await asyncio.to_thread(runs.delete, run.id)
+            await asyncio.to_thread(threads.delete, thread_id)
+
+    async def shutdown(self) -> None:
+        """进程退出：取消并释放所有活动句柄（持久化在 Task 5 加入）。"""
+        for thread_id in list(self._handles):
+            await self.cancel(thread_id)

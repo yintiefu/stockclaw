@@ -1,5 +1,6 @@
 import asyncio
 import json
+import tempfile
 from copy import deepcopy
 
 import pytest
@@ -80,7 +81,13 @@ def patch_interrupting(monkeypatch):
 
 
 def reset_coordinator():
-    router_module.coordinator = RunCoordinator()
+    # 1B：注入全新的 services（独立临时数据目录）；coordinator 只是测试兼容别名，
+    # 生产代码只读 router_module.services.coordinator。
+    from agent.router import build_services
+
+    services = build_services(tempfile.mkdtemp())
+    router_module.services = services
+    router_module.coordinator = services.coordinator
 
 
 def parse_events(text: str) -> list[dict]:
