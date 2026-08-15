@@ -2,6 +2,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 import pytest
 
+from agent.models import ModelRef, RunSecrets
 from agent.runtime import AgentFactory
 from tests.agent.fakes import ScriptedChatModel
 
@@ -21,7 +22,13 @@ async def test_create_agent_completes_a_tool_then_text_run():
         AIMessage(content="", tool_calls=[{"id": "call-1", "name": "lookup", "args": {"code": "600519"}}]),
         AIMessage(content="fixture answer"),
     ])
-    handle = AgentFactory().create(model=model, tools=[lookup], thread_id="thread-1")
+    handle = AgentFactory().create(
+        model_ref=ModelRef(provider="fixture", base_url="https://example.com/v1", model="fixture"),
+        secrets=RunSecrets(model_api_key="fixture-key"),
+        model_builder=lambda model_ref, secrets: model,
+        tools=[lookup],
+        thread_id="thread-1",
+    )
     events = [event async for event in handle.new_adapter("protocol-1").run(handle.start_input("hello"))]
 
     assert calls == ["600519"]

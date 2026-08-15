@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from ag_ui.core.events import (
     CustomEvent,
+    RawEvent,
     RunErrorEvent,
     RunFinishedEvent,
     ToolCallArgsEvent,
@@ -50,8 +51,21 @@ class AgentProtocolBridge:
         self._tool_call_order: list[str] = []
 
     def convert(self, event: Any) -> list[Any]:
+        if isinstance(event, RawEvent):
+            self._observe_raw_tool_calls(event)
+            return [event]
         if isinstance(event, ToolCallStartEvent):
-            self._tool_calls[event.tool_call_id] = {"name": event.tool_call_name, "args_text": ""}
+            # 锁定版本不发独立的 ARGS 增量；参数就在 START 的 raw_event chunk 里。
+            chunk_args = ""
+            chunk = (event.raw_event or {}).get("data", {}).get("chunk", {}) if isinstance(event.raw_event, dict) else {}
+            for piece in chunk.get("tool_call_chunks") or []:
+                if piece.get("id") == event.tool_call_id and piece.get("args"):
+                    chunk_args = piece["args"]
+                    break
+            self._tool_calls[event.tool_call_id] = {
+                "name": event.tool_call_name,
+                "args_text": chunk_args,
+            }
             self._tool_call_order.append(event.tool_call_id)
             return [event]
         if isinstance(event, ToolCallArgsEvent):
@@ -66,7 +80,10 @@ class AgentProtocolBridge:
         if isinstance(event, CustomEvent):
             if event.name != "on_interrupt":
                 return [RunErrorEvent(message=f"Unsupported custom event: {event.name}", code="UNSUPPORTED_CUSTOM_EVENT")]
-            self._capture(event.value)
+            # 本锁定版本里 CustomEvent.value 是 JSON 字符串而非 dict，统一解析。
+            raw = event.value
+            value = json.loads(raw) if isinstance(raw, str) else raw
+            self._capture(value)
             return []
         if isinstance(event, RunFinishedEvent) and self.pending:
             interrupts = [{
@@ -92,6 +109,22 @@ class AgentProtocolBridge:
 
     def cancelled(self) -> RunCancelledEvent:
         return RunCancelledEvent(thread_id=self.thread_id, run_id=self.run_id)
+
+    def _observe_raw_tool_calls(self, event: RawEvent) -> None:
+        """锁定版本里中断前不会发 TOOL_CALL_* 事件；从 RawEvent 的模型输出里补观察。"""
+        payload = event.event if isinstance(event.event, dict) else {}
+        if payload.get("event") != "on_chat_model_end":
+            return
+        output = (payload.get("data") or {}).get("output") or {}
+        for call in output.get("tool_calls") or []:
+            call_id = call.get("id")
+            if not call_id or call_id in self._tool_calls:
+                continue
+            self._tool_calls[call_id] = {
+                "name": call.get("name"),
+                "args_text": json.dumps(call.get("args") or {}),
+            }
+            self._tool_call_order.append(call_id)
 
     def _ordered_entries(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         by_id: dict[str, dict[str, Any]] = {}
