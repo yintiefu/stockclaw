@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
-import { Link, Outlet, useLocation } from "react-router-dom";
+import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 import {
   Activity, Radar, LayoutGrid, Wallet, Settings, Search, NotebookPen,
-  Moon, Sun, ChevronsLeft, ChevronsRight, LineChart, Github, UserRound,
+  Moon, Sun, ChevronsLeft, ChevronsRight, ChevronDown, LineChart, Github, UserRound,
   Cog, Cpu, Database, Cable, Rocket, FlaskConical, Star, FileText, Swords, Bot } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useDarkMode } from "@/hooks/useDarkMode";
@@ -44,12 +44,24 @@ const SECTOR_LINKS = [
 
 export function Layout() {
   const { pathname } = useLocation();
+  const navigate = useNavigate();
   const { dark, toggle } = useDarkMode();
   const [collapsed, setCollapsed] = useState(() => storageGet("vr-sidebar") === "collapsed");
+  // 板块中心的子菜单：未持久化过时默认按当前是否在板块页展开
+  const [sectorsOpen, setSectorsOpen] = useState(() => {
+    const stored = storageGet("vr-sidebar-sectors");
+    if (stored === "open") return true;
+    if (stored === "closed") return false;
+    return pathname.startsWith("/sectors");
+  });
 
   useEffect(() => {
     storageSet("vr-sidebar", collapsed ? "collapsed" : "expanded");
   }, [collapsed]);
+
+  useEffect(() => {
+    storageSet("vr-sidebar-sectors", sectorsOpen ? "open" : "closed");
+  }, [sectorsOpen]);
 
   return (
     <div className="flex h-screen">
@@ -75,25 +87,42 @@ export function Layout() {
         <nav className={cn("flex-1 space-y-1 overflow-auto", collapsed ? "p-1.5" : "p-2.5")}>
           {NAV.map(({ to, icon: Icon, label }) => {
             const active = pathname === to;
+            // 板块中心：整行可点击展开/收起子菜单（同时保留跳转到板块总览）
+            const isSectors = to === "/sectors";
+            const subOpen = isSectors && sectorsOpen;
             return (
               <div key={to}>
                 <Link
                   to={to}
                   title={collapsed ? label : undefined}
+                  onClick={isSectors ? (e) => {
+                    e.preventDefault();
+                    setSectorsOpen((open) => !open);
+                    if (pathname !== to) {
+                      // 首次点击仍进入板块总览，之后点击只做展开/收起
+                      navigate(to);
+                    }
+                  } : undefined}
                   className={cn(
                     "flex items-center rounded-lg text-sm transition-colors",
                     collapsed ? "justify-center p-2.5" : "gap-2.5 px-3 py-2.5",
-                    active
+                    active || subOpen
                       ? "bg-primary/15 font-medium text-primary shadow-glow"
                       : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
                   )}
                 >
                   <Icon className="h-4 w-4 shrink-0" />
                   {!collapsed && label}
+                  {!collapsed && isSectors && (
+                    <ChevronDown
+                      className={cn("ml-auto h-3.5 w-3.5 shrink-0 transition-transform duration-200", subOpen && "rotate-180")}
+                      aria-label={subOpen ? "收起板块列表" : "展开板块列表"}
+                    />
+                  )}
                 </Link>
 
-                {/* 板块中心下方：常看板块的快捷入口（缩进） */}
-                {to === "/sectors" && (
+                {/* 板块中心下方：常看板块的快捷入口（缩进，可展开/收起） */}
+                {isSectors && subOpen && (
                   <div className={cn("mt-1 space-y-0.5", !collapsed && "ml-4 border-l border-border/40 pl-1.5")}>
                     {SECTOR_LINKS.map(({ to: st, icon: SIcon, label: slabel }) => {
                       const sactive = pathname === st;
