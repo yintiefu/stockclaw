@@ -1,0 +1,86 @@
+import json
+
+from ag_ui.core.events import (
+    CustomEvent, EventType, RunFinishedEvent,
+    ToolCallArgsEvent, ToolCallEndEvent, ToolCallStartEvent,
+)
+from agent.protocol import AgentProtocolBridge
+
+
+def legacy_interrupt(tool_call_id: str = "call-1") -> CustomEvent:
+    return CustomEvent(
+        type=EventType.CUSTOM,
+        name="on_interrupt",
+        value={
+            "action_requests": [{"name": "mcp__demo__quote", "args": {"code": "600519"}, "description": "review"}],
+            "review_configs": [{"action_name": "mcp__demo__quote", "allowed_decisions": ["approve", "reject"]}],
+        },
+    )
+
+
+def observe_tool_call(bridge: AgentProtocolBridge, tool_call_id: str = "call-1") -> None:
+    bridge.convert(ToolCallStartEvent(
+        tool_call_id=tool_call_id,
+        tool_call_name="mcp__demo__quote",
+        parent_message_id="assistant-1",
+    ))
+    bridge.convert(ToolCallArgsEvent(
+        tool_call_id=tool_call_id,
+        delta=json.dumps({"code": "600519"}),
+    ))
+    bridge.convert(ToolCallEndEvent(tool_call_id=tool_call_id))
+
+
+def test_legacy_interrupt_is_suppressed_and_finishes_with_standard_outcome():
+    bridge = AgentProtocolBridge("thread-1", "run-1")
+    observe_tool_call(bridge)
+    assert bridge.convert(legacy_interrupt()) == []
+    converted = bridge.convert(RunFinishedEvent(thread_id="thread-1", run_id="run-1"))
+    assert len(converted) == 1
+    payload = converted[0].model_dump(by_alias=True, mode="json")
+    assert payload["outcome"]["type"] == "interrupt"
+    assert payload["outcome"]["interrupts"][0]["reason"] == "tool_call"
+    assert "expiresAt" not in payload["outcome"]["interrupts"][0]
+
+
+def test_repeated_observation_reuses_bridge_id():
+    bridge = AgentProtocolBridge("thread-1", "run-1")
+    observe_tool_call(bridge)
+    bridge.convert(legacy_interrupt())
+    first = bridge.pending[0].bridge_interrupt_id
+    bridge.convert(legacy_interrupt())
+    assert bridge.pending[0].bridge_interrupt_id == first
+
+
+def test_unknown_custom_event_fails_closed():
+    bridge = AgentProtocolBridge("thread-1", "run-1")
+    event = CustomEvent(type=EventType.CUSTOM, name="surprise", value={})
+    assert bridge.convert(event)[0].code == "UNSUPPORTED_CUSTOM_EVENT"
+
+
+def test_cancelled_event_uses_the_standard_client_event_name():
+    payload = AgentProtocolBridge("thread-1", "run-1").cancelled().model_dump(by_alias=True)
+    assert payload == {"type": "RUN_CANCELLED", "threadId": "thread-1", "runId": "run-1"}
+
+
+def test_interleaved_tool_fragments_keep_call_ids_and_order():
+    bridge = AgentProtocolBridge("thread-1", "run-1")
+    bridge.convert(ToolCallStartEvent(tool_call_id="call-a", tool_call_name="tool_a"))
+    bridge.convert(ToolCallStartEvent(tool_call_id="call-b", tool_call_name="tool_b"))
+    bridge.convert(ToolCallArgsEvent(tool_call_id="call-a", delta='{"code":'))
+    bridge.convert(ToolCallArgsEvent(tool_call_id="call-b", delta='{"symbol":'))
+    bridge.convert(ToolCallArgsEvent(tool_call_id="call-a", delta='"600519"}'))
+    bridge.convert(ToolCallArgsEvent(tool_call_id="call-b", delta='"AAPL"}'))
+    bridge.convert(ToolCallEndEvent(tool_call_id="call-b"))
+    bridge.convert(ToolCallEndEvent(tool_call_id="call-a"))
+    bridge.convert(CustomEvent(type=EventType.CUSTOM, name="on_interrupt", value={
+        "action_requests": [
+            {"name": "tool_a", "args": {"code": "600519"}},
+            {"name": "tool_b", "args": {"symbol": "AAPL"}},
+        ],
+        "review_configs": [
+            {"action_name": "tool_a", "allowed_decisions": ["approve", "reject"]},
+            {"action_name": "tool_b", "allowed_decisions": ["approve", "reject"]},
+        ],
+    }))
+    assert [item.tool_call_id for item in bridge.pending] == ["call-a", "call-b"]
