@@ -3,3 +3,4 @@
 #         .venv/bin/pytest -m live          （联网核对数据源 shape，开源前/升级后用）
 pytest>=7
 httpx>=0.24   # fastapi TestClient 依赖
+pytest-asyncio==0.25.3
