@@ -94,3 +94,41 @@ it("surfaces in-stream RUN_ERROR via onRunError", async () => {
   await new Promise((r) => setTimeout(r, 10));
   expect(runErrors).toContain("上游余额不足");
 });
+
+it("armed retry sends retryOf, empty messages and the current revision", async () => {
+  let captured: RequestInit | undefined;
+  vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
+    captured = init;
+    return sseStream();
+  }));
+  const agent = new AgentHttpAgent(CONFIG, vi.fn(), vi.fn(), {
+    getRevision: () => 7,
+    onRevision: vi.fn(),
+  });
+  agent.armRetry("run-old");
+  await new Promise<void>((resolve, reject) => {
+    agent.run(INPUT).subscribe({ complete: resolve, error: reject });
+  });
+  const body = JSON.parse(String(captured?.body));
+  expect(body.messages).toEqual([]);
+  expect(body.forwardedProps.runtime.retryOf).toBe("run-old");
+  expect(body.forwardedProps.runtime.threadRevision).toBe(7);
+});
+
+it("intercepts thread.revision.updated CUSTOM events monotonically", async () => {
+  const revisions: Array<[string, number]> = [];
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(
+    'data: {"type":"CUSTOM","name":"thread.revision.updated","value":"{\\"threadId\\":\\"thread-1\\",\\"revision\\":2}"}\n\n'
+      + 'data: {"type":"CUSTOM","name":"thread.revision.updated","value":"{\\"threadId\\":\\"thread-1\\",\\"revision\\":1}"}\n\n'
+      + 'data: {"type":"RUN_FINISHED","threadId":"thread-1","runId":"run-1"}\n\n',
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  )));
+  const agent = new AgentHttpAgent(CONFIG, vi.fn(), vi.fn(), {
+    onRevision: (threadId, revision) => revisions.push([threadId, revision]),
+  });
+  await new Promise<void>((resolve, reject) => {
+    agent.run(INPUT).subscribe({ complete: resolve, error: reject });
+  });
+  await new Promise((r) => setTimeout(r, 10));
+  expect(revisions).toEqual([["thread-1", 2], ["thread-1", 1]]);
+});

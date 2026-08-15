@@ -31,13 +31,13 @@ class RuntimeForwardedProps(BaseModel):
     """forwardedProps.runtime 的服务端视图。
 
     `command` 是 AG-UI 顶层转发属性，不会出现在 runtime 内。
-    `thread_revision` 允许缺省是给已上线 1A 前端的临时兼容；Task 7 会改为必填。
+    `thread_revision` 必填：前端迁移后所有 run 形状都携带权威 revision。
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     model: ModelRef
-    thread_revision: int | None = Field(default=None, ge=0, validation_alias="threadRevision")
+    thread_revision: int = Field(ge=0, validation_alias="threadRevision")
     retry_of: str | None = Field(default=None, validation_alias="retryOf")
 
 

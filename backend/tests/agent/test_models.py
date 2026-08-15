@@ -28,14 +28,12 @@ def test_run_secret_masks_key():
     assert secrets.model_api_key.get_secret_value() == "spike-secret"
 
 
-def test_runtime_props_accept_1a_wire_shape_with_optional_revision():
-    # 与 1A 前端 AgentHttpAgent.requestInject 的真实负载一致：
-    # runtime 只含 model，command 保持在顶层；threadRevision 允许缺省（1A 兼容，Task 7 移除）。
-    props = RuntimeForwardedProps.model_validate({
-        "model": {"provider": "openai", "baseURL": "https://api.openai.com/v1", "model": "gpt-5-mini"},
-    })
-    assert props.thread_revision is None
-    assert props.retry_of is None
+def test_runtime_props_require_thread_revision_after_migration():
+    # Task 7 迁移后：缺省 threadRevision 一律拒绝（临时 1A 兼容路径已移除）
+    with pytest.raises(ValidationError):
+        RuntimeForwardedProps.model_validate({
+            "model": {"provider": "openai", "baseURL": "https://api.openai.com/v1", "model": "gpt-5-mini"},
+        })
 
 
 def test_runtime_props_accept_revision_and_retry_of():

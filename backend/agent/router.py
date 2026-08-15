@@ -229,9 +229,6 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
         mode = _classify(input_data)
     except ValueError as exc:
         return _error_response("INVALID_REQUEST_SHAPE", str(exc))
-    if mode == "retry" and runtime_props.thread_revision is None:
-        # 1A 兼容缺省 revision 只覆盖 start/resume/steer-away；retry 必须带权威 revision
-        return _error_response("INVALID_RUNTIME_PROPS", "retry 请求必须携带 runtime.threadRevision")
 
     secrets = RunSecrets(model_api_key=model_key)
     model_ref: ModelRef = runtime_props.model

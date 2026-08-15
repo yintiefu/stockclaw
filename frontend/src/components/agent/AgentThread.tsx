@@ -3,7 +3,9 @@ import {
   MessagePrimitive,
   ThreadPrimitive,
 } from "@assistant-ui/react";
-import { Send, Square, Wrench } from "lucide-react";
+import { RotateCcw, Send, Square, Wrench } from "lucide-react";
+
+import type { AgentThread } from "@/lib/agent/types";
 
 function UserMessage() {
   return (
@@ -51,7 +53,42 @@ function AssistantMessage() {
   );
 }
 
-export function AgentThread() {
+/** 重试动作：仅 failed/cancelled/interrupted 的最新 run 可重试。 */
+function RetryAction({
+  activeThread,
+  onRetry,
+}: {
+  activeThread: AgentThread | null;
+  onRetry: (runId: string) => void;
+}) {
+  const status = activeThread?.last_run?.status;
+  if (status !== "failed" && status !== "cancelled" && status !== "interrupted") return null;
+  const runId = activeThread?.last_run?.id;
+  if (!runId) return null;
+  return (
+    <button
+      onClick={() => {
+        // 装填 retryOf 后由页面触发 startRun（requestInit 会置空 messages）
+        onRetry(runId);
+      }}
+      className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs text-muted-foreground hover:text-primary"
+      title="用新的运行重试本轮"
+    >
+      <RotateCcw className="h-3.5 w-3.5" />
+      重试本轮
+    </button>
+  );
+}
+
+export function AgentThread({
+  activeThread = null,
+  onRetry = () => {},
+  statusNote = null,
+}: {
+  activeThread?: AgentThread | null;
+  onRetry?: (runId: string) => void;
+  statusNote?: string | null;
+}) {
   // 两个分支几何一致：running 状态不会撑动页面；队列在 runtime 层已禁用，
   // 禁用态无法提交第二次 start 请求。
   return (
@@ -61,7 +98,13 @@ export function AgentThread() {
           <p className="m-auto text-sm text-muted-foreground">开始一项投研任务</p>
         </ThreadPrimitive.Empty>
         <ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />
-        <ThreadPrimitive.ViewportFooter className="sticky bottom-0 mt-auto bg-background pt-3">
+        <ThreadPrimitive.ViewportFooter className="sticky bottom-0 mt-auto space-y-2 bg-background pt-3">
+          {statusNote ? (
+            <div className="rounded-lg border border-border bg-black/20 px-3 py-2 text-xs text-muted-foreground">
+              {statusNote}
+            </div>
+          ) : null}
+          <RetryAction activeThread={activeThread} onRetry={onRetry} />
           <ComposerPrimitive.Root className="flex min-h-12 items-end gap-2 rounded-md border border-border bg-background p-2">
             <ThreadPrimitive.If running={false}>
               <ComposerPrimitive.Input
