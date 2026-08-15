@@ -66,3 +66,16 @@ def test_gstock_quote_full_null_shape():
     q = gstock._quote_from({})
     assert set(q) == {"code", "name", "price", "open", "high", "low", "prev_close", "amount", "mcap", "change_pct"}
     assert all(v is None for v in q.values())
+
+
+def test_cors_preflight_allows_patch():
+    """Agent 工作台需要 PATCH 预检放行。"""
+    r = client.options(
+        "/api/agent/run",
+        headers={
+            "Origin": "http://127.0.0.1:5899",
+            "Access-Control-Request-Method": "PATCH",
+        },
+    )
+    assert r.status_code == 200
+    assert "PATCH" in r.headers.get("access-control-allow-methods", "")

@@ -28,6 +28,8 @@ import market
 import myreports as mr
 import reflection as reflect_layer
 
+from agent.router import router as agent_router
+
 
 from version import read_version
 
@@ -44,7 +46,7 @@ _ORIGINS = [o.strip() for o in os.environ.get("VR_ALLOW_ORIGINS", "*").split(","
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ORIGINS,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -73,6 +75,10 @@ def _validate(code: str) -> str:
     if not code.isdigit() or len(code) != 6:
         raise HTTPException(400, "代码必须是 6 位数字")
     return code
+
+
+# Agent 工作台（AG-UI 流式入口）
+app.include_router(agent_router)
 
 
 @app.get("/api/health")

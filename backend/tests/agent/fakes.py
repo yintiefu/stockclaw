@@ -46,3 +46,21 @@ class ScriptedChatModel(BaseChatModel):
             yield ChatGenerationChunk(message=AIMessageChunk(content=message.content))
         else:
             yield ChatGenerationChunk(message=AIMessageChunk(content="", tool_calls=message.tool_calls))
+
+
+class PausingChatModel(ScriptedChatModel):
+    """首个回复前阻塞一段时间（sync sleep 在线程池里跑，不卡事件循环），
+    让 http.disconnect 有机会在流式响应中途被处理。"""
+
+    pause_seconds: float = 0.2
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        import time
+        time.sleep(self.pause_seconds)
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
