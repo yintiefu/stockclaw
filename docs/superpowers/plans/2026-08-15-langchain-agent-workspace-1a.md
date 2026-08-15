@@ -107,13 +107,69 @@ Run:
 ```bash
 cd backend
 .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
-.venv/bin/python -c 'from langchain.agents import create_agent; from langchain.agents.middleware import HumanInTheLoopMiddleware; from langgraph.checkpoint.memory import MemorySaver; from ag_ui_langgraph import LangGraphAgent; from ag_ui.core.types import RunAgentInput; print("agent imports ok")'
+.venv/bin/python - <<'PY'
+from ag_ui.core.events import RunFinishedEvent
+from ag_ui.core.types import RunAgentInput
+from ag_ui_langgraph import LangGraphAgent
+from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langchain_core.tools import StructuredTool
+from langgraph.checkpoint.memory import MemorySaver
+
+
+async def probe_tool(**kwargs):
+    return kwargs
+
+
+schema = {
+    "type": "object",
+    "properties": {"code": {"type": "string"}},
+    "required": ["code"],
+}
+tool = StructuredTool.from_function(
+    coroutine=probe_tool,
+    name="probe_tool",
+    description="Probe raw JSON Schema support.",
+    args_schema=schema,
+)
+assert tool.args_schema == schema
+finished = RunFinishedEvent(
+    thread_id="thread-probe",
+    run_id="run-probe",
+    outcome={"type": "interrupt", "interrupts": []},
+)
+assert finished.model_dump()["outcome"]["type"] == "interrupt"
+assert callable(getattr(LangGraphAgent, "prepare_regenerate_stream", None))
+print("backend agent compatibility ok")
+PY
 
 cd ../frontend
-node -e 'Promise.all([import("@assistant-ui/react"), import("@assistant-ui/react-ag-ui"), import("@ag-ui/client")]).then(() => console.log("agent imports ok"))'
+node --input-type=module <<'JS'
+import { ComposerPrimitive, MessagePrimitive, ThreadPrimitive } from "@assistant-ui/react";
+import {
+  useAgUiInterrupts,
+  useAgUiSteerAway,
+  useAgUiSubmitInterruptResponses,
+} from "@assistant-ui/react-ag-ui";
+import { HttpAgent } from "@ag-ui/client";
+
+const agent = new HttpAgent({
+  url: "/api/agent/run",
+  headers: { "X-Probe": "1" },
+  fetch: async () => new Response(null, { status: 200 }),
+});
+if (typeof agent.requestInit !== "function") throw new Error("HttpAgent.requestInit is unavailable");
+if (!ThreadPrimitive.If || !ComposerPrimitive.Cancel || !MessagePrimitive.Content) {
+  throw new Error("required assistant-ui primitives are unavailable");
+}
+for (const hook of [useAgUiInterrupts, useAgUiSteerAway, useAgUiSubmitInterruptResponses]) {
+  if (typeof hook !== "function") throw new Error("required AG-UI interrupt hook is unavailable");
+}
+console.log("frontend agent compatibility ok");
+JS
 ```
 
-Expected: both commands print `agent imports ok`.
+Expected: the commands print `backend agent compatibility ok` and `frontend agent compatibility ok`. Treat any failed assertion as a locked-version incompatibility and stop before Task 2; do not defer it to the later Spike tasks.
 
 - [ ] **Step 5: Re-run the baseline and commit**
 
@@ -450,7 +506,12 @@ async def test_create_agent_completes_a_tool_then_text_run():
     assert calls == ["600519"]
     assert [event.type for event in events][0].value == "RUN_STARTED"
     assert [event.type for event in events][-1].value == "RUN_FINISHED"
-    assert any(getattr(event, "delta", "") == "fixture answer" for event in events)
+    text = "".join(
+        getattr(event, "delta", "")
+        for event in events
+        if getattr(event.type, "value", event.type) == "TEXT_MESSAGE_CONTENT"
+    )
+    assert text == "fixture answer"
 ```
 
 - [ ] **Step 3: Run the test and verify the missing factory**
@@ -982,6 +1043,7 @@ async def test_resume_uses_empty_messages_new_graph_and_new_adapter():
     async def fail_regenerate(*args, **kwargs):
         raise AssertionError("resume entered regenerate path")
 
+    assert callable(getattr(second_adapter, "prepare_regenerate_stream", None))
     second_adapter.prepare_regenerate_stream = fail_regenerate
     resume_value = bridge.resume_value([{
         "interruptId": bridge.pending[0].bridge_interrupt_id,
@@ -994,7 +1056,12 @@ async def test_resume_uses_empty_messages_new_graph_and_new_adapter():
     resumed_events = [event async for event in second_adapter.run(resume_input)]
     assert handle.checkpointer is saver
     assert executed == ["600519"]
-    assert any(getattr(event, "delta", "") == "fixture complete" for event in resumed_events)
+    text = "".join(
+        getattr(event, "delta", "")
+        for event in resumed_events
+        if getattr(event.type, "value", event.type) == "TEXT_MESSAGE_CONTENT"
+    )
+    assert text == "fixture complete"
     resumed_state = await handle.graph.aget_state({"configurable": {"thread_id": handle.thread_id}})
     assert_secret_absent(SENTINEL, resumed_events, saver.storage, handle.snapshot, resumed_state.values)
     assert_secret_absent(SENTINEL, recorder.metadata, repr(handle))
@@ -1213,7 +1280,11 @@ from langchain_core.messages import AIMessage
 import app as app_module
 from tests.agent.fakes import ScriptedChatModel
 
-client = TestClient(app_module.app)
+def make_client(host: str = "127.0.0.1") -> TestClient:
+    return TestClient(app_module.app, client=(host, 50000))
+
+
+client = make_client()
 
 START = {
     "threadId": "thread-endpoint",
@@ -1281,6 +1352,82 @@ loopback HTTP -> allowed; trusted proxy IP plus VR_TRUST_PROXY_HEADERS=1 and X-F
 untrusted X-Forwarded-Proto=https -> rejected
 ```
 
+Use `make_client("203.0.113.9")` for the non-loopback rejection case and `make_client()` for every ordinary HTTP success case. Do not depend on Starlette's default `("testclient", 50000)` address because it is intentionally not treated as loopback by `require_secure_model_key_transport`.
+
+Build the steer-away request from the bridge ID returned by an interrupted fixture using this exact wire shape; define the fixture to return `pending_id`, the old `ActiveRunHandle`, and the protected tool's call list so the test can assert cancellation and release before the replacement run starts:
+
+```python
+from copy import deepcopy
+
+
+steer = deepcopy(START)
+steer["runId"] = "protocol-steer-away"
+steer["messages"] = [{"id": "user-steer", "role": "user", "content": "use a different approach"}]
+steer["forwardedProps"]["command"] = {
+    "resume": [{"interruptId": pending_id, "status": "cancelled"}],
+}
+response = client.post(
+    "/api/agent/run",
+    json=steer,
+    headers={"X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"},
+)
+assert response.status_code == 200
+assert old_handle.phase == "cancelled"
+assert old_handle.runtime.graph is None and old_handle.runtime.model is None
+assert "RUN_STARTED" in response.text and "RUN_FINISHED" in response.text
+assert protected_tool_calls == []
+```
+
+Test disconnect delivery through the ASGI receive channel instead of relying on `TestClient`, which buffers normal responses. Add this helper and use a spy around `coordinator.cancel`; the scripted adapter must pause after its first event so `http.disconnect` wins, then the test releases it and asserts that no later event was sent:
+
+```python
+import json
+
+
+async def post_then_disconnect(app, payload: dict) -> list[dict]:
+    body = json.dumps(payload).encode()
+    incoming = iter([
+        {"type": "http.request", "body": body, "more_body": False},
+        {"type": "http.disconnect"},
+    ])
+    sent: list[dict] = []
+
+    async def receive() -> dict:
+        try:
+            return next(incoming)
+        except StopIteration:
+            return {"type": "http.disconnect"}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    await app({
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/agent/run",
+        "raw_path": b"/api/agent/run",
+        "query_string": b"",
+        "root_path": "",
+        "state": {},
+        "extensions": {},
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+        "headers": [
+            (b"host", b"testserver"),
+            (b"content-type", b"application/json"),
+            (b"accept", b"text/event-stream"),
+            (b"x-vr-agent-model-key", b"request-only-key"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+    }, receive, send)
+    return sent
+```
+
+The disconnect assertion must verify one `coordinator.cancel(thread_id)` call, the captured handle's `phase == "cancelled"`, `handle.runtime.graph is None`, `handle.runtime.model is None`, and absence of any response body frame containing a post-cancellation fixture marker.
+
 Add a CORS test to `backend/tests/test_api.py` that sends an `OPTIONS` preflight with `Access-Control-Request-Method: PATCH` and expects `access-control-allow-methods` to include `PATCH`.
 
 - [ ] **Step 2: Run and verify route failures**
@@ -1291,13 +1438,13 @@ Expected: endpoint tests return 404 and the PATCH preflight assertion fails.
 
 - [ ] **Step 3: Implement the 1A in-memory coordinator**
 
-In `backend/agent/runs.py`, define one `asyncio.Lock` per thread, one active handle per thread, and explicit `acquire_start`, `acquire_resume`, `mark_awaiting_approval`, `steer_away`, `cancel`, and `release` methods. The active handle owns one `pending_interrupts: list[PendingInterrupt]`; each protocol request creates its new bridge with that same list, so bridge IDs survive adapter/Graph reconstruction. `mark_awaiting_approval` must set the state and call `release_graph()` before the standard interrupt outcome is emitted. Terminal release must remove the handle. `steer_away` must validate every pending bridge ID under the lock, set the old state to `cancelled`, call `release_graph()`, and only then create the new handle. Do not add disk I/O or retry state.
+In `backend/agent/runs.py`, define an `ActiveRunHandle` dataclass containing `runtime: RuntimeHandle`, `phase: Literal["running", "awaiting_approval", "completed", "failed", "cancelled"]`, and `pending_interrupts: list[PendingInterrupt]`. Define one `asyncio.Lock` per thread, one `ActiveRunHandle` per thread, and explicit `acquire_start`, `acquire_resume`, `mark_awaiting_approval`, `steer_away`, `cancel`, and `release` methods. Each protocol request creates its new bridge with the active handle's same pending list, so bridge IDs survive adapter/Graph reconstruction. `mark_awaiting_approval` must set the phase and call `runtime.release_graph()` before the standard interrupt outcome is emitted. Terminal release must remove the handle. `steer_away` must validate every pending bridge ID under the lock, set the old phase to `cancelled`, call `runtime.release_graph()`, and only then create the replacement handle. `cancel` must likewise set `phase="cancelled"` and release the runtime before terminal removal, allowing the caller that captured the handle reference to verify the transition. Do not add disk I/O or retry state.
 
 - [ ] **Step 4: Implement the custom streaming route**
 
-In `backend/agent/router.py`, define `router = APIRouter(prefix="/api/agent")` and `POST /run` accepting `RunAgentInput`, `Request`, and `X-VR-Agent-Model-Key`. Before parsing `RuntimeForwardedProps` or constructing the Graph, call `require_secure_model_key_transport(request)`: allow plain HTTP only when `request.client.host` parses as loopback; otherwise require `request.url.scheme == "https"`. Consult `X-Forwarded-Proto` only when `VR_TRUST_PROXY_HEADERS=1` and the direct client IP is a member of the comma-separated `VR_TRUSTED_PROXY_IPS`; all other forwarded headers are ignored.
+In `backend/agent/router.py`, define `router = APIRouter(prefix="/api/agent")` and `POST /run` accepting `RunAgentInput`, `Request`, and `X-VR-Agent-Model-Key`. Bind the header to a local `model_key: str`, reject a missing or blank value, and construct `RunSecrets` from it inside the request task. Before parsing `RuntimeForwardedProps` or constructing the Graph, call `require_secure_model_key_transport(request)`: allow plain HTTP only when `request.client.host` parses as loopback; otherwise require `request.url.scheme == "https"`. Consult `X-Forwarded-Proto` only when `VR_TRUST_PROXY_HEADERS=1` and the direct client IP is a member of the comma-separated `VR_TRUSTED_PROXY_IPS`; all other forwarded headers are ignored.
 
-Use `EventEncoder(accept=request.headers.get("accept"))` and a fresh `LangGraphAgent` from the selected handle for this request. For resume, first compute `resume_value = bridge.resume_value(entries)`, construct the `messages=[]` adapter input, transition the handle to `running`, and only then clear `handle.pending_interrupts`; malformed resume leaves the list untouched. For steer-away, coordinator validation consumes and closes the old handle rather than turning cancellations into a resume value. Stream with:
+Use `EventEncoder(accept=request.headers.get("accept"))` and call `selected_handle.runtime.new_adapter(...)` to create a fresh `LangGraphAgent` for this request. For resume, first compute `resume_value = bridge.resume_value(entries)`, construct the `messages=[]` adapter input, transition the active handle to `running`, and only then clear `selected_handle.pending_interrupts`; malformed resume leaves the list untouched. For steer-away, coordinator validation consumes and closes the old handle rather than turning cancellations into a resume value. Stream with:
 
 ```python
 async def event_generator():
@@ -1364,13 +1511,13 @@ git commit -m "feat(agent): add custom ag-ui streaming endpoint"
 Add `"test:unit": "vitest run"` to `frontend/package.json`; keep the existing `npm test` command unchanged. Create `frontend/vitest.config.ts`:
 
 ```typescript
-import path from "node:path";
+import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   plugins: [react()],
-  resolve: { alias: { "@": path.resolve(__dirname, "./src") } },
+  resolve: { alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) } },
   test: {
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
@@ -1775,7 +1922,7 @@ git commit -m "feat(agent): add minimal agent workspace entry"
 
 - [ ] **Step 1: Add one offline vertical-slice test**
 
-Drive `POST /api/agent/run` through FastAPI `TestClient` with the scripted model and a monkeypatched built-in tool. Parse the actual encoded event stream, filter out state/step events that are not part of this contract, and assert this order among the listed event types:
+Drive `POST /api/agent/run` through `TestClient(app_module.app, client=("127.0.0.1", 50000))` with the scripted model and a monkeypatched built-in tool. Parse the actual encoded event stream, filter out state/step events that are not part of this contract, and assert this order among the listed event types:
 
 ```text
 RUN_STARTED
