@@ -8,13 +8,30 @@ from ag_ui_langgraph import LangGraphAgent
 from langchain.agents import create_agent
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import BaseTool
+from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
+from pydantic import SecretStr
 
 import chat
 from agent.models import ModelRef, RunSecrets
 
 # 1A 不宣称跨 resume 的转移数上限（见 test_transition_limit）。
 PRODUCT_TRANSITION_LIMIT = None
+
+
+def build_chat_model(model_ref: ModelRef, secrets: RunSecrets) -> ChatOpenAI:
+    """请求级构建 OpenAI 兼容模型；先过 SSRF 校验，密钥绝不落日志/配置。"""
+    chat._check_base_url(model_ref.base_url)
+    key = secrets.model_api_key.get_secret_value().strip()
+    if not key:
+        raise ValueError("X-VR-Agent-Model-Key is required")
+    return ChatOpenAI(
+        model=model_ref.model,
+        base_url=model_ref.base_url.rstrip("/"),
+        api_key=SecretStr(key),
+        temperature=0.2,
+        streaming=True,
+    )
 
 
 @dataclass(frozen=True)
