@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
-from ag_ui.core.types import RunAgentInput, UserMessage
+from ag_ui.core.types import (
+    AssistantMessage,
+    RunAgentInput,
+    ToolCall,
+    ToolMessage,
+    UserMessage,
+)
 from ag_ui_langgraph import LangGraphAgent
 from langchain.agents import create_agent
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -13,7 +20,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from pydantic import SecretStr
 
 import chat
-from agent.models import ModelRef, RunSecrets
+from agent.models import AgentMessage, ModelRef, RunSecrets
 
 # 1A 不宣称跨 resume 的转移数上限（见 test_transition_limit）。
 PRODUCT_TRANSITION_LIMIT = None
@@ -82,12 +89,18 @@ class RuntimeHandle:
             transitions=self.transitions,
         )
 
-    def start_input(self, content: str, run_id: str = "protocol-1") -> RunAgentInput:
+    def run_input(
+        self,
+        *,
+        protocol_run_id: str,
+        messages: Sequence[AgentMessage],
+    ) -> RunAgentInput:
+        """Graph 输入只来自服务端已清洗历史（partial/pending_interrupt 已排除）。"""
         return RunAgentInput(
             thread_id=self.thread_id,
-            run_id=run_id,
+            run_id=protocol_run_id,
             state={},
-            messages=[UserMessage(id=f"{run_id}-user", content=content)],
+            messages=[to_ag_ui_message(message) for message in messages],
             tools=[],
             context=[],
             forwarded_props={},
@@ -169,3 +182,35 @@ class AgentFactory:
             middleware=list(handle.middleware),
             checkpointer=handle.checkpointer,
         )
+
+
+def _content_str(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    return json.dumps(content, ensure_ascii=False)
+
+
+def to_ag_ui_message(message: AgentMessage):
+    """把已验证的持久化消息转成 AG-UI 消息；不携带 partial/时间戳/run 元数据。"""
+    if message.role == "user":
+        return UserMessage(id=message.id, content=_content_str(message.content))
+    if message.role == "tool":
+        return ToolMessage(
+            id=message.id,
+            content=_content_str(message.content),
+            tool_call_id=message.tool_call_id or "",
+        )
+    tool_calls = [
+        ToolCall(
+            id=call.get("id", ""),
+            function={"name": call.get("name", ""), "arguments": call.get("args", {})},
+        )
+        for call in message.tool_calls
+    ]
+    return AssistantMessage(
+        id=message.id,
+        content=_content_str(message.content),
+        tool_calls=tool_calls or None,
+    )

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal, Sequence
+from uuid import uuid4
 
-from agent.models import ModelRef, RunSecrets
+from ag_ui.core.types import RunAgentInput
+
+from agent.models import AgentMessage, ModelRef, RunDocument, RunSecrets, RunSummary, ThreadDocument
 from agent.protocol import PendingInterrupt
 from agent.runtime import AgentFactory, RuntimeHandle
+from agent.stores import DocumentNotFound, RevisionConflict, utc_now
 
 if TYPE_CHECKING:
     from agent.stores import RunStore, ThreadStore
@@ -16,12 +21,28 @@ Phase = Literal["running", "awaiting_approval", "completed", "failed", "cancelle
 
 @dataclass
 class ActiveRunHandle:
-    """线程的活动 run 状态（1A 仅内存，无磁盘 IO / 重试状态）。"""
+    """线程的活动 run 状态；密钥绝不落在本结构上。"""
 
     runtime: RuntimeHandle
     phase: Phase
     pending_interrupts: list[PendingInterrupt] = field(default_factory=list)
     thread_revision: int | None = None
+    product_run_id: str | None = None
+    protocol_run_ids: list[str] = field(default_factory=list)
+    trigger_message_id: str | None = None
+    started_monotonic: float = field(default_factory=time.monotonic)
+    # 脱敏的历史快照引用（进入后续模型输入的服务端历史）
+    history_snapshot: tuple[AgentMessage, ...] = ()
+
+
+@dataclass
+class StartAdmission:
+    """一次成功准入的产物：句柄、产品 run、权威 adapter 输入与已提交 revision。"""
+
+    handle: ActiveRunHandle
+    run: RunDocument
+    input: RunAgentInput
+    revisions: list[int]
 
 
 class ThreadBusy(RuntimeError):
@@ -32,6 +53,22 @@ class ResumeRejected(RuntimeError):
     """resume/steer-away 校验失败（不完整/未知中断 ID/形状非法），待审批列表保持原状。"""
 
     code = "RESUME_REJECTED"
+
+
+class DuplicateRunActive(RuntimeError):
+    code = "DUPLICATE_RUN_ACTIVE"
+
+
+class DuplicateRunTerminal(RuntimeError):
+    code = "DUPLICATE_RUN_TERMINAL"
+
+
+class MessageConflict(RuntimeError):
+    code = "MESSAGE_CONFLICT"
+
+
+class RetryNotAllowed(RuntimeError):
+    code = "RETRY_NOT_ALLOWED"
 
 
 class RunCoordinator:
@@ -72,7 +109,31 @@ class RunCoordinator:
         )
         return ActiveRunHandle(runtime=placeholder, phase="running")
 
-    def _start_locked(
+    # ---- 1B：服务端权威准入 ----
+
+    @staticmethod
+    def _content_of(message: Any) -> Any:
+        return getattr(message, "content", "")
+
+    def _load_thread(self, thread_id: str) -> ThreadDocument | None:
+        try:
+            return self._threads.get(thread_id)
+        except DocumentNotFound:
+            return None
+
+    def _check_protocol_duplicate(self, protocol_run_id: str) -> None:
+        existing_run = self._runs.find_by_protocol_run_id(protocol_run_id)
+        if existing_run is None:
+            return
+        if existing_run.status in ("running", "awaiting_approval"):
+            raise DuplicateRunActive(
+                f"{DuplicateRunActive.code}: protocol run {protocol_run_id} 已在运行"
+            )
+        raise DuplicateRunTerminal(
+            f"{DuplicateRunTerminal.code}: protocol run {protocol_run_id} 已终结"
+        )
+
+    def _admit_locked(
         self,
         thread_id: str,
         *,
@@ -81,18 +142,155 @@ class RunCoordinator:
         model_builder: Callable,
         tools,
         middleware,
-    ) -> ActiveRunHandle:
-        runtime = self._factory.create(
-            model_ref=model_ref,
-            secrets=secrets,
-            model_builder=model_builder,
-            tools=tools,
+        protocol_run_id: str,
+        messages: Sequence[Any],
+        client_revision: int | None,
+    ) -> StartAdmission:
+        """持锁准入：重复检查 → revision/头部校验 → 持久化 → 建 Graph → 装句柄。
+
+        调用方必须已持有该线程的锁。模型密钥只在 model_builder 调用时被消费。
+        """
+        threads, runs = self._require_stores()
+
+        # 1) protocol run 重复检查（先于 revision）
+        self._check_protocol_duplicate(protocol_run_id)
+
+        thread = self._load_thread(thread_id)
+        implicit_thread = thread is None
+        if thread is None:
+            # 线程不存在则隐式创建（revision 0）；客户端 revision 必须与之对齐
+            thread = ThreadDocument.new(thread_id, "新会话", now=utc_now())
+            if client_revision not in (None, 0):
+                raise RevisionConflict(
+                    f"线程 {thread_id} 不存在，客户端 revision {client_revision} 无法对齐"
+                )
+
+        # 2) revision 比较（兼容期 client_revision=None → 用锁内读到的服务端值）
+        expected_revision = client_revision if client_revision is not None else thread.revision
+        if thread.revision != expected_revision:
+            raise RevisionConflict(
+                f"线程 {thread_id} 期望 revision {expected_revision}，实际 {thread.revision}"
+            )
+
+        if not messages:
+            raise MessageConflict("准入请求缺少新 user message")
+        new_message = messages[-1]
+        prefix = list(messages[:-1])
+        if getattr(new_message, "role", None) != "user":
+            raise MessageConflict("准入的新消息必须是 user 角色")
+
+        # 3) 客户端前缀必须与服务端完整历史逐条一致（id/role/content）；
+        #    服务端尾部的 partial/pending 消息不参与比较（可见但不计入模型历史）
+        complete_history = thread.model_history()
+        if len(prefix) != len(complete_history):
+            raise MessageConflict(
+                f"客户端历史长度 {len(prefix)} 与服务端 {len(complete_history)} 不一致"
+            )
+        for client_msg, server_msg in zip(prefix, complete_history):
+            if (
+                getattr(client_msg, "id", None) != server_msg.id
+                or getattr(client_msg, "role", None) != server_msg.role
+                or self._content_of(client_msg) != server_msg.content
+            ):
+                raise MessageConflict(
+                    f"客户端历史在消息 {server_msg.id} 处与服务端不一致"
+                )
+
+        # 消息 ID 重复：同 ID 不同内容 → 冲突；同 ID 同内容 → 按所属 run 判重复
+        for server_msg in thread.messages:
+            if server_msg.id == new_message.id:
+                if self._content_of(new_message) != server_msg.content:
+                    raise MessageConflict(
+                        f"{MessageConflict.code}: 消息 {server_msg.id} 已存在且内容不同"
+                    )
+                prior = runs.find_by_trigger_message_id(server_msg.id)
+                if prior is not None and prior.status in ("running", "awaiting_approval"):
+                    raise DuplicateRunActive(
+                        f"{DuplicateRunActive.code}: 消息 {server_msg.id} 的 run 仍在运行"
+                    )
+                raise DuplicateRunTerminal(
+                    f"{DuplicateRunTerminal.code}: 消息 {server_msg.id} 已被接受过"
+                )
+
+        # 4) 创建产品 run 并写入 running 状态
+        run_id = f"run-{uuid4().hex}"
+        run = RunDocument.start(
+            run_id=run_id,
             thread_id=thread_id,
-            middleware=middleware,
+            protocol_run_id=protocol_run_id,
+            model_ref=model_ref,
+            trigger_message_id=new_message.id,
+            history_head_id=thread.messages[-1].id if thread.messages else None,
+            now=utc_now(),
         )
-        handle = ActiveRunHandle(runtime=runtime, phase="running")
+        runs.replace(run)
+
+        # 5) 追加被接受的用户消息 + 更新 last_run 摘要（同一次 revision 递增）
+        accepted = AgentMessage(
+            id=new_message.id,
+            role="user",
+            content=self._content_of(new_message),
+            created_at=utc_now(),
+        )
+
+        def append_user(doc: ThreadDocument) -> ThreadDocument:
+            return doc.model_copy(update={
+                "messages": [*doc.messages, accepted],
+                "last_run": RunSummary(
+                    id=run_id, status="running", updated_at=utc_now(), retry_of=None
+                ),
+            })
+
+        if implicit_thread:
+            threads.create(thread)  # 隐式创建的新线程先落盘，再走 CAS 追加
+        updated_thread = threads.update(thread_id, thread.revision, append_user)
+
+        # 6) 从服务端完整历史重建 Graph 输入
+        try:
+            runtime = self._factory.create(
+                model_ref=model_ref,
+                secrets=secrets,
+                model_builder=model_builder,
+                tools=tools,
+                thread_id=thread_id,
+                middleware=middleware,
+            )
+        except Exception:
+            # 持久化已成功：run 终态 failed、线程摘要修复；用户消息保留
+            runs.replace(run.model_copy(update={
+                "status": "failed",
+                "updated_at": utc_now(),
+                "ended_at": utc_now(),
+                "error_code": "GRAPH_BUILD_FAILED",
+                "error_message": "Graph 构建失败",
+            }))
+            threads.update(
+                thread_id,
+                updated_thread.revision,
+                lambda doc: doc.model_copy(update={"last_run": RunSummary(
+                    id=run_id, status="failed", updated_at=utc_now(), retry_of=None
+                )}),
+            )
+            raise
+
+        model_history = updated_thread.model_history()
+        handle = ActiveRunHandle(
+            runtime=runtime,
+            phase="running",
+            thread_revision=updated_thread.revision,
+            product_run_id=run_id,
+            protocol_run_ids=[protocol_run_id],
+            trigger_message_id=new_message.id,
+            history_snapshot=tuple(model_history),
+        )
+        # 7) 持久化成功后才安装句柄
         self._handles[thread_id] = handle
-        return handle
+        return StartAdmission(
+            handle=handle,
+            run=runs.get(run_id),
+            input=runtime.run_input(protocol_run_id=protocol_run_id, messages=model_history),
+            revisions=[updated_thread.revision],
+        )
 
     async def acquire_start(
         self,
@@ -103,18 +301,29 @@ class RunCoordinator:
         tools,
         thread_id: str,
         middleware=(),
-    ) -> ActiveRunHandle:
+        protocol_run_id: str = "protocol-1",
+        messages: Sequence[Any] = (),
+        client_revision: int | None = None,
+    ) -> StartAdmission:
+        self._require_stores()
         async with self._lock(thread_id):
+            # 重复检查先于 busy/revision（重放检测永远最优先）
+            self._check_protocol_duplicate(protocol_run_id)
             existing = self._handles.get(thread_id)
             if existing is not None and existing.phase in ("running", "awaiting_approval"):
                 raise ThreadBusy(f"{ThreadBusy.code}: thread {thread_id} already has an active run")
-            return self._start_locked(
-                thread_id,
-                model_ref=model_ref,
-                secrets=secrets,
-                model_builder=model_builder,
-                tools=tools,
-                middleware=middleware,
+            return await asyncio.to_thread(
+                lambda: self._admit_locked(
+                    thread_id,
+                    model_ref=model_ref,
+                    secrets=secrets,
+                    model_builder=model_builder,
+                    tools=tools,
+                    middleware=middleware,
+                    protocol_run_id=protocol_run_id,
+                    messages=messages,
+                    client_revision=client_revision,
+                )
             )
 
     async def acquire_resume(
@@ -125,6 +334,8 @@ class RunCoordinator:
         secrets: RunSecrets,
         model_builder,
         validate: Callable[[list[PendingInterrupt]], dict],
+        protocol_run_id: str = "protocol-resume",
+        client_revision: int | None = None,
     ) -> tuple[ActiveRunHandle, dict]:
         """单锁完成：校验 resume 条目 → 重建 Graph → 转 running → 清 pending。
 
@@ -134,6 +345,14 @@ class RunCoordinator:
             handle = self._handles.get(thread_id)
             if handle is None or handle.phase != "awaiting_approval":
                 raise ResumeRejected(f"{ResumeRejected.code}: thread {thread_id} has no awaiting run")
+            threads, runs = self._require_stores()
+            thread = self._load_thread(thread_id)
+            if thread is not None:
+                expected = client_revision if client_revision is not None else thread.revision
+                if thread.revision != expected:
+                    raise RevisionConflict(
+                        f"线程 {thread_id} 期望 revision {expected}，实际 {thread.revision}"
+                    )
             resume_value = validate(handle.pending_interrupts)  # ValueError → 交给调用方 400
             self._factory.resume(
                 handle=handle.runtime,
@@ -141,6 +360,14 @@ class RunCoordinator:
                 secrets=secrets,
                 model_builder=model_builder,
             )  # RunConfigMismatch → 状态未变
+            # 同一产品 run 追加新的 protocol run ID
+            if handle.product_run_id is not None:
+                run = runs.get(handle.product_run_id)
+                runs.replace(run.model_copy(update={
+                    "protocol_run_ids": [*run.protocol_run_ids, protocol_run_id],
+                    "updated_at": utc_now(),
+                }))
+                handle.protocol_run_ids = list(run.protocol_run_ids) + [protocol_run_id]
             handle.phase = "running"
             handle.pending_interrupts = []
             return handle, resume_value
@@ -156,23 +383,42 @@ class RunCoordinator:
         model_builder,
         tools,
         middleware=(),
-    ) -> ActiveRunHandle:
-        """单锁完成：校验 steer-away 条目 → 关闭旧句柄 → 建新句柄。"""
+        messages: Sequence[Any] = (),
+        client_revision: int | None = None,
+        protocol_run_id: str = "protocol-2",
+    ) -> StartAdmission:
+        """单锁完成：校验 steer-away 条目 → 旧 run 持久化为 cancelled → 新准入。"""
         async with self._lock(thread_id):
             handle = self._handles.get(thread_id)
             if handle is None or not handle.pending_interrupts:
                 raise ResumeRejected(f"{ResumeRejected.code}: thread {thread_id} has no pending interrupts")
             validate(handle.pending_interrupts, entries)  # ValueError → 旧句柄保持原状
+            threads, runs = self._require_stores()
+            # 旧 run 先持久化为 cancelled（即使新 run 写入失败也保持 cancelled）
+            if handle.product_run_id is not None:
+                old_run = runs.get(handle.product_run_id)
+                runs.replace(old_run.model_copy(update={
+                    "status": "cancelled",
+                    "updated_at": utc_now(),
+                    "ended_at": utc_now(),
+                    "error_code": "STEERED_AWAY",
+                    "error_message": "用户转向新问题，原运行取消",
+                }))
             handle.phase = "cancelled"
             handle.runtime.release_graph()
             self._handles.pop(thread_id, None)
-            return self._start_locked(
-                thread_id,
-                model_ref=model_ref,
-                secrets=secrets,
-                model_builder=model_builder,
-                tools=tools,
-                middleware=middleware,
+            return await asyncio.to_thread(
+                lambda: self._admit_locked(
+                    thread_id,
+                    model_ref=model_ref,
+                    secrets=secrets,
+                    model_builder=model_builder,
+                    tools=tools,
+                    middleware=middleware,
+                    protocol_run_id=protocol_run_id,
+                    messages=messages,
+                    client_revision=client_revision,
+                )
             )
 
     async def mark_awaiting_approval(self, thread_id: str) -> None:
@@ -205,6 +451,36 @@ class RunCoordinator:
             if phase in ("completed", "failed", "cancelled"):
                 handle.runtime.release_graph()
                 self._handles.pop(thread_id, None)
+                await asyncio.to_thread(self._persist_run_terminal, handle, phase)
+
+    def _persist_run_terminal(self, handle: ActiveRunHandle, phase: str) -> None:
+        """终态落盘：run 状态 + 线程 last_run 摘要（同一把线程锁内被调用）。"""
+        if handle.product_run_id is None or self._runs is None or self._threads is None:
+            return
+        try:
+            run = self._runs.get(handle.product_run_id)
+        except DocumentNotFound:
+            return
+        now = utc_now()
+        self._runs.replace(run.model_copy(update={
+            "status": phase,
+            "updated_at": now,
+            "ended_at": now,
+        }))
+        summary = RunSummary(id=run.id, status=phase, updated_at=now, retry_of=run.retry_of)
+        try:
+            thread = self._threads.get(handle.runtime.thread_id)
+        except DocumentNotFound:
+            return
+        if thread.last_run == summary:
+            return
+        expected = handle.thread_revision if handle.thread_revision is not None else thread.revision
+        updated = self._threads.update(
+            handle.runtime.thread_id,
+            expected,
+            lambda doc: doc.model_copy(update={"last_run": summary}),
+        )
+        handle.thread_revision = updated.revision
 
     def active(self, thread_id: str) -> ActiveRunHandle | None:
         return self._handles.get(thread_id)

@@ -164,6 +164,7 @@ def test_valid_full_resume_uses_same_handle_and_empty_messages(monkeypatch):
     resume = deepcopy(START)
     resume["runId"] = "protocol-resume"
     resume["messages"] = []
+    resume["forwardedProps"]["runtime"]["threadRevision"] = 1  # start 追加用户消息后的服务端 revision
     resume["forwardedProps"]["command"] = {
         "resume": [{"interruptId": pending_id, "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}],
     }
@@ -187,7 +188,11 @@ def test_steer_away_closes_old_handle_and_starts_fresh_run(monkeypatch):
     )
     steer = deepcopy(START)
     steer["runId"] = "protocol-steer-away"
-    steer["messages"] = [{"id": "user-steer", "role": "user", "content": "use a different approach"}]
+    steer["messages"] = [
+        {"id": "user-endpoint", "role": "user", "content": "hello"},
+        {"id": "user-steer", "role": "user", "content": "use a different approach"},
+    ]
+    steer["forwardedProps"]["runtime"]["threadRevision"] = 1
     steer["forwardedProps"]["command"] = {
         "resume": [{"interruptId": pending_id, "status": "cancelled"}],
     }
@@ -206,6 +211,7 @@ def test_partial_or_unknown_resume_fails_closed(monkeypatch):
     resume = deepcopy(START)
     resume["runId"] = "protocol-bad-resume"
     resume["messages"] = []
+    resume["forwardedProps"]["runtime"]["threadRevision"] = 1
     resume["forwardedProps"]["command"] = {
         "resume": [{"interruptId": "unknown", "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}],
     }
@@ -395,7 +401,9 @@ def test_malformed_shapes_fail_closed(monkeypatch):
         {"id": "u1", "role": "user", "content": "a"},
         {"id": "u2", "role": "user", "content": "b"},
     ]
-    assert client.post("/api/agent/run", json=two_msgs, headers=HEADERS).status_code == 400
+    resp = client.post("/api/agent/run", json=two_msgs, headers=HEADERS)
+    assert resp.status_code == 409  # 1B：前缀与服务端权威历史不一致
+    assert resp.json()["code"] == "MESSAGE_CONFLICT"
 
 
 def test_resume_with_new_message_fails_closed(monkeypatch):
@@ -423,6 +431,7 @@ def test_resume_model_mismatch_returns_409(monkeypatch):
     resume["runId"] = "r-mismatch"
     resume["messages"] = []
     resume["forwardedProps"]["runtime"]["model"]["model"] = "different-model"
+    resume["forwardedProps"]["runtime"]["threadRevision"] = 1
     resume["forwardedProps"]["command"] = {
         "resume": [{"interruptId": pending_id, "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}],
     }
@@ -451,6 +460,7 @@ async def test_concurrent_resume_is_atomic(monkeypatch):
     resume = deepcopy(START)
     resume["runId"] = "r-atomic"
     resume["messages"] = []
+    resume["forwardedProps"]["runtime"]["threadRevision"] = 1  # start 追加用户消息后的服务端 revision
     resume["forwardedProps"]["command"] = {
         "resume": [{"interruptId": pending_id, "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}],
     }

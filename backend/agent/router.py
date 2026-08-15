@@ -18,7 +18,14 @@ from pydantic import BaseModel, Field
 
 from agent.models import ModelRef, RunSecrets, RunSummary, RuntimeForwardedProps, ThreadDocument
 from agent.protocol import AgentProtocolBridge, PendingInterrupt
-from agent.runs import ResumeRejected, RunCoordinator, ThreadBusy
+from agent.runs import (
+    DuplicateRunActive,
+    DuplicateRunTerminal,
+    MessageConflict,
+    ResumeRejected,
+    RunCoordinator,
+    ThreadBusy,
+)
 from agent.runtime import AgentFactory, RunConfigMismatch, build_chat_model
 from agent.stores import (
     AgentPaths,
@@ -105,23 +112,22 @@ def _classify(input_data: RunAgentInput) -> str:
     messages = input_data.messages or []
 
     has_cancelled = any(isinstance(e, dict) and e.get("status") == "cancelled" for e in resume_entries)
-    user_messages = [m for m in messages if getattr(m, "role", None) == "user"]
 
     if resume_entries and has_cancelled:
-        # steer-away：全部 cancelled + 恰好一条新 user message
+        # steer-away：全部 cancelled + 最后一条是新 user message（前面是客户端历史前缀）
         if not all(isinstance(e, dict) and e.get("status") == "cancelled" for e in resume_entries):
             raise ValueError("steer-away 不能混合 resolved 与 cancelled 条目")
-        if len(user_messages) != 1:
-            raise ValueError("steer-away 必须恰好携带一条新 user message")
+        if not messages or getattr(messages[-1], "role", None) != "user":
+            raise ValueError("steer-away 必须携带一条新 user message")
         return "steer_away"
     if resume_entries:
         # 纯 resume：不得携带新消息
         if messages:
             raise ValueError("纯 resume 不得携带新消息（messages 必须为空）")
         return "resume"
-    # start：恰好一条新 user message
-    if len(user_messages) != 1 or len(messages) != 1:
-        raise ValueError("start 必须恰好携带一条新 user message")
+    # start：客户端历史前缀 + 最后一条新 user message（前缀由协调器对照服务端校验）
+    if not messages or getattr(messages[-1], "role", None) != "user":
+        raise ValueError("start 必须以一条新 user message 结尾")
     return "start"
 
 
@@ -129,11 +135,6 @@ def _validate_steer_away(pending: list[PendingInterrupt], entries: list[dict]) -
     probe = AgentProtocolBridge("", "", pending=pending)
     if not probe.is_steer_away(entries):
         raise ValueError("resume 条目不是全量 cancelled，不能作为 steer-away")
-
-
-def _without_resume_command(input_data: RunAgentInput) -> RunAgentInput:
-    props = {k: v for k, v in (input_data.forwarded_props or {}).items() if k != "command"}
-    return input_data.model_copy(update={"forwarded_props": props})
 
 
 @router.post("/run")
@@ -178,7 +179,7 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
 
     try:
         if mode == "steer_away":
-            handle = await services.coordinator.acquire_steer_away(
+            admission = await services.coordinator.acquire_steer_away(
                 thread_id,
                 entries=resume_entries,
                 validate=_validate_steer_away,
@@ -187,8 +188,12 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                 model_builder=model_builder,
                 tools=tools,
                 middleware=middleware,
+                messages=input_data.messages,
+                client_revision=runtime_props.thread_revision,
+                protocol_run_id=run_id,
             )
-            adapter_input = _without_resume_command(input_data)
+            handle = admission.handle
+            adapter_input = admission.input
         elif mode == "resume":
             handle, resume_value = await services.coordinator.acquire_resume(
                 thread_id,
@@ -196,21 +201,31 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                 secrets=secrets,
                 model_builder=model_builder,
                 validate=lambda pending: AgentProtocolBridge("", "", pending=pending).resume_value(resume_entries),
+                protocol_run_id=run_id,
+                client_revision=runtime_props.thread_revision,
             )
             adapter_input = handle.runtime.resume_input(run_id, resume_value)
         else:
-            handle = await services.coordinator.acquire_start(
+            admission = await services.coordinator.acquire_start(
                 model_ref=model_ref,
                 secrets=secrets,
                 model_builder=model_builder,
                 tools=tools,
                 thread_id=thread_id,
                 middleware=middleware,
+                protocol_run_id=run_id,
+                messages=input_data.messages,
+                client_revision=runtime_props.thread_revision,
             )
-            adapter_input = input_data
+            handle = admission.handle
+            adapter_input = admission.input
     except ThreadBusy as exc:
         return _error_response(exc.code, str(exc), 409)
     except ResumeRejected as exc:
+        return _error_response(exc.code, str(exc), 409)
+    except (DuplicateRunActive, DuplicateRunTerminal, MessageConflict) as exc:
+        return _error_response(exc.code, str(exc), 409)
+    except RevisionConflict as exc:
         return _error_response(exc.code, str(exc), 409)
     except ValueError as exc:
         return _error_response("RESUME_REJECTED", str(exc))

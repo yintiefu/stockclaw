@@ -2,7 +2,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 import pytest
 
-from agent.models import ModelRef, RunSecrets
+from agent.models import AgentMessage, ModelRef, RunSecrets
 from agent.runtime import AgentFactory
 from tests.agent.fakes import ScriptedChatModel
 
@@ -29,7 +29,12 @@ async def test_create_agent_completes_a_tool_then_text_run():
         tools=[lookup],
         thread_id="thread-1",
     )
-    events = [event async for event in handle.new_adapter("protocol-1").run(handle.start_input("hello"))]
+    events = [event async for event in handle.new_adapter("protocol-1").run(
+        handle.run_input(
+            protocol_run_id="protocol-1",
+            messages=[AgentMessage(id="user-1", role="user", content="hello")],
+        )
+    )]
 
     assert calls == ["600519"]
     assert [event.type for event in events][0].value == "RUN_STARTED"

@@ -7,7 +7,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 
-from agent.models import ModelRef, RunSecrets
+from agent.models import AgentMessage, ModelRef, RunSecrets
 from agent.protocol import AgentProtocolBridge
 from agent.runtime import AgentFactory, RunConfigMismatch
 from tests.agent.fakes import ScriptedChatModel
@@ -63,7 +63,10 @@ async def test_resume_uses_empty_messages_new_graph_and_new_adapter():
     recorder = MetadataRecorder()
     first_adapter = handle.new_adapter("protocol-start", callbacks=[recorder])
     first_events = []
-    async for event in first_adapter.run(handle.start_input("approve fixture", "protocol-start")):
+    async for event in first_adapter.run(handle.run_input(
+        protocol_run_id="protocol-start",
+        messages=[AgentMessage(id="user-start", role="user", content="run protected")],
+    )):
         first_events.extend(bridge.convert(event))
 
     assert executed == []
