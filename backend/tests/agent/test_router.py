@@ -45,7 +45,8 @@ START = {
                 "provider": "fixture",
                 "baseURL": "https://example.com/v1",
                 "model": "fixture-model",
-            }
+            },
+            "threadRevision": 0,
         }
     },
 }

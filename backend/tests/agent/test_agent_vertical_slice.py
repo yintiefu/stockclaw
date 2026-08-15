@@ -38,7 +38,8 @@ def start_payload(content="hello", run_id="protocol-slice"):
                     "provider": "fixture",
                     "baseURL": "https://example.com/v1",
                     "model": "fixture-model",
-                }
+                },
+                "threadRevision": 0,
             }
         },
     }
