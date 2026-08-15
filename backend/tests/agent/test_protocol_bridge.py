@@ -84,3 +84,40 @@ def test_interleaved_tool_fragments_keep_call_ids_and_order():
         ],
     }))
     assert [item.tool_call_id for item in bridge.pending] == ["call-a", "call-b"]
+
+
+import pytest
+
+
+def test_resolved_entries_become_ordered_hitl_decisions():
+    bridge = AgentProtocolBridge("thread-1", "run-1")
+    observe_tool_call(bridge, "call-1")
+    bridge.convert(legacy_interrupt("call-1"))
+    observe_tool_call(bridge, "call-2")
+    bridge.convert(legacy_interrupt("call-2"))
+    entries = [
+        {"interruptId": bridge.pending[1].bridge_interrupt_id, "status": "resolved", "payload": {"decision": "reject", "scope": "once"}},
+        {"interruptId": bridge.pending[0].bridge_interrupt_id, "status": "resolved", "payload": {"decision": "approve", "scope": "once"}},
+    ]
+    assert bridge.resume_value(entries) == {
+        "decisions": [{"type": "approve"}, {"type": "reject", "message": "User rejected the tool call"}]
+    }
+
+
+@pytest.mark.parametrize("entries", [[], [{"interruptId": "unknown", "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}]])
+def test_incomplete_or_unknown_resume_fails_closed(entries):
+    bridge = AgentProtocolBridge("thread-1", "run-1")
+    observe_tool_call(bridge)
+    bridge.convert(legacy_interrupt())
+    with pytest.raises(ValueError):
+        bridge.resume_value(entries)
+
+
+def test_all_cancelled_is_steer_away_and_never_a_hitl_decision():
+    bridge = AgentProtocolBridge("thread-1", "run-1")
+    observe_tool_call(bridge)
+    bridge.convert(legacy_interrupt())
+    entries = [{"interruptId": bridge.pending[0].bridge_interrupt_id, "status": "cancelled"}]
+    assert bridge.is_steer_away(entries) is True
+    with pytest.raises(ValueError):
+        bridge.resume_value(entries)

@@ -93,6 +93,38 @@ class AgentProtocolBridge:
     def cancelled(self) -> RunCancelledEvent:
         return RunCancelledEvent(thread_id=self.thread_id, run_id=self.run_id)
 
+    def _ordered_entries(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        by_id: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            interrupt_id = entry.get("interruptId")
+            if not interrupt_id or interrupt_id in by_id:
+                raise ValueError("resume contains a missing or duplicate interrupt ID")
+            by_id[interrupt_id] = entry
+        expected = {item.bridge_interrupt_id for item in self.pending}
+        if set(by_id) != expected:
+            raise ValueError("resume must answer every pending bridge interrupt exactly once")
+        return [by_id[item.bridge_interrupt_id] for item in sorted(self.pending, key=lambda item: item.order)]
+
+    def is_steer_away(self, entries: list[dict[str, Any]]) -> bool:
+        ordered = self._ordered_entries(entries)
+        return bool(ordered) and all(entry.get("status") == "cancelled" for entry in ordered)
+
+    def resume_value(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        ordered = self._ordered_entries(entries)
+        decisions = []
+        for entry in ordered:
+            if entry.get("status") != "resolved":
+                raise ValueError("cancelled interrupts are transport-level steer-away, not HITL decisions")
+            payload = entry.get("payload") or {}
+            if payload == {"decision": "approve", "scope": "once"}:
+                decisions.append({"type": "approve"})
+            elif payload == {"decision": "reject", "scope": "once"}:
+                decisions.append({"type": "reject", "message": "User rejected the tool call"})
+            else:
+                # thread_session 需要 1C 的会话级许可注册表；1A 只展示、不承诺。
+                raise ValueError("unsupported approval payload")
+        return {"decisions": decisions}
+
     def _capture(self, value: dict[str, Any]) -> None:
         actions = value.get("action_requests") or []
         reviews = value.get("review_configs") or []
