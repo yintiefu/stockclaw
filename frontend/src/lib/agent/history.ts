@@ -68,18 +68,26 @@ export function toThreadMessageLike(
         ? { result: toolResultsByCallId.get(callId) }
         : {}),
       state: message.pending_interrupt
-        ? { status: "requires-action" }
+        ? { status: "requires-action", reason: "interrupt" }
         : { status: "completed" },
     });
   }
   if (!content.length) {
     content.push({ type: "text", text: "" });
   }
+  // 锁定版本的 MessageStatus 语义：
+  // partial（停止/断连后被保留的部分输出）→ incomplete+cancelled；
+  // pending interrupt → requires-action（等待审批，不再是普通完成态）
+  const status = message.pending_interrupt
+    ? { type: "requires-action" as const, reason: "interrupt" as const }
+    : message.partial
+      ? { type: "incomplete" as const, reason: "cancelled" as const }
+      : undefined;
   return {
     id: message.id,
     role: "assistant",
     content: content as unknown as ThreadMessageLike["content"],
-    status: message.partial ? { type: "running" } : undefined,
+    status,
     createdAt: dateOf(message.created_at),
   };
 }
@@ -198,8 +206,8 @@ export class AgentHistoryController {
     await this.refreshList().catch(() => undefined);
   }
 
-  async remove(threadId: string): Promise<void> {
-    await agentApi.deleteThread(threadId);
+  async remove(threadId: string, revision?: number): Promise<void> {
+    await agentApi.deleteThread(threadId, revision ?? this.getRevision(threadId));
     this.revisionByThread.delete(threadId);
     if (this.activeThread?.id === threadId) {
       this.activeThread = null;

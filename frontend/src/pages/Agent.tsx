@@ -136,7 +136,7 @@ export function Agent() {
 
   const handleDelete = async (threadId: string) => {
     try {
-      await controller.remove(threadId);
+      await controller.remove(threadId, controller.getRevision(threadId));
       const remaining = controller.getThreads();
       if (remaining.length > 0) {
         await controller.switchTo(remaining[0].id);
@@ -158,6 +158,25 @@ export function Agent() {
 
   // revision 事件驱动轻量刷新（线程列表排序/状态）
   useEffect(() => controller.subscribe(bump), [controller, bump]);
+
+  // 终局 / Stop / 断连后收敛到服务端权威状态（last_run、Retry 可用性、最新 revision）。
+  // 停止时后端还在落盘 partial，先等一拍再重载；若仍在运行则再补一次。
+  const onStreamEnd = useCallback(() => {
+    const threadId = controller.getActiveThreadId();
+    if (!threadId) return;
+    const reloadOnce = async () => {
+      try {
+        const thread = await controller.reload(threadId);
+        await syncFromController();
+        if (thread.last_run?.status === "running" || thread.last_run?.status === "awaiting_approval") {
+          setTimeout(() => { void controller.reload(threadId).then(syncFromController).catch(() => undefined); }, 4000);
+        }
+      } catch {
+        // 重载失败保持现状
+      }
+    };
+    setTimeout(() => { void reloadOnce(); }, 1200);
+  }, [controller, syncFromController]);
 
   const activeBusy = activeThread?.last_run?.status === "running"
     || activeThread?.last_run?.status === "awaiting_approval";
@@ -245,6 +264,7 @@ export function Agent() {
             onRuntime={(refs) => {
               runtimeRefs.current = refs;
             }}
+            onStreamEnd={onStreamEnd}
           >
             <AgentThread
               activeThread={activeThread}

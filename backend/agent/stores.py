@@ -302,8 +302,8 @@ def reconcile_agent_data(paths: AgentPaths, threads: ThreadStore, runs: RunStore
                 updated_at=latest.updated_at,
                 retry_of=latest.retry_of,
             ))
-        except DocumentNotFound:
-            # run 指向的线程文件已被删除（或已隔离）——不重建空线程
+        except (DocumentNotFound, DocumentCorrupt):
+            # 线程文件已被删除或损坏（读取时已隔离）——不重建空线程，也不阻塞启动
             continue
     for directory in (paths.root, paths.threads, paths.runs, paths.root / "artifacts"):
         if not directory.exists():

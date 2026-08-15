@@ -17,6 +17,8 @@ export type AgentTransportOptions = {
   getRevision?: () => number;
   /** 流内 thread.revision.updated 事件（提交后到达）。 */
   onRevision?: (threadId: string, revision: number) => void;
+  /** 流结束（终局 / 停止 / 断连）后触发一次，用于收敛到服务端权威状态。 */
+  onStreamEnd?: () => void;
 };
 
 function parseSsePayload(line: string): Record<string, unknown> | null {
@@ -33,6 +35,7 @@ async function scanStream(
   handlers: {
     onRunError: (message: string) => void;
     onRevision?: (threadId: string, revision: number) => void;
+    onStreamEnd?: () => void;
   },
 ) {
   const reader = stream.getReader();
@@ -62,6 +65,8 @@ async function scanStream(
     }
   } catch {
     // 扫描失败不影响主流程
+  } finally {
+    handlers.onStreamEnd?.();
   }
 }
 
@@ -87,7 +92,11 @@ export class AgentHttpAgent extends HttpAgent {
       // 在传输层 tee 流扫描并上报给页面（订阅钩子在当前 @ag-ui/client 版本不触发）。
       if (response.body && (response.headers.get("content-type") ?? "").includes("text/event-stream")) {
         const [forCaller, forScan] = response.body.tee();
-        void scanStream(forScan, { onRunError, onRevision: transportOptions.onRevision });
+        void scanStream(forScan, {
+          onRunError,
+          onRevision: transportOptions.onRevision,
+          onStreamEnd: transportOptions.onStreamEnd,
+        });
         return new Response(forCaller, {
           status: response.status,
           statusText: response.statusText,
@@ -153,6 +162,7 @@ export function AgentRuntimeProvider({
   onError,
   controller,
   onRuntime,
+  onStreamEnd,
   children,
 }: {
   config: AgentModelConfig;
@@ -160,6 +170,7 @@ export function AgentRuntimeProvider({
   onError: (error: Error) => void;
   controller?: AgentHistoryController;
   onRuntime?: (refs: { agent: AgentHttpAgent; startRun: (parentId: string | null) => void }) => void;
+  onStreamEnd?: () => void;
   children: ReactNode;
 }) {
   const threadId = controller?.getActiveThreadId() ?? null;
@@ -177,10 +188,12 @@ export function AgentRuntimeProvider({
         getThreadId,
         getRevision,
         onRevision: (id, revision) => controller?.applyRevision(id, revision),
+        onStreamEnd,
       },
     ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [config, onConflict, onError, getThreadId, getRevision],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [config, onConflict, onError, getThreadId, getRevision, onStreamEnd],
   );
   const historyAdapter = useMemo(() => controller?.historyAdapter(), [controller, threadId]);
   const runtime = useAgUiRuntime({

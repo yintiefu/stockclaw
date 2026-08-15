@@ -20,7 +20,7 @@
 - Refresh and backend-restart recovery: **PASS**
 - Secret persistence scan: **PASS**
 - Legacy backend/frontend regression: **PASS**
-- Browser desktop/mobile acceptance: **PASS（1 项未捕获，见下）**
+- Browser desktop/mobile acceptance: **PARTIAL**（Stop 中途停止场景未在 live 捕获，见下；其余全部通过）
 
 ## 浏览器验收（CDP 127.0.0.1:16002，真实 BigModel GLM-5.2 通道）
 
@@ -53,3 +53,25 @@
 
 Proceed to 1C：所有自动化项通过；验收测试数据已从 `~/.vibe-research/agent/` 清理，
 无密钥或用户数据出现在隔离的 Agent 数据目录之外。注意：live Stop 部分输出持久化建议在 1C 开发时顺手复验一次。
+
+
+## 评审修复记录（2026-08-15 二轮）
+
+外部评审 13 项：采纳 11、部分采纳 1（#10 状态映射）、拒绝 1（#12 MemorySaver checkpoint——1B 为请求级纯内存且从不序列化，内置工具不接触密钥；**1C 引入持久化 checkpoint 时必须重评并在持久化边界脱敏**）。
+
+已修复并附回归：
+
+1. `/runs/{id}/cancel` 按 `product_run_id` 匹配活动 handle，不再误杀同线程的新 run
+2. steer-away 先无副作用 preflight（重复/revision/前缀），通过后才取消旧 run
+3. tool_calls 按轮次归属：合成 `asst-req-<call>` 请求消息先于 tool result 落盘，最终回答不重复携带调用
+4. retry 输入截断到目标 run 触发消息边界，失败 run 自身输出不进入重试；「目标后出现新 user 消息」拒绝
+5. 前端流结束（终局/Stop/断连）后 1.2s 权威重载 + 会话重建，仍运行则 4s 后补一次
+6. `shutdown()` 走统一持久化取消；后台持久化任务 coordinator 级强引用集合
+7. 对账捕获 `DocumentCorrupt`，损坏线程不再阻塞 lifespan
+8. resume/steer-away/retry 的存储读写与 Graph 构建全部 `asyncio.to_thread`
+9. interrupt 同步线程 `last_run=awaiting_approval`；resume 恢复 `running` 并结算 `approval_wait_ms`
+10. 前端状态映射：partial → `incomplete+cancelled`，pending interrupt → `requires-action+interrupt`（tool part 补 `reason`）
+11. resume 增加 protocol-run 重复检查；409 冲突体 `product_run_id` 改为真实产品 run ID；DELETE 携带 revision CAS（前端同步更新；计划文档中 Task 7 示例与顶层不变量的冲突按顶层不变量澄清）
+13. 本验证记录浏览器项由 PASS 更正为 PARTIAL
+
+revision 事件 `value` 的 camelCase（`threadId/persistedAt`）维持现状：计划只锁定构造函数签名，未锁定 value 字段命名；该事件为本项目私有，前后端同仓同改，已有测试锁定。

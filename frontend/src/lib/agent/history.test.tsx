@@ -115,7 +115,7 @@ describe("AgentHistoryController", () => {
     const repo = controller.historyAdapter();
     const loaded = await repo.load();
     expect(loaded.messages.map((item) => item.message.id)).toEqual(["u1", "a1"]);
-    expect(loaded.messages[1].message.status).toEqual({ type: "running" });
+    expect(loaded.messages[1].message.status).toEqual({ type: "incomplete", reason: "cancelled" });
   });
 
   it("导出仓库保留消息 ID 且 tool 结果并入 tool-call part", () => {

@@ -164,7 +164,7 @@ def test_valid_full_resume_uses_same_handle_and_empty_messages(monkeypatch):
     resume = deepcopy(START)
     resume["runId"] = "protocol-resume"
     resume["messages"] = []
-    resume["forwardedProps"]["runtime"]["threadRevision"] = 2  # start 追加用户消息 + 中断持久化 两次提交后的服务端 revision  # start 追加用户消息后的服务端 revision
+    resume["forwardedProps"]["runtime"]["threadRevision"] = router_module.services.threads.get("thread-endpoint").revision  # start 追加用户消息 + 中断持久化 两次提交后的服务端 revision  # start 追加用户消息后的服务端 revision
     resume["forwardedProps"]["command"] = {
         "resume": [{"interruptId": pending_id, "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}],
     }
@@ -192,7 +192,7 @@ def test_steer_away_closes_old_handle_and_starts_fresh_run(monkeypatch):
         {"id": "user-endpoint", "role": "user", "content": "hello"},
         {"id": "user-steer", "role": "user", "content": "use a different approach"},
     ]
-    steer["forwardedProps"]["runtime"]["threadRevision"] = 2  # start 追加用户消息 + 中断持久化 两次提交后的服务端 revision
+    steer["forwardedProps"]["runtime"]["threadRevision"] = router_module.services.threads.get("thread-endpoint").revision  # start 追加用户消息 + 中断持久化 两次提交后的服务端 revision
     steer["forwardedProps"]["command"] = {
         "resume": [{"interruptId": pending_id, "status": "cancelled"}],
     }
@@ -211,7 +211,7 @@ def test_partial_or_unknown_resume_fails_closed(monkeypatch):
     resume = deepcopy(START)
     resume["runId"] = "protocol-bad-resume"
     resume["messages"] = []
-    resume["forwardedProps"]["runtime"]["threadRevision"] = 2  # start 追加用户消息 + 中断持久化 两次提交后的服务端 revision
+    resume["forwardedProps"]["runtime"]["threadRevision"] = router_module.services.threads.get("thread-endpoint").revision  # start 追加用户消息 + 中断持久化 两次提交后的服务端 revision
     resume["forwardedProps"]["command"] = {
         "resume": [{"interruptId": "unknown", "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}],
     }
@@ -430,7 +430,7 @@ def test_resume_model_mismatch_returns_409(monkeypatch):
     resume["runId"] = "r-mismatch"
     resume["messages"] = []
     resume["forwardedProps"]["runtime"]["model"]["model"] = "different-model"
-    resume["forwardedProps"]["runtime"]["threadRevision"] = 2  # start 追加用户消息 + 中断持久化 两次提交后的服务端 revision
+    resume["forwardedProps"]["runtime"]["threadRevision"] = router_module.services.threads.get("thread-endpoint").revision  # start 追加用户消息 + 中断持久化 两次提交后的服务端 revision
     resume["forwardedProps"]["command"] = {
         "resume": [{"interruptId": pending_id, "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}],
     }
@@ -459,7 +459,7 @@ async def test_concurrent_resume_is_atomic(monkeypatch):
     resume = deepcopy(START)
     resume["runId"] = "r-atomic"
     resume["messages"] = []
-    resume["forwardedProps"]["runtime"]["threadRevision"] = 2  # start 追加用户消息 + 中断持久化 两次提交后的服务端 revision  # start 追加用户消息后的服务端 revision
+    resume["forwardedProps"]["runtime"]["threadRevision"] = router_module.services.threads.get("thread-endpoint").revision  # start 追加用户消息 + 中断持久化 两次提交后的服务端 revision  # start 追加用户消息后的服务端 revision
     resume["forwardedProps"]["command"] = {
         "resume": [{"interruptId": pending_id, "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}],
     }

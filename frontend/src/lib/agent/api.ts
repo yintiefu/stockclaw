@@ -56,8 +56,8 @@ export const agentApi = {
   getThread: (id: string) => agentRequest<AgentThread>(`/api/agent/threads/${encodeURIComponent(id)}`),
   patchThread: (id: string, revision: number, title: string) =>
     agentRequest<AgentThread>(`/api/agent/threads/${encodeURIComponent(id)}`, "PATCH", { revision, title }),
-  deleteThread: (id: string) =>
-    agentRequest<void>(`/api/agent/threads/${encodeURIComponent(id)}`, "DELETE"),
+  deleteThread: (id: string, revision: number) =>
+    agentRequest<void>(`/api/agent/threads/${encodeURIComponent(id)}`, "DELETE", { revision }),
   cancelRun: (id: string) =>
     agentRequest<AgentRun>(`/api/agent/runs/${encodeURIComponent(id)}/cancel`, "POST"),
 };

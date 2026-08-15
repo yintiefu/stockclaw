@@ -382,6 +382,19 @@ def test_event_boundary_revisions_and_message_persistence(http, monkeypatch):
     assert ids[0] == "user-http"
     roles = {m.role for m in thread.messages}
     assert "assistant" in roles
+    # 模型协议：tool result 之前必须存在携带 tool_calls 的 assistant 请求消息，
+    # 最终回答不得重复声明已完成调用
+    tool_msgs = [m for m in thread.messages if m.role == "tool"]
+    for tool_msg in tool_msgs:
+        request_msgs = [
+            m for m in thread.messages
+            if m.role == "assistant"
+            and any(call.get("id") == tool_msg.tool_call_id for call in m.tool_calls)
+        ]
+        assert request_msgs, "缺少携带 tool_calls 的 assistant 请求消息"
+        assert thread.messages.index(request_msgs[0]) < thread.messages.index(tool_msg)
+    final = [m for m in thread.messages if m.role == "assistant" and m.content]
+    assert all(not m.tool_calls for m in final), "最终回答不应重复携带 tool_calls"
     completed = [m for m in thread.messages if m.role == "assistant" and not m.partial]
     assert completed and completed[-1].content == "最终回答"
     run = services.runs.list_documents()[0]
@@ -823,3 +836,97 @@ async def test_full_lifecycle_create_partial_retry_restart_next_turn(tmp_path, m
     assert revisions_seen == sorted(revisions_seen) and len(revisions_seen) == len(set(revisions_seen))
     final_thread = fresh.threads.get(thread_id)
     assert final_thread.revision == revisions_seen[-1]
+
+
+def test_retry_input_excludes_failed_runs_own_outputs(tmp_path, monkeypatch):
+    """失败 run 自己已落盘的 tool 输出不得进入它自己的重试输入。"""
+    services = build_services(tmp_path / "agent")
+    monkeypatch.setattr(router_module, "services", services)
+    monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [journal_tool])
+    monkeypatch.setattr("agent.router.build_middleware", lambda: ())
+    RECORDED_INPUTS.clear()
+    # 第一轮：工具成功 → 第二次模型调用越界异常 → run failed（tool 输出已落盘）
+    monkeypatch.setattr(
+        "agent.router.build_chat_model",
+        lambda ref, sec: ScriptedChatModel([
+            AIMessage(content="", tool_calls=[{"id": "call-x", "name": "journal_tool", "args": {"code": "1"}}]),
+        ]),
+    )
+    client = TestClient(app_module.app, client=("127.0.0.1", 50030))
+    hdrs = {"X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"}
+    failed = client.post("/api/agent/run", json=start_payload_json(thread_id="thread-rx", run_id="protocol-rx-1"), headers=hdrs)
+    assert failed.status_code == 200 and "RUN_ERROR" in failed.text
+    thread = services.threads.get("thread-rx")
+    assert any(m.role == "tool" for m in thread.messages)  # 失败轮的工具输出已落盘
+    failed_run = services.runs.list_documents()[0]
+    assert failed_run.status == "failed"
+
+    monkeypatch.setattr(
+        "agent.router.build_chat_model",
+        lambda ref, sec: RecordingModel([AIMessage(content="重试回答")]),
+    )
+    retry = client.post("/api/agent/run", json=retry_payload(
+        "thread-rx", "protocol-rx-2", thread.revision, failed_run.id), headers=hdrs)
+    assert retry.status_code == 200, retry.text
+    retry_input = RECORDED_INPUTS[-1]
+    non_system = [m for m in retry_input if getattr(m, "type", "") != "system"]
+    assert len(non_system) == 1  # 只有原始 user 消息（不含 system prompt）
+    assert getattr(non_system[0], "content", None) == "hello"
+
+
+@pytest.mark.asyncio
+async def test_cancel_old_run_does_not_kill_active_new_run(tmp_path):
+    """评审修复1：取消已终结的旧 run 不得误杀同线程当前在跑的新 run。"""
+    coordinator, threads, runs = make_coordinator(tmp_path)
+    first = await start(coordinator, protocol_run_id="protocol-1", revision=None)
+    await coordinator.finish_if_terminal("thread-1", "completed")
+    revision = threads.get("thread-1").revision
+    second = await coordinator.acquire_start(
+        model_ref=MODEL_REF, secrets=SECRETS, model_builder=CountingBuilder(), tools=[],
+        thread_id="thread-1", middleware=(),
+        protocol_run_id="protocol-2",
+        messages=[user_msg("user-1", "分析现金流"), user_msg("user-2", "第二个问题")],
+        client_revision=revision,
+    )
+
+    cancelled = await coordinator.cancel_run("thread-1", first.run.id)
+
+    assert cancelled is None  # 旧 run 已终结：不做任何取消
+    assert runs.get(second.run.id).status == "running"
+    assert coordinator.active("thread-1") is second.handle
+    # 不带匹配 ID 的调用（当前流自身的断连路径）仍取消当前 run
+    assert await coordinator.cancel_run("thread-1", second.run.id) == second.run.id
+    assert runs.get(second.run.id).status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_steer_away_preflight_failure_leaves_old_run_intact(tmp_path):
+    """评审修复2：steer-away 校验失败（陈旧 revision）时旧审批运行原封不动。"""
+    coordinator, threads, runs = make_coordinator(tmp_path)
+    admission = await start(coordinator, protocol_run_id="protocol-1", revision=None)
+    handle = coordinator.active("thread-1")
+    handle.phase = "awaiting_approval"
+    handle.pending_interrupts = [PendingInterrupt(bridge_interrupt_id="int-1", order=0, tool_call_id="call-1", value={})]
+    builder = CountingBuilder()
+
+    with pytest.raises(RevisionConflict):
+        await coordinator.acquire_steer_away(
+            "thread-1",
+            entries=[{"interruptId": "int-1", "status": "cancelled"}],
+            validate=lambda pending, entries: None,
+            model_ref=MODEL_REF,
+            secrets=SECRETS,
+            model_builder=builder,
+            tools=[],
+            middleware=(),
+            messages=[user_msg("user-1", "分析现金流"), user_msg("user-2", "换个方向")],
+            client_revision=0,  # 陈旧：服务端已是 1
+            protocol_run_id="protocol-2",
+        )
+
+    assert builder.count == 0
+    assert runs.get(admission.run.id).status == "running"  # 旧 run 未被取消
+    assert coordinator.active("thread-1") is handle
+    assert handle.phase == "awaiting_approval"
+    thread = threads.get("thread-1")
+    assert [m.id for m in thread.messages] == ["user-1"]  # 无新消息写入

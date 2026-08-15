@@ -154,6 +154,9 @@ def _event_kind(event) -> str:
     return str(getattr(getattr(event, "type", None), "value", getattr(event, "type", "")))
 
 
+# 后台持久化任务的强引用集合（asyncio 文档要求持有 create_task 结果，防 GC）
+_BACKGROUND_PERSISTENCE: set[asyncio.Task] = set()
+
 # 只进内存的事件（无 JSON 写，内联观察即可）
 _MEMORY_ONLY_KINDS = {
     "TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT",
@@ -310,8 +313,10 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
         return _conflict_response(exc.code, str(exc), thread_id=thread_id,
                                   product_run_id=product_run_id, run_status=status)
     except DuplicateRunActive as exc:
+        persisted = services.runs.find_by_protocol_run_id(run_id)
         return _conflict_response(exc.code, str(exc), thread_id=thread_id,
-                                  product_run_id=run_id, run_status="running")
+                                  product_run_id=persisted.id if persisted else None,
+                                  run_status=persisted.status if persisted else "running")
     except DuplicateRunTerminal as exc:
         persisted = services.runs.find_by_protocol_run_id(run_id)
         return _conflict_response(exc.code, str(exc), thread_id=thread_id,
@@ -353,7 +358,7 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
         try:
             async for event in adapter.run(adapter_input):
                 if await request.is_disconnected():
-                    await services.coordinator.cancel_run(thread_id)
+                    await services.coordinator.cancel_run(thread_id, handle.product_run_id)
                     return
                 converted_events = bridge.convert(event)
                 if isinstance(event, RunFinishedEvent):
@@ -399,13 +404,19 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                     pending_initial = []
         except asyncio.CancelledError:
             # anyio 取消作用域里不能普通 await：独立的持久化任务 + 限时 shield 汇合
-            persistence = asyncio.create_task(services.coordinator.cancel_run(thread_id))
+            persistence = asyncio.create_task(services.coordinator.cancel_run(thread_id, handle.product_run_id))
+            # coordinator 级强引用：2 秒汇合超时后任务也不会被回收，直到完成回调观察结果
+            _BACKGROUND_PERSISTENCE.add(persistence)
 
             def _observe_result(done_task):
                 if not done_task.cancelled() and done_task.exception() is not None:
                     import sys
                     print(f"agent cancel persistence failed: {done_task.exception()!r}", file=sys.stderr)
-            persistence.add_done_callback(_observe_result)
+            persistence.add_done_callback(lambda done_task: (
+                _BACKGROUND_PERSISTENCE.discard(done_task),
+                None if done_task.cancelled() or done_task.exception() is None
+                else print(f"agent cancel persistence failed: {done_task.exception()!r}", file=__import__("sys").stderr),
+            ))
 
             with anyio.move_on_after(2, shield=True):
                 await asyncio.shield(persistence)
@@ -535,16 +546,22 @@ async def patch_thread(thread_id: str, payload: ThreadPatch):
     return updated.model_dump(mode="json")
 
 
+class ThreadDelete(BaseModel):
+    revision: int = Field(ge=0)
+
+
 @router.delete("/threads/{thread_id}", status_code=204)
-async def delete_thread(thread_id: str):
+async def delete_thread(thread_id: str, payload: ThreadDelete):
     try:
-        await services.coordinator.delete_thread(thread_id)
+        await services.coordinator.delete_thread(thread_id, expected_revision=payload.revision)
     except InvalidDocumentId as exc:
         return _store_error_response(exc, 400)
     except ThreadBusy as exc:
         return _store_error_response(exc, 409)
     except DocumentNotFound as exc:
         return _store_error_response(exc, 404)
+    except RevisionConflict as exc:
+        return _store_error_response(exc, 409)
     except DocumentCorrupt as exc:
         return _store_error_response(exc, 500)
     return Response(status_code=204)
@@ -561,7 +578,7 @@ async def cancel_run(run_id: str):
     except DocumentCorrupt as exc:
         return _store_error_response(exc, 500)
     # 幂等：断连 / REST 取消 / CancelledError 共用同一条持久化迁移
-    await services.coordinator.cancel_run(run.thread_id)
+    await services.coordinator.cancel_run(run.thread_id, run.id)
     refreshed = await asyncio.to_thread(services.runs.get, run_id)
     return refreshed.model_dump(mode="json")
 

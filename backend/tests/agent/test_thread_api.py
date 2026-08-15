@@ -118,7 +118,8 @@ def test_delete_idle_thread_removes_run_files(api):
     seed_run(services, run_id="run-1", thread_id="th-1")
     seed_run(services, run_id="run-2", thread_id="th-1")
 
-    resp = client.delete("/api/agent/threads/th-1")
+    revision = services.threads.get("th-1").revision
+    resp = client.request("DELETE", "/api/agent/threads/th-1", json={"revision": revision})
     assert resp.status_code == 204
     assert not (services.paths.threads / "th-1.json").exists()
     assert not (services.paths.runs / "run-1.json").exists()
@@ -132,7 +133,7 @@ def test_delete_active_thread_conflicts(api):
     coordinator = services.coordinator
     coordinator._handles["th-1"] = coordinator._make_running_handle("th-1")
 
-    resp = client.delete("/api/agent/threads/th-1")
+    resp = client.request("DELETE", "/api/agent/threads/th-1", json={"revision": 0})
     assert resp.status_code == 409
     assert resp.json()["code"] == "THREAD_BUSY"
     assert (services.paths.threads / "th-1.json").exists()
@@ -200,3 +201,13 @@ def test_app_lifespan_reconciles_injected_services(tmp_path, monkeypatch):
     assert reconciled.status == "interrupted"
     assert reconciled.error_code == "BACKEND_RESTARTED"
     assert services.threads.get("th-1").last_run.status == "interrupted"
+
+
+def test_delete_with_stale_revision_is_409(api):
+    client, services = api
+    services.threads.create(ThreadDocument.new("th-1", "待删", now=NOW))
+    services.threads.update("th-1", 0, lambda d: d)  # revision → 1
+    resp = client.request("DELETE", "/api/agent/threads/th-1", json={"revision": 0})
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "THREAD_REVISION_CONFLICT"
+    assert (services.paths.threads / "th-1.json").exists()

@@ -151,7 +151,7 @@ describe("Agent 工作台页面", () => {
     await user.click(screen.getByRole("button", { name: "确认" }));
     await waitFor(() => expect(api.patchThread).toHaveBeenCalledWith("th-1", 3, "改名后的会话"));
     await user.click(screen.getByLabelText("删除会话"));
-    await waitFor(() => expect(api.deleteThread).toHaveBeenCalledWith("th-1"));
+    await waitFor(() => expect(api.deleteThread).toHaveBeenCalledWith("th-1", expect.any(Number)));
   });
 
   it("结构化 409 触发一次权威重载并显示中文 detail", async () => {

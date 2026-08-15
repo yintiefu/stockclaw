@@ -32,6 +32,8 @@ class ActiveRunHandle:
     protocol_run_ids: list[str] = field(default_factory=list)
     trigger_message_id: str | None = None
     started_monotonic: float = field(default_factory=time.monotonic)
+    # 进入 awaiting_approval 的单调时刻（resume 时结算 approval_wait_ms）
+    approval_started_monotonic: float | None = None
     # 脱敏的历史快照引用（进入后续模型输入的服务端历史）
     history_snapshot: tuple[AgentMessage, ...] = ()
     # 语义边界持久化日志（不含密钥/闭包）
@@ -101,7 +103,8 @@ class RunJournal:
         self._handle = handle
         self._assistant_buffers: dict[str, dict] = {}
         self._tool_calls: dict[str, dict] = {}
-        self._tool_order: list[str] = []
+        # 当前轮次尚未归属的 tool 请求调用（发起请求的 assistant 消息尚未持久化）
+        self._pending_request_calls: list[str] = []
         self.closed = False
         self.model_calls = 0
         self.tool_calls = 0
@@ -114,8 +117,10 @@ class RunJournal:
         kind = str(getattr(getattr(event, "type", None), "value", getattr(event, "type", "")))
         if kind == "TEXT_MESSAGE_START":
             self.model_calls += 1
+            # 文本开始 = 工具请求阶段结束：先把带 tool_calls 的请求 assistant 消息落盘
+            commits = self._flush_request_message()
             self._assistant_buffers.setdefault(event.message_id, {"content": "", "tool_calls": []})
-            return []
+            return commits
         if kind == "TEXT_MESSAGE_CONTENT":
             buffer = self._assistant_buffers.setdefault(event.message_id, {"content": "", "tool_calls": []})
             buffer["content"] += event.delta
@@ -124,12 +129,14 @@ class RunJournal:
             return self._commit_assistant(event.message_id, partial=False)
         if kind == "TOOL_CALL_START":
             self._tool_calls.setdefault(event.tool_call_id, {"name": event.tool_call_name, "args": "", "message_id": None})
-            if event.tool_call_id not in self._tool_order:
-                self._tool_order.append(event.tool_call_id)
+            if event.tool_call_id not in self._pending_request_calls:
+                self._pending_request_calls.append(event.tool_call_id)
             return []
         if kind == "TOOL_CALL_ARGS":
             entry = self._tool_calls.setdefault(event.tool_call_id, {"name": "", "args": "", "message_id": None})
             entry["args"] += event.delta
+            if event.tool_call_id not in self._pending_request_calls:
+                self._pending_request_calls.append(event.tool_call_id)
             return []
         if kind == "TOOL_CALL_END":
             return []
@@ -153,9 +160,14 @@ class RunJournal:
                     partial=False,
                     pending_interrupt=True,
                     interrupts=metadata,
-                    tool_calls=self._tool_call_records(),
+                    tool_calls=self._request_call_records(),
                 ))
+        # 尚无文本流的挂起轮次：把未归属的请求调用单独落一条 pending 消息
+        if self._pending_request_calls:
+            self._flush_request_message(pending_interrupt=True, interrupts=metadata)
+        self._handle.approval_started_monotonic = time.monotonic()
         self._update_run({"status": "awaiting_approval"})
+        self._refresh_last_run("awaiting_approval")
         return self._commit_thread("interrupt")
 
     def persist_terminal(self, status: str, error_code: str | None = None, error_message: str | None = None) -> CommittedRevision:
@@ -185,6 +197,8 @@ class RunJournal:
         if self.closed:
             return None
         self.closed = True
+        if self._pending_request_calls:
+            self._flush_request_message(partial=True)
         for message_id, buffer in self._assistant_buffers.items():
             if not buffer["content"]:
                 continue
@@ -193,7 +207,6 @@ class RunJournal:
                 role="assistant",
                 content=buffer["content"],
                 partial=True,
-                tool_calls=self._tool_call_records(),
             ))
         self._update_run({
             "status": "cancelled",
@@ -215,25 +228,56 @@ class RunJournal:
         thread = self._threads.get(self._handle.runtime.thread_id)
         return {m.id for m in thread.messages if m.role == "assistant"}
 
-    def _tool_call_records(self) -> list[dict]:
+    def _request_call_records(self) -> list[dict]:
+        """当前轮次尚未归属的 tool 请求调用（含已执行完成的——请求声明仍属于发起消息）。"""
         return [
             {"id": call_id, "name": self._tool_calls[call_id]["name"], "args": self._tool_calls[call_id]["args"]}
-            for call_id in self._tool_order
+            for call_id in self._pending_request_calls
         ]
+
+    def _flush_request_message(
+        self,
+        *,
+        partial: bool = False,
+        pending_interrupt: bool = False,
+        interrupts: list[dict] | None = None,
+    ) -> list[CommittedRevision]:
+        """把当前轮次的 tool 请求调用合成一条 assistant 消息落盘（模型协议要求
+        tool result 之前存在携带 tool_calls 的请求消息）。ID 由首个 call ID 决定，
+        resume 重复观察时按 ID 幂等 upsert。
+        """
+        if not self._pending_request_calls:
+            return []
+        first_call = self._pending_request_calls[0]
+        message = AgentMessage(
+            id=f"asst-req-{first_call}",
+            role="assistant",
+            content="",
+            partial=partial,
+            pending_interrupt=pending_interrupt,
+            interrupts=interrupts or [],
+            tool_calls=self._request_call_records(),
+            created_at=utc_now(),
+        )
+        self._pending_request_calls = []
+        self._upsert_message(message)
+        return [self._commit_thread("tool_request")]
 
     def _commit_assistant(self, message_id: str, *, partial: bool) -> list[CommittedRevision]:
         buffer = self._assistant_buffers.get(message_id) or {"content": "", "tool_calls": []}
+        # 最终回答不再重复声明已完成调用：请求消息已在 TEXT_MESSAGE_START 时落盘
         self._upsert_message(AgentMessage(
             id=message_id,
             role="assistant",
             content=buffer["content"],
             partial=partial,
-            tool_calls=self._tool_call_records(),
             created_at=utc_now(),
         ))
         return [self._commit_thread("assistant_complete")]
 
     def _commit_tool(self, event: Any) -> list[CommittedRevision]:
+        # 模型协议：tool result 之前必须存在携带 tool_calls 的 assistant 请求消息
+        commits = self._flush_request_message()
         content = str(getattr(event, "content", "") or "")[:TOOL_SUMMARY_LIMIT]
         self._upsert_message(AgentMessage(
             id=event.message_id,
@@ -249,7 +293,8 @@ class RunJournal:
             "name": call.get("name", ""),
             "content": content,
         })})
-        return [self._commit_thread("tool_complete")]
+        commits.append(self._commit_thread("tool_complete"))
+        return commits
 
     def _append_tool_summary(self, summary: dict) -> list[dict]:
         run = self._current_run()
@@ -363,25 +408,20 @@ class RunCoordinator:
             f"{DuplicateRunTerminal.code}: protocol run {protocol_run_id} 已终结"
         )
 
-    def _admit_locked(
+    def _preflight_locked(
         self,
         thread_id: str,
         *,
-        model_ref: ModelRef,
-        secrets: RunSecrets,
-        model_builder: Callable,
-        tools,
-        middleware,
         protocol_run_id: str,
         messages: Sequence[Any],
         client_revision: int | None,
-    ) -> StartAdmission:
-        """持锁准入：重复检查 → revision/头部校验 → 持久化 → 建 Graph → 装句柄。
+    ) -> tuple[ThreadDocument, bool]:
+        """无副作用的准入校验：不写任何文件、不动任何句柄。
 
-        调用方必须已持有该线程的锁。模型密钥只在 model_builder 调用时被消费。
+        steer-away 必须先通过本校验，才允许取消旧的审批中运行。
+        返回 (权威线程文档, 是否为隐式创建的线程)。
         """
         threads, runs = self._require_stores()
-
         # 1) protocol run 重复检查（先于 revision）
         self._check_protocol_duplicate(protocol_run_id)
 
@@ -486,6 +526,35 @@ class RunCoordinator:
                 raise DuplicateRunTerminal(
                     f"{DuplicateRunTerminal.code}: 消息 {server_msg.id} 已被接受过"
                 )
+
+        return thread, implicit_thread
+
+    def _admit_locked(
+        self,
+        thread_id: str,
+        *,
+        model_ref: ModelRef,
+        secrets: RunSecrets,
+        model_builder: Callable,
+        tools,
+        middleware,
+        protocol_run_id: str,
+        messages: Sequence[Any],
+        client_revision: int | None,
+    ) -> StartAdmission:
+        """持锁准入：重复检查 → revision/头部校验 → 持久化 → 建 Graph → 装句柄。
+
+        调用方必须已持有该线程的锁。模型密钥只在 model_builder 调用时被消费。
+        """
+        threads, runs = self._require_stores()
+
+        # 1-3) 无副作用准入校验（重复/revision/前缀/消息重复）
+        thread, implicit_thread = self._preflight_locked(
+            thread_id, protocol_run_id=protocol_run_id, messages=messages,
+            client_revision=client_revision,
+        )
+        new_message = messages[-1]
+
 
         # 4) 创建产品 run 并写入 running 状态
         run_id = f"run-{uuid4().hex}"
@@ -636,7 +705,9 @@ class RunCoordinator:
             if handle is None or handle.phase != "awaiting_approval":
                 raise ResumeRejected(f"{ResumeRejected.code}: thread {thread_id} has no awaiting run")
             threads, runs = self._require_stores()
-            thread = self._load_thread(thread_id)
+            # 重复检查先于 revision（resume 的 protocol run 重放同样要拒绝）
+            self._check_protocol_duplicate(protocol_run_id)
+            thread = await asyncio.to_thread(self._load_thread, thread_id)
             if thread is not None:
                 expected = client_revision if client_revision is not None else thread.revision
                 if thread.revision != expected:
@@ -644,20 +715,31 @@ class RunCoordinator:
                         f"线程 {thread_id} 期望 revision {expected}，实际 {thread.revision}"
                     )
             resume_value = validate(handle.pending_interrupts)  # ValueError → 交给调用方 400
-            self._factory.resume(
-                handle=handle.runtime,
-                model_ref=model_ref,
-                secrets=secrets,
-                model_builder=model_builder,
-            )  # RunConfigMismatch → 状态未变
-            # 同一产品 run 追加新的 protocol run ID
-            if handle.product_run_id is not None:
-                run = runs.get(handle.product_run_id)
-                runs.replace(run.model_copy(update={
-                    "protocol_run_ids": [*run.protocol_run_ids, protocol_run_id],
-                    "updated_at": utc_now(),
-                }))
-                handle.protocol_run_ids = list(run.protocol_run_ids) + [protocol_run_id]
+
+            def _rebuild_and_record() -> None:
+                self._factory.resume(
+                    handle=handle.runtime,
+                    model_ref=model_ref,
+                    secrets=secrets,
+                    model_builder=model_builder,
+                )  # RunConfigMismatch → 状态未变
+                if handle.product_run_id is not None:
+                    run = runs.get(handle.product_run_id)
+                    approval_wait = 0
+                    if handle.approval_started_monotonic is not None:
+                        approval_wait = int((time.monotonic() - handle.approval_started_monotonic) * 1000)
+                        handle.approval_started_monotonic = None
+                    # 同一产品 run：追加 protocol ID、恢复 running、记录审批等待时长
+                    runs.replace(run.model_copy(update={
+                        "protocol_run_ids": [*run.protocol_run_ids, protocol_run_id],
+                        "status": "running",
+                        "ended_at": None,
+                        "approval_wait_ms": run.approval_wait_ms + approval_wait,
+                        "updated_at": utc_now(),
+                    }))
+                    handle.protocol_run_ids = list(run.protocol_run_ids) + [protocol_run_id]
+
+            await asyncio.to_thread(_rebuild_and_record)
             handle.phase = "running"
             handle.pending_interrupts = []
             return handle, resume_value
@@ -677,23 +759,37 @@ class RunCoordinator:
         client_revision: int | None = None,
         protocol_run_id: str = "protocol-2",
     ) -> StartAdmission:
-        """单锁完成：校验 steer-away 条目 → 旧 run 持久化为 cancelled → 新准入。"""
+        """单锁完成：校验 steer-away 条目 → 无副作用 preflight → 旧 run 持久化为 cancelled → 新准入。
+
+        preflight（重复/revision/前缀）失败时旧运行原封不动——任何校验错误都
+        不得不可逆地取消有效的审批中运行；只有新 run **写入**失败才保持旧 run 已取消。
+        """
         async with self._lock(thread_id):
             handle = self._handles.get(thread_id)
             if handle is None or not handle.pending_interrupts:
                 raise ResumeRejected(f"{ResumeRejected.code}: thread {thread_id} has no pending interrupts")
             validate(handle.pending_interrupts, entries)  # ValueError → 旧句柄保持原状
             threads, runs = self._require_stores()
-            # 旧 run 先持久化为 cancelled（即使新 run 写入失败也保持 cancelled）
-            if handle.product_run_id is not None:
-                old_run = runs.get(handle.product_run_id)
-                runs.replace(old_run.model_copy(update={
-                    "status": "cancelled",
-                    "updated_at": utc_now(),
-                    "ended_at": utc_now(),
-                    "error_code": "STEERED_AWAY",
-                    "error_message": "用户转向新问题，原运行取消",
-                }))
+            old_product_run_id = handle.product_run_id
+
+            def _preflight_and_cancel_old() -> None:
+                # 先做无副作用 preflight：通过后才允许破坏旧运行
+                self._preflight_locked(
+                    thread_id, protocol_run_id=protocol_run_id, messages=messages,
+                    client_revision=client_revision,
+                )
+                # 旧 run 先持久化为 cancelled（即使新 run 写入失败也保持 cancelled）
+                if old_product_run_id is not None:
+                    old_run = runs.get(old_product_run_id)
+                    runs.replace(old_run.model_copy(update={
+                        "status": "cancelled",
+                        "updated_at": utc_now(),
+                        "ended_at": utc_now(),
+                        "error_code": "STEERED_AWAY",
+                        "error_message": "用户转向新问题，原运行取消",
+                    }))
+
+            await asyncio.to_thread(_preflight_and_cancel_old)
             handle.phase = "cancelled"
             handle.runtime.release_graph()
             self._handles.pop(thread_id, None)
@@ -735,7 +831,7 @@ class RunCoordinator:
                 raise ThreadBusy(f"{ThreadBusy.code}: thread {thread_id} already has an active run")
             self._check_protocol_duplicate(protocol_run_id)
             try:
-                target = runs.get(retry_of)
+                target = await asyncio.to_thread(runs.get, retry_of)
             except DocumentNotFound:
                 raise RetryNotAllowed(f"{RetryNotAllowed.code}: 目标 run 不存在")
 
@@ -746,18 +842,28 @@ class RunCoordinator:
                 reject("目标 run 属于另一个线程")
             if target.status not in ("failed", "cancelled", "interrupted"):
                 reject("只能重试 failed/cancelled/interrupted 的 run")
-            thread_runs = runs.runs_for_thread(thread_id)
+            thread_runs = await asyncio.to_thread(runs.runs_for_thread, thread_id)
             latest = max(thread_runs, key=lambda r: (r.updated_at, r.id))
             if latest.id != target.id:
                 reject("目标 run 不是线程最新的产品 run")
 
-            thread = self._load_thread(thread_id)
+            thread = await asyncio.to_thread(self._load_thread, thread_id)
             if thread is None:
                 reject("线程不存在")
             if thread.revision != client_revision:
                 raise RevisionConflict(
                     f"线程 {thread_id} 期望 revision {client_revision}，实际 {thread.revision}"
                 )
+
+            # 重试输入必须回到目标 run 的触发边界：失败 run 自己落盘的输出不进入自身重试
+            history = thread.model_history()
+            history_ids = [m.id for m in history]
+            if target.trigger_message_id not in history_ids:
+                reject("目标 run 的触发消息不在完整历史中")
+            trigger_index = history_ids.index(target.trigger_message_id)
+            if any(m.role == "user" for m in history[trigger_index + 1:]):
+                reject("目标 run 之后完整历史已推进（出现了新的 user 消息）")
+            retry_history = history[: trigger_index + 1]
 
             run_id = f"run-{uuid4().hex}"
             now = utc_now()
@@ -767,21 +873,23 @@ class RunCoordinator:
                 protocol_run_id=protocol_run_id,
                 model_ref=model_ref,
                 trigger_message_id=target.trigger_message_id,
-                history_head_id=thread.messages[-1].id if thread.messages else None,
+                history_head_id=retry_history[-1].id if retry_history else None,
                 now=now,
                 retry_of=retry_of,
             )
-            runs.replace(run)
+            await asyncio.to_thread(runs.replace, run)
 
             def refresh_summary(doc: ThreadDocument) -> ThreadDocument:
                 return doc.model_copy(update={"last_run": RunSummary(
                     id=run_id, status="running", updated_at=utc_now(), retry_of=retry_of,
                 )})
 
-            updated_thread = threads.update(thread_id, thread.revision, refresh_summary)
+            updated_thread = await asyncio.to_thread(
+                threads.update, thread_id, thread.revision, refresh_summary,
+            )
 
-            try:
-                runtime = self._factory.create(
+            def _build_retry_runtime():
+                return self._factory.create(
                     model_ref=model_ref,
                     secrets=secrets,
                     model_builder=model_builder,
@@ -789,6 +897,9 @@ class RunCoordinator:
                     thread_id=thread_id,
                     middleware=middleware,
                 )
+
+            try:
+                runtime = await asyncio.to_thread(_build_retry_runtime)
             except Exception:
                 runs.replace(run.model_copy(update={
                     "status": "failed",
@@ -806,7 +917,6 @@ class RunCoordinator:
                 )
                 raise
 
-            model_history = updated_thread.model_history()
             handle = ActiveRunHandle(
                 runtime=runtime,
                 phase="running",
@@ -814,14 +924,14 @@ class RunCoordinator:
                 product_run_id=run_id,
                 protocol_run_ids=[protocol_run_id],
                 trigger_message_id=target.trigger_message_id,
-                history_snapshot=tuple(model_history),
+                history_snapshot=tuple(retry_history),
             )
             handle.journal = RunJournal(threads=threads, runs=runs, handle=handle)
             self._handles[thread_id] = handle
             return StartAdmission(
                 handle=handle,
                 run=runs.get(run_id),
-                input=runtime.run_input(protocol_run_id=protocol_run_id, messages=model_history),
+                input=runtime.run_input(protocol_run_id=protocol_run_id, messages=retry_history),
                 revisions=[updated_thread.revision],
             )
 
@@ -917,12 +1027,18 @@ class RunCoordinator:
             thread_id, lambda journal: [journal.persist_terminal(status, error_code, error_message)]
         )
 
-    async def cancel_run(self, thread_id: str) -> str | None:
-        """幂等的持久化取消：断连 / REST 取消 / CancelledError 共用同一条迁移。"""
+    async def cancel_run(self, thread_id: str, product_run_id: str | None = None) -> str | None:
+        """幂等的持久化取消：断连 / REST 取消 / CancelledError 共用同一条迁移。
+
+        传入 product_run_id 时只取消匹配的活动 run——取消一个已终结的旧 run
+        绝不能误杀该线程当前在跑的新 run（此时原样返回，不产生任何写入）。
+        """
         async with self._lock(thread_id):
             handle = self._handles.get(thread_id)
             if handle is None:
                 return None
+            if product_run_id is not None and handle.product_run_id != product_run_id:
+                return None  # 目标 run 已终结，当前活动的是别的 run：不做任何事
             handle.phase = "cancelled"  # 先标记：迟到的 journal 事件被拒
             journal = handle.journal
             product_run_id = handle.product_run_id
@@ -952,9 +1068,15 @@ class RunCoordinator:
                 handle.thread_revision = updated.revision
             return updated
 
-    async def delete_thread(self, thread_id: str) -> None:
+    async def delete_thread(self, thread_id: str, expected_revision: int | None = None) -> None:
+        """删除线程（连带其全部 run 文件）；删除前按顶层不变量做 revision CAS。"""
         threads, runs = self._require_stores()
         async with self._lock(thread_id):
+            thread = await asyncio.to_thread(self._load_thread, thread_id)
+            if thread is not None and expected_revision is not None and thread.revision != expected_revision:
+                raise RevisionConflict(
+                    f"线程 {thread_id} 期望 revision {expected_revision}，实际 {thread.revision}"
+                )
             handle = self._handles.get(thread_id)
             if handle is not None and handle.phase in ("running", "awaiting_approval"):
                 raise ThreadBusy(f"{ThreadBusy.code}: thread {thread_id} has an active run")
@@ -964,6 +1086,6 @@ class RunCoordinator:
             await asyncio.to_thread(threads.delete, thread_id)
 
     async def shutdown(self) -> None:
-        """进程退出：取消并释放所有活动句柄（持久化在 Task 5 加入）。"""
+        """进程退出：每个活动 run 走统一的持久化取消迁移（partial 落盘 + run 终态）。"""
         for thread_id in list(self._handles):
-            await self.cancel(thread_id)
+            await self.cancel_run(thread_id)
