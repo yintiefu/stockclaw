@@ -3,7 +3,7 @@ import {
   MessagePrimitive,
   ThreadPrimitive,
 } from "@assistant-ui/react";
-import { Send, Square } from "lucide-react";
+import { Send, Square, Wrench } from "lucide-react";
 
 function UserMessage() {
   return (
@@ -13,10 +13,40 @@ function UserMessage() {
   );
 }
 
+/** 兜底工具渲染：未注册专用 UI 的工具调用显示名称/参数/结果，而不是空白。 */
+function ToolFallback({
+  toolName,
+  args,
+  result,
+}: {
+  toolName: string;
+  args?: unknown;
+  result?: unknown;
+}) {
+  return (
+    <div className="flex items-start gap-2 rounded-md border border-border bg-black/20 px-3 py-2 text-xs text-muted-foreground">
+      <Wrench className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+      <div className="min-w-0 flex-1">
+        <span className="font-medium text-foreground">{toolName}</span>
+        {args != null ? (
+          <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all">
+            {typeof args === "string" ? args : JSON.stringify(args)}
+          </pre>
+        ) : null}
+        {result != null ? (
+          <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all">
+            {typeof result === "string" ? result : JSON.stringify(result)}
+          </pre>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function AssistantMessage() {
   return (
     <MessagePrimitive.Root className="max-w-[88%] text-sm leading-6 text-foreground">
-      <MessagePrimitive.Content />
+      <MessagePrimitive.Content components={{ tools: { Fallback: ToolFallback } }} />
     </MessagePrimitive.Root>
   );
 }

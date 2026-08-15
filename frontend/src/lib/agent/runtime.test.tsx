@@ -80,3 +80,17 @@ it("stores model config under vr-agent-model and never vr-llm", () => {
   saveAgentModelConfig({ provider: "", baseURL: "", model: "", apiKey: "" });
   expect(loadAgentModelConfig()).toBeNull();
 });
+
+it("surfaces in-stream RUN_ERROR via onRunError", async () => {
+  const runErrors: string[] = [];
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(
+    'data: {"type":"RUN_STARTED","threadId":"thread-1","runId":"run-1"}\n\ndata: {"type":"RUN_ERROR","message":"上游余额不足","threadId":"thread-1","runId":"run-1"}\n\n',
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  )));
+  const agent = new AgentHttpAgent(CONFIG, vi.fn(), (message) => runErrors.push(message));
+  await new Promise<void>((resolve) => {
+    agent.run(INPUT).subscribe({ complete: resolve, error: () => resolve() });
+  });
+  await new Promise((r) => setTimeout(r, 10));
+  expect(runErrors).toContain("上游余额不足");
+});

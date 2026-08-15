@@ -14,7 +14,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import BaseTool
 
 from agent.models import ModelRef, RuntimeForwardedProps, RunSecrets
-from agent.protocol import AgentProtocolBridge
+from agent.protocol import AgentProtocolBridge, PendingInterrupt
 from agent.runs import ResumeRejected, RunCoordinator, ThreadBusy
 from agent.runtime import AgentFactory, RunConfigMismatch, build_chat_model
 from agent.tool_registry import build_builtin_tools
@@ -64,6 +64,40 @@ def _error_event(message: str) -> RunErrorEvent:
     return RunErrorEvent(message=message, code="AGENT_RUN_FAILED")
 
 
+def _classify(input_data: RunAgentInput) -> str:
+    """按 spec 的合法形状分类（start/resume/steer-away）；混合/畸形形状一律失败关闭。"""
+    forwarded_props = input_data.forwarded_props or {}
+    command = forwarded_props.get("command") or {}
+    resume_entries = (command.get("resume") or []) if isinstance(command, dict) else []
+    messages = input_data.messages or []
+
+    has_cancelled = any(isinstance(e, dict) and e.get("status") == "cancelled" for e in resume_entries)
+    user_messages = [m for m in messages if getattr(m, "role", None) == "user"]
+
+    if resume_entries and has_cancelled:
+        # steer-away：全部 cancelled + 恰好一条新 user message
+        if not all(isinstance(e, dict) and e.get("status") == "cancelled" for e in resume_entries):
+            raise ValueError("steer-away 不能混合 resolved 与 cancelled 条目")
+        if len(user_messages) != 1:
+            raise ValueError("steer-away 必须恰好携带一条新 user message")
+        return "steer_away"
+    if resume_entries:
+        # 纯 resume：不得携带新消息
+        if messages:
+            raise ValueError("纯 resume 不得携带新消息（messages 必须为空）")
+        return "resume"
+    # start：恰好一条新 user message
+    if len(user_messages) != 1 or len(messages) != 1:
+        raise ValueError("start 必须恰好携带一条新 user message")
+    return "start"
+
+
+def _validate_steer_away(pending: list[PendingInterrupt], entries: list[dict]) -> None:
+    probe = AgentProtocolBridge("", "", pending=pending)
+    if not probe.is_steer_away(entries):
+        raise ValueError("resume 条目不是全量 cancelled，不能作为 steer-away")
+
+
 def _without_resume_command(input_data: RunAgentInput) -> RunAgentInput:
     props = {k: v for k, v in (input_data.forwarded_props or {}).items() if k != "command"}
     return input_data.model_copy(update={"forwarded_props": props})
@@ -92,39 +126,46 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
     except Exception:
         return _error_response("INVALID_RUNTIME_PROPS", "forwardedProps.runtime 缺少有效的 model 配置")
 
+    command = forwarded_props.get("command") or {}
+    resume_entries = (command.get("resume") or []) if isinstance(command, dict) else []
+
+    try:
+        mode = _classify(input_data)
+    except ValueError as exc:
+        return _error_response("INVALID_REQUEST_SHAPE", str(exc))
+
     secrets = RunSecrets(model_api_key=model_key)
     model_ref: ModelRef = runtime_props.model
     thread_id = input_data.thread_id
     run_id = input_data.run_id
 
-    command = forwarded_props.get("command") or {}
-    resume_entries = (command.get("resume") or []) if isinstance(command, dict) else []
-
-    # —— 分类：start / resume / steer-away ——
-    if resume_entries and any(isinstance(entry, dict) and entry.get("status") == "cancelled" for entry in resume_entries):
-        mode = "steer_away"
-    elif resume_entries:
-        mode = "resume"
-    else:
-        mode = "start"
-
     model_builder: Callable[[ModelRef, RunSecrets], BaseChatModel] = build_chat_model
     tools: list[BaseTool] = build_builtin_tools()
     middleware = build_middleware()
 
-    if mode == "steer_away":
-        # 校验全部 pending bridge ID，然后关闭旧句柄、按新消息全新起跑
-        active = coordinator.active(thread_id)
-        if active is None or not active.pending_interrupts:
-            return _error_response("RESUME_REJECTED", "没有待处理的审批中断", 409)
-        try:
-            probe = AgentProtocolBridge(thread_id, run_id, pending=active.pending_interrupts)
-            if not probe.is_steer_away(resume_entries):
-                return _error_response("RESUME_REJECTED", "混合/部分取消的 resume 不被支持")
-        except ValueError as exc:
-            return _error_response("RESUME_REJECTED", str(exc))
-        await coordinator.steer_away(thread_id)
-        try:
+    try:
+        if mode == "steer_away":
+            handle = await coordinator.acquire_steer_away(
+                thread_id,
+                entries=resume_entries,
+                validate=_validate_steer_away,
+                model_ref=model_ref,
+                secrets=secrets,
+                model_builder=model_builder,
+                tools=tools,
+                middleware=middleware,
+            )
+            adapter_input = _without_resume_command(input_data)
+        elif mode == "resume":
+            handle, resume_value = await coordinator.acquire_resume(
+                thread_id,
+                model_ref=model_ref,
+                secrets=secrets,
+                model_builder=model_builder,
+                validate=lambda pending: AgentProtocolBridge("", "", pending=pending).resume_value(resume_entries),
+            )
+            adapter_input = handle.runtime.resume_input(run_id, resume_value)
+        else:
             handle = await coordinator.acquire_start(
                 model_ref=model_ref,
                 secrets=secrets,
@@ -133,40 +174,16 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                 thread_id=thread_id,
                 middleware=middleware,
             )
-        except ThreadBusy as exc:
-            return _error_response(exc.code, str(exc), 409)
-        adapter_input = _without_resume_command(input_data)
-    elif mode == "resume":
-        try:
-            active = await coordinator.acquire_resume(thread_id)
-        except ResumeRejected as exc:
-            return _error_response(exc.code, str(exc), 409)
-        bridge_probe = AgentProtocolBridge(thread_id, run_id, pending=active.pending_interrupts)
-        try:
-            resume_value = bridge_probe.resume_value(resume_entries)
-        except ValueError as exc:
-            return _error_response("RESUME_REJECTED", str(exc))
-        try:
-            await coordinator.rebuild_graph(active, model_ref=model_ref, secrets=secrets, model_builder=model_builder)
-        except RunConfigMismatch as exc:
-            return _error_response(exc.code, str(exc))
-        # 先转 running 再清 pending —— 校验失败时列表保持原状
-        active.pending_interrupts = []
-        handle = active
-        adapter_input = handle.runtime.resume_input(run_id, resume_value)
-    else:
-        try:
-            handle = await coordinator.acquire_start(
-                model_ref=model_ref,
-                secrets=secrets,
-                model_builder=model_builder,
-                tools=tools,
-                thread_id=thread_id,
-                middleware=middleware,
-            )
-        except ThreadBusy as exc:
-            return _error_response(exc.code, str(exc), 409)
-        adapter_input = input_data
+            adapter_input = input_data
+    except ThreadBusy as exc:
+        return _error_response(exc.code, str(exc), 409)
+    except ResumeRejected as exc:
+        return _error_response(exc.code, str(exc), 409)
+    except ValueError as exc:
+        return _error_response("RESUME_REJECTED", str(exc))
+    except RunConfigMismatch as exc:
+        # spec：resume 的 ModelRef 与活动线程不一致 → 409
+        return _error_response(exc.code, str(exc), 409)
 
     bridge = AgentProtocolBridge(thread_id, run_id, pending=handle.pending_interrupts)
     adapter = handle.runtime.new_adapter(run_id)
@@ -187,6 +204,7 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                 for converted in converted_events:
                     yield encoder.encode(converted)
         except asyncio.CancelledError:
+            # anyio 取消作用域里不能 await，用同步路径清理
             coordinator.cancel_sync(thread_id)
             raise
         except Exception as exc:

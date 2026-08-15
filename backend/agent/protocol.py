@@ -67,6 +67,9 @@ class AgentProtocolBridge:
                 "args_text": chunk_args,
             }
             self._tool_call_order.append(event.tool_call_id)
+            if chunk_args:
+                # 合成标准 TOOL_CALL_ARGS，下游无需理解 raw_event 结构
+                return [event, ToolCallArgsEvent(tool_call_id=event.tool_call_id, delta=chunk_args)]
             return [event]
         if isinstance(event, ToolCallArgsEvent):
             if event.tool_call_id not in self._tool_calls:

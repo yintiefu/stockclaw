@@ -4,10 +4,12 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 
 // AgentRuntimeProvider / AgentThread 以轻量桩替代，专注页面自身状态契约
+const captured = vi.hoisted(() => ({ onError: null as ((e: Error) => void) | null }));
 vi.mock("@/lib/agent/runtime", () => ({
-  AgentRuntimeProvider: ({ children }: { children: React.ReactNode }) => (
-    <div data-testid="agent-runtime-stub">{children}</div>
-  ),
+  AgentRuntimeProvider: ({ children, onError }: { children: React.ReactNode; onError: (e: Error) => void }) => {
+    captured.onError = onError;
+    return <div data-testid="agent-runtime-stub">{children}</div>;
+  },
 }));
 vi.mock("@/components/agent/AgentThread", () => ({
   AgentThread: () => <div data-testid="agent-thread-stub" />,
@@ -53,6 +55,20 @@ describe("Agent 工作台页面", () => {
   it("表单不完整时不挂载 runtime", () => {
     render(<MemoryRouter><Agent /></MemoryRouter>);
     expect(screen.queryByTestId("agent-runtime-stub")).toBeNull();
+  });
+
+  it("runtime onError 触发后错误可见且不暴露密钥", async () => {
+    const user = userEvent.setup();
+    render(<MemoryRouter><Agent /></MemoryRouter>);
+    await user.type(screen.getByLabelText("Provider"), "openai");
+    await user.type(screen.getByLabelText("Base URL"), "https://api.openai.com/v1");
+    await user.type(screen.getByLabelText("模型"), "gpt-5-mini");
+    await user.type(screen.getByLabelText("API Key"), "sk-sentinel-key");
+    await user.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(screen.getByTestId("agent-runtime-stub")).toBeInTheDocument());
+    captured.onError?.(new Error("上游余额不足"));
+    await waitFor(() => expect(screen.getByText(/上游余额不足/)).toBeInTheDocument());
+    expect(document.body.textContent ?? "").not.toContain("sk-sentinel-key");
   });
 
   it("表单完整时挂载 runtime 且错误提示不暴露密钥", async () => {

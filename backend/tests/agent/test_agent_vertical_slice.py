@@ -64,11 +64,10 @@ def test_vertical_slice_event_order(monkeypatch):
     response = client.post("/api/agent/run", json=start_payload(), headers=HEADERS)
     assert response.status_code == 200
     types = [event["type"] for event in parse_events(response.text)]
-    # 锁定版本（ag-ui-langgraph 0.0.42）不发独立 TOOL_CALL_ARGS：
-    # 参数内嵌在 TOOL_CALL_START.rawEvent 的 chunk 里（见 Task 7 spike 记录）。
     expected_order = [
         "RUN_STARTED",
         "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",  # 桥接层从 START.raw_event 合成的标准事件
         "TOOL_CALL_END",
         "TOOL_CALL_RESULT",
         "TEXT_MESSAGE_START",

@@ -65,6 +65,8 @@ class RuntimeHandle:
     tools: tuple[BaseTool, ...]
     middleware: tuple[Any, ...]
     graph: Any | None = None
+    # 注意：不保存 model 引用。运行期间 Graph 内部持有模型（spec 允许），
+    # 但 handle/coordinator 上不得保留独立的密钥载体（spec：原始 key 不得进入 ActiveRunHandle）。
     model: BaseChatModel | None = None
     model_calls: int = 0
     tool_calls: int = 0
@@ -144,7 +146,6 @@ class AgentFactory:
             tools=tuple(tools),
             middleware=tuple(middleware),
             graph=graph,
-            model=model,
         )
 
     def resume(
@@ -168,4 +169,3 @@ class AgentFactory:
             middleware=list(handle.middleware),
             checkpointer=handle.checkpointer,
         )
-        handle.model = model

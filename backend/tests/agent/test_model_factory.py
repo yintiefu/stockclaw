@@ -29,3 +29,30 @@ def test_blank_key_is_rejected_before_model_construction(monkeypatch):
     ref = ModelRef(provider="openai", base_url="https://api.openai.com/v1", model="gpt-5-mini")
     with pytest.raises(ValueError, match="X-VR-Agent-Model-Key"):
         build_chat_model(ref, RunSecrets(model_api_key="   "))
+
+
+def test_handle_never_stores_real_model_key(monkeypatch):
+    """真实 ChatOpenAI 路径：handle/coordinator 快照上不保留密钥载体。"""
+    from agent.runtime import AgentFactory
+    from langchain_core.tools import tool as lc_tool
+
+    monkeypatch.setattr(chat, "_check_base_url", lambda value: None)
+
+    @lc_tool
+    def noop(code: str) -> str:
+        """noop"""
+        return "ok"
+
+    secret = "sk-real-leak-probe"
+    handle = AgentFactory().create(
+        model_ref=ModelRef(provider="openai", base_url="https://api.openai.com/v1", model="gpt-5-mini"),
+        secrets=RunSecrets(model_api_key=secret),
+        model_builder=build_chat_model,
+        tools=[noop],
+        thread_id="thread-leak",
+    )
+    assert handle.model is None
+    rendered = repr(handle) + repr(handle.snapshot) + repr(vars(handle.snapshot))
+    assert secret not in rendered
+    handle.release_graph()
+    assert handle.graph is None and handle.model is None

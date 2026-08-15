@@ -6,7 +6,7 @@
 
 **Architecture:** Add a focused `backend/agent/` package without changing the existing AI routes. A custom FastAPI endpoint creates a fresh `LangGraphAgent` for each HTTP request and delegates version-sensitive event and resume conversion to `AgentProtocolBridge`; active Spike state stays in memory until milestone 1B adds authoritative JSON thread/run storage. The existing React/Vite app gets only a minimal `/agent` page using `assistant-ui`, `@assistant-ui/react-ag-ui`, and a small `HttpAgent` wrapper; the full three-column workspace, durable history, Skills, MCP, approvals, artifacts, and policy UI remain later milestones.
 
-**Tech Stack:** Python 3, FastAPI, Pydantic, LangChain 1.3.15, LangGraph 1.2.9, `ag-ui-langgraph` 0.0.42, `ag-ui-protocol` 0.1.15, React 19, TypeScript, assistant-ui 0.15.14, AG-UI client 0.0.58, Vitest, React Testing Library
+**Tech Stack:** Python 3, FastAPI, Pydantic, LangChain 1.3.15, LangGraph 1.2.11, `ag-ui-langgraph` 0.0.42, `ag-ui-protocol` 0.1.15, React 19, TypeScript, assistant-ui 0.15.14, AG-UI client 0.0.58, Vitest, React Testing Library
 
 ---
 
@@ -75,11 +75,12 @@ Append this block to `backend/requirements.txt`:
 # Agent workspace protocol/runtime group. Upgrade and contract-test as one unit.
 langchain==1.3.15
 langchain-openai==1.5.1
-langgraph==1.2.9
+langgraph==1.2.11  # 1.2.9 与 langchain 1.3.15 冲突（要求 >=1.2.11），经用户确认上调
 ag-ui-langgraph==0.0.42
 ag-ui-protocol==0.1.15
 ag-ui-a2ui-toolkit==0.0.4
-langchain-mcp-adapters==0.3.2
+# langchain-mcp-adapters 与 mootdx 的 httpx 上下限互斥（mcp 需 >=0.27，mootdx 需 <0.26），
+# 经用户确认 1A 移除、待 1C 引入 MCP 时再评估拆分
 ```
 
 Append this exact test dependency to `backend/requirements-dev.txt`:

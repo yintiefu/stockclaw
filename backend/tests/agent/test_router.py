@@ -368,3 +368,111 @@ async def test_client_disconnect_cancels_run(monkeypatch):
         assert "protected-result" not in message.get("body", b"").decode("utf-8", "ignore")
         assert "RUN_FINISHED" not in message.get("body", b"").decode("utf-8", "ignore")
     assert PROTECTED_CALLS == []
+
+
+def test_malformed_shapes_fail_closed(monkeypatch):
+    reset_coordinator()
+    patch_plain(monkeypatch)
+
+    # steer-away 没有/多于一条新消息
+    no_msg = deepcopy(START)
+    no_msg["runId"] = "r-steer-nomsg"
+    no_msg["messages"] = []
+    no_msg["forwardedProps"]["command"] = {"resume": [{"interruptId": "x", "status": "cancelled"}]}
+    assert client.post("/api/agent/run", json=no_msg, headers=HEADERS).status_code == 400
+
+    two_msgs = deepcopy(START)
+    two_msgs["runId"] = "r-start-two"
+    two_msgs["messages"] = [
+        {"id": "u1", "role": "user", "content": "a"},
+        {"id": "u2", "role": "user", "content": "b"},
+    ]
+    assert client.post("/api/agent/run", json=two_msgs, headers=HEADERS).status_code == 400
+
+
+def test_resume_with_new_message_fails_closed(monkeypatch):
+    reset_coordinator()
+    patch_plain(monkeypatch)
+    pending_id = interrupt_and_get_pending(monkeypatch, client)
+    resume = deepcopy(START)
+    resume["runId"] = "r-resume-with-msg"
+    resume["messages"] = [{"id": "u9", "role": "user", "content": "extra"}]
+    resume["forwardedProps"]["command"] = {
+        "resume": [{"interruptId": pending_id, "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}],
+    }
+    assert client.post("/api/agent/run", json=resume, headers=HEADERS).status_code == 400
+    assert PROTECTED_CALLS == []
+
+
+def test_resume_model_mismatch_returns_409(monkeypatch):
+    reset_coordinator()
+    pending_id = interrupt_and_get_pending(monkeypatch, client)
+    monkeypatch.setattr(
+        "agent.router.build_chat_model",
+        lambda model_ref, secrets: ScriptedChatModel([AIMessage(content="resumed")]),
+    )
+    resume = deepcopy(START)
+    resume["runId"] = "r-mismatch"
+    resume["messages"] = []
+    resume["forwardedProps"]["runtime"]["model"]["model"] = "different-model"
+    resume["forwardedProps"]["command"] = {
+        "resume": [{"interruptId": pending_id, "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}],
+    }
+    response = client.post("/api/agent/run", json=resume, headers=HEADERS)
+    assert response.status_code == 409
+    assert response.json()["code"] == "RUN_CONFIG_MISMATCH"
+    # 原句柄保持 awaiting_approval，pending 不变
+    handle = router_module.coordinator._handles["thread-endpoint"]
+    assert handle.phase == "awaiting_approval"
+    assert len(handle.pending_interrupts) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_resume_is_atomic(monkeypatch):
+    """两个并发 resume 只能有一个成功（单锁原子迁移）。"""
+    import httpx
+    reset_coordinator()
+    pending_id = interrupt_and_get_pending(monkeypatch, client)
+    build_calls = []
+
+    def counting_builder(model_ref, secrets):
+        build_calls.append(model_ref.model)
+        return ScriptedChatModel([AIMessage(content="resumed")])
+
+    monkeypatch.setattr("agent.router.build_chat_model", counting_builder)
+    resume = deepcopy(START)
+    resume["runId"] = "r-atomic"
+    resume["messages"] = []
+    resume["forwardedProps"]["command"] = {
+        "resume": [{"interruptId": pending_id, "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}],
+    }
+
+    async def fire(app):
+        body = json.dumps(resume).encode()
+        incoming = iter([{"type": "http.request", "body": body, "more_body": False}])
+        sent = []
+
+        async def receive():
+            return next(incoming, {"type": "http.disconnect"})
+
+        async def send(message):
+            sent.append(message)
+
+        await app({
+            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+            "method": "POST", "scheme": "http", "path": "/api/agent/run",
+            "raw_path": b"/api/agent/run", "query_string": b"", "root_path": "",
+            "state": {}, "extensions": {}, "client": ("127.0.0.1", 50000), "server": ("t", 80),
+            "headers": [
+                (b"host", b"t"), (b"content-type", b"application/json"),
+                (b"accept", b"text/event-stream"), (b"x-vr-agent-model-key", b"request-only-key"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        }, receive, send)
+        status = next((m["status"] for m in sent if m["type"] == "http.response.start"), None)
+        return status
+
+    statuses = await asyncio.gather(fire(app_module.app), fire(app_module.app))
+    statuses = sorted(statuses)
+    assert statuses == [200, 409]
+    assert len(build_calls) == 1

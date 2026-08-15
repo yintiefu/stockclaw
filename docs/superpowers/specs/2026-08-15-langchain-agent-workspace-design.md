@@ -128,11 +128,11 @@
 
 - `langchain==1.3.15`
 - `langchain-openai==1.5.1`
-- `langgraph==1.2.9`
+- `langgraph==1.2.11`（1.2.9 与 langchain 1.3.15 冲突，经用户确认上调）
 - `ag-ui-langgraph==0.0.42`
 - `ag-ui-protocol==0.1.15`
 - `ag-ui-a2ui-toolkit==0.0.4`
-- `langchain-mcp-adapters==0.3.2`
+- `langchain-mcp-adapters`：1A 移除 —— 与 mootdx 的 httpx 上下限互斥（经用户确认），1C 引入 MCP 时重新评估
 
 前端必须提交 `package-lock.json`，后端必须直接锁定 `ag-ui-protocol`、`ag-ui-a2ui-toolkit` 和 `langgraph`，不能依赖 `ag-ui-langgraph` 的宽松传递范围。`ag-ui-a2ui-toolkit` 会在适配器导入时进入关键路径，因此也属于协议锁定组。AG-UI 相关 0.x 依赖不得使用宽松版本范围；升级必须整组进行，并先通过协议合同测试。
 
