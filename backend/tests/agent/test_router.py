@@ -164,12 +164,12 @@ def test_valid_full_resume_uses_same_handle_and_empty_messages(monkeypatch):
     resume = deepcopy(START)
     resume["runId"] = "protocol-resume"
     resume["messages"] = []
-    resume["forwardedProps"]["runtime"]["threadRevision"] = 1  # start 追加用户消息后的服务端 revision
+    resume["forwardedProps"]["runtime"]["threadRevision"] = 2  # start 追加用户消息 + 中断持久化 两次提交后的服务端 revision  # start 追加用户消息后的服务端 revision
     resume["forwardedProps"]["command"] = {
         "resume": [{"interruptId": pending_id, "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}],
     }
     response = client.post("/api/agent/run", json=resume, headers=HEADERS)
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     assert "resumed answer" in response.text
     assert "RUN_FINISHED" in response.text
     assert PROTECTED_CALLS == ["600519"]
@@ -192,7 +192,7 @@ def test_steer_away_closes_old_handle_and_starts_fresh_run(monkeypatch):
         {"id": "user-endpoint", "role": "user", "content": "hello"},
         {"id": "user-steer", "role": "user", "content": "use a different approach"},
     ]
-    steer["forwardedProps"]["runtime"]["threadRevision"] = 1
+    steer["forwardedProps"]["runtime"]["threadRevision"] = 2  # start 追加用户消息 + 中断持久化 两次提交后的服务端 revision
     steer["forwardedProps"]["command"] = {
         "resume": [{"interruptId": pending_id, "status": "cancelled"}],
     }
@@ -211,7 +211,7 @@ def test_partial_or_unknown_resume_fails_closed(monkeypatch):
     resume = deepcopy(START)
     resume["runId"] = "protocol-bad-resume"
     resume["messages"] = []
-    resume["forwardedProps"]["runtime"]["threadRevision"] = 1
+    resume["forwardedProps"]["runtime"]["threadRevision"] = 2  # start 追加用户消息 + 中断持久化 两次提交后的服务端 revision
     resume["forwardedProps"]["command"] = {
         "resume": [{"interruptId": "unknown", "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}],
     }
@@ -343,18 +343,6 @@ async def test_client_disconnect_cancels_run(monkeypatch):
     reset_coordinator()
     PROTECTED_CALLS.clear()
     coordinator = router_module.coordinator
-    cancels: list[str] = []
-    captured_handles: list = []
-    original_cancel = coordinator.cancel_sync
-
-    def spy_cancel(thread_id):
-        cancels.append(thread_id)
-        handle = coordinator._handles.get(thread_id)
-        if handle is not None:
-            captured_handles.append(handle)
-        original_cancel(thread_id)
-
-    coordinator.cancel_sync = spy_cancel
     # 首个事件后暂停，让 http.disconnect 在流中途被处理
     monkeypatch.setattr(
         "agent.router.build_chat_model",
@@ -371,12 +359,13 @@ async def test_client_disconnect_cancels_run(monkeypatch):
     )
 
     sent = await post_then_disconnect(app_module.app, START)
-    # 断言：恰好一次 cancel；handle 进入 cancelled 且图已释放；无断连后的事件帧。
-    assert cancels == ["thread-endpoint"]
-    for handle in captured_handles:
-        assert handle.phase == "cancelled"
-        assert handle.runtime.graph is None
-        assert handle.runtime.model is None
+    # 1B：断连走唯一的持久化取消迁移 —— run 落盘为 cancelled，句柄释放
+    assert coordinator.active("thread-endpoint") is None
+    persisted = router_module.services.runs.list_documents()
+    assert len(persisted) == 1
+    assert persisted[0].status == "cancelled"
+    assert persisted[0].thread_id == "thread-endpoint"
+    # 无断连后的事件帧，工具绝不在断连后执行
     bodies = [m for m in sent if m.get("type") == "http.response.body"]
     for message in bodies:
         assert "protected-result" not in message.get("body", b"").decode("utf-8", "ignore")
@@ -431,7 +420,7 @@ def test_resume_model_mismatch_returns_409(monkeypatch):
     resume["runId"] = "r-mismatch"
     resume["messages"] = []
     resume["forwardedProps"]["runtime"]["model"]["model"] = "different-model"
-    resume["forwardedProps"]["runtime"]["threadRevision"] = 1
+    resume["forwardedProps"]["runtime"]["threadRevision"] = 2  # start 追加用户消息 + 中断持久化 两次提交后的服务端 revision
     resume["forwardedProps"]["command"] = {
         "resume": [{"interruptId": pending_id, "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}],
     }
@@ -460,7 +449,7 @@ async def test_concurrent_resume_is_atomic(monkeypatch):
     resume = deepcopy(START)
     resume["runId"] = "r-atomic"
     resume["messages"] = []
-    resume["forwardedProps"]["runtime"]["threadRevision"] = 1  # start 追加用户消息后的服务端 revision
+    resume["forwardedProps"]["runtime"]["threadRevision"] = 2  # start 追加用户消息 + 中断持久化 两次提交后的服务端 revision  # start 追加用户消息后的服务端 revision
     resume["forwardedProps"]["command"] = {
         "resume": [{"interruptId": pending_id, "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}],
     }

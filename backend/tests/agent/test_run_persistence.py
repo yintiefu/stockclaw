@@ -274,3 +274,278 @@ async def test_graph_failure_after_persistence_finalizes_run_failed(tmp_path):
     persisted = runs.list_documents()
     assert persisted[0].status == "failed"
     assert thread.last_run is not None and thread.last_run.status == "failed"
+
+
+# ---- Task 5：流式边界持久化 / 部分消息 / 取消 ----
+
+
+import asyncio
+
+import app as app_module
+import agent.router as router_module
+from fastapi.testclient import TestClient
+from langchain_core.messages import AIMessage
+from langchain_core.tools import tool
+
+from agent.router import build_services
+from tests.agent.fakes import PausingChatModel
+
+RECORDED_INPUTS: list = []
+
+
+@tool
+def journal_tool(code: str) -> str:
+    """Return a fixture result containing no secrets."""
+    return f"journal-result-{code}"
+
+
+@tool
+def leaking_tool(code: str) -> str:
+    """Echo the request key back to verify redaction at the persistence boundary."""
+    return "leaked request-only-key inside tool result"
+
+
+class RecordingModel(ScriptedChatModel):
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        RECORDED_INPUTS.append(list(messages))
+        return super()._generate(messages, stop, run_manager, **kwargs)
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        RECORDED_INPUTS.append(list(messages))
+        return super()._stream(messages, stop, run_manager, **kwargs)
+
+
+@pytest.fixture
+def http(tmp_path, monkeypatch):
+    services = build_services(tmp_path / "agent")
+    monkeypatch.setattr(router_module, "services", services)
+    monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [journal_tool])
+    monkeypatch.setattr("agent.router.build_middleware", lambda: ())
+    client = TestClient(app_module.app, client=("127.0.0.1", 50010))
+    return client, services
+
+
+def start_payload_json(thread_id="thread-http", run_id="protocol-http", content="hello", revision=0, prefix=(), user_id="user-http"):
+    messages = [{"id": m[0], "role": "user", "content": m[1]} for m in prefix]
+    messages.append({"id": user_id, "role": "user", "content": content})
+    return {
+        "threadId": thread_id,
+        "runId": run_id,
+        "state": {},
+        "messages": messages,
+        "tools": [],
+        "context": [],
+        "forwardedProps": {"runtime": {
+            "model": {"provider": "fixture", "baseURL": "https://example.com/v1", "model": "fixture-model"},
+            "threadRevision": revision,
+        }},
+    }
+
+
+def parse_sse(text: str) -> list[dict]:
+    return [json.loads(line[len("data: "):]) for line in text.splitlines() if line.startswith("data: ")]
+
+
+def test_event_boundary_revisions_and_message_persistence(http, monkeypatch):
+    client, services = http
+    RECORDED_INPUTS.clear()
+    monkeypatch.setattr(
+        "agent.router.build_chat_model",
+        lambda ref, sec: RecordingModel([
+            AIMessage(content="", tool_calls=[{"id": "call-1", "name": "journal_tool", "args": {"code": "600519"}}]),
+            AIMessage(content="最终回答"),
+        ]),
+    )
+    resp = client.post("/api/agent/run", json=start_payload_json(), headers={
+        "X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"})
+    assert resp.status_code == 200, resp.text
+
+    events = parse_sse(resp.text)
+    revisions = [e for e in events if e.get("type") == "CUSTOM" and e.get("name") == "thread.revision.updated"]
+    finishes = [i for i, e in enumerate(events) if e.get("type") == "RUN_FINISHED"]
+    assert finishes and revisions
+    last_rev_index = max(i for i, e in enumerate(events) if e.get("type") == "CUSTOM" and e.get("name") == "thread.revision.updated")
+    assert last_rev_index < finishes[-1]
+    values = [json.loads(e["value"])["revision"] if isinstance(e.get("value"), str) else e["value"]["revision"] for e in revisions]
+    assert values == sorted(values)
+    assert len(values) == len(set(values))
+
+    thread = services.threads.get("thread-http")
+    ids = [m.id for m in thread.messages]
+    assert ids[0] == "user-http"
+    roles = {m.role for m in thread.messages}
+    assert "assistant" in roles
+    completed = [m for m in thread.messages if m.role == "assistant" and not m.partial]
+    assert completed and completed[-1].content == "最终回答"
+    run = services.runs.list_documents()[0]
+    assert run.status == "completed"
+    assert thread.last_run.status == "completed"
+    assert "request-only-key" not in resp.text
+    assert "request-only-key" not in (services.paths.threads / "thread-http.json").read_text()
+    assert "request-only-key" not in (services.paths.runs / f"{run.id}.json").read_text()
+
+
+def test_redaction_at_persistence_boundary(http, monkeypatch):
+    client, services = http
+    monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [leaking_tool])
+    monkeypatch.setattr(
+        "agent.router.build_chat_model",
+        lambda ref, sec: RecordingModel([
+            AIMessage(content="", tool_calls=[{"id": "call-leak", "name": "leaking_tool", "args": {"code": "1"}}]),
+            AIMessage(content="回答里也带 request-only-key"),
+        ]),
+    )
+    resp = client.post("/api/agent/run", json=start_payload_json(run_id="protocol-leak"), headers={
+        "X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"})
+    assert resp.status_code == 200
+    assert "request-only-key" not in resp.text
+    assert "[redacted]" in resp.text
+    thread_text = (services.paths.threads / "thread-http.json").read_text()
+    run_file = services.runs.list_documents()[0]
+    run_text = (services.paths.runs / f"{run_file.id}.json").read_text()
+    assert "request-only-key" not in thread_text
+    assert "request-only-key" not in run_text
+    assert "[redacted]" in thread_text
+
+
+async def drive_asgi(app, payload: dict, *, mode: str = "plain"):
+    """raw ASGI 驱动：plain=发完 body 即等；disconnect=首个 delta 后断连；hold=永不返回。"""
+    body = json.dumps(payload).encode()
+    incoming = iter([{"type": "http.request", "body": body, "more_body": False}])
+    sent: list[dict] = []
+    got_delta = asyncio.Event()
+
+    body_sent = False
+
+    async def receive() -> dict:
+        nonlocal body_sent
+        if not body_sent:
+            body_sent = True
+            return next(incoming, {"type": "http.disconnect"})
+        if mode == "hold":
+            await asyncio.Event().wait()  # 模拟保持连接、既不响应也不断开
+        if mode == "disconnect":
+            # 首个 delta 之后才断连；Event 已置位时 wait() 不挂起，
+            # is_disconnected 的已取消作用域仍能拿到同步返回的断连消息
+            await got_delta.wait()
+            return {"type": "http.disconnect"}
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+        raw = message.get("body", b"")
+        body_text = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, str)) else ""
+        if "TEXT_MESSAGE_CONTENT" in body_text:
+            got_delta.set()
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": "POST", "scheme": "http", "path": "/api/agent/run",
+        "raw_path": b"/api/agent/run", "query_string": b"", "root_path": "",
+        "state": {}, "extensions": {},
+        "client": ("127.0.0.1", 50011), "server": ("testserver", 80),
+        "headers": [
+            (b"host", b"testserver"), (b"content-type", b"application/json"),
+            (b"accept", b"text/event-stream"), (b"x-vr-agent-model-key", b"request-only-key"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+    }
+    task = asyncio.create_task(app(scope, receive, send))
+    return task, sent, got_delta
+
+
+@pytest.mark.asyncio
+async def test_disconnect_persists_partial_then_excludes_from_next_input(tmp_path, monkeypatch):
+    services = build_services(tmp_path / "agent")
+    monkeypatch.setattr(router_module, "services", services)
+    monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [])
+    monkeypatch.setattr("agent.router.build_middleware", lambda: ())
+    RECORDED_INPUTS.clear()
+    monkeypatch.setattr(
+        "agent.router.build_chat_model",
+        lambda ref, sec: PausingChatModel([AIMessage(content="部分回答内容")]),
+    )
+    task, sent, got_delta = await drive_asgi(
+        app_module.app, start_payload_json(thread_id="thread-disc", run_id="protocol-disc"),
+        mode="disconnect",
+    )
+    await asyncio.wait_for(got_delta.wait(), timeout=5)
+    await asyncio.wait_for(task, timeout=10)
+
+    thread = services.threads.get("thread-disc")
+    partials = [m for m in thread.messages if m.role == "assistant"]
+    assert partials and partials[0].partial is True
+    assert partials[0].content
+    run = services.runs.list_documents()[0]
+    assert run.status == "cancelled"
+    assert services.coordinator.active("thread-disc") is None
+
+    monkeypatch.setattr(
+        "agent.router.build_chat_model",
+        lambda ref, sec: RecordingModel([AIMessage(content="下一轮回答")]),
+    )
+    client = TestClient(app_module.app, client=("127.0.0.1", 50012))
+    resp = client.post("/api/agent/run", json=start_payload_json(
+        thread_id="thread-disc", run_id="protocol-disc-2", content="继续", user_id="user-disc-2",
+        revision=thread.revision, prefix=[("user-http", "hello")],
+    ), headers={"X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"})
+    assert resp.status_code == 200, resp.text
+    model_input_ids = [getattr(m, "id", None) for m in RECORDED_INPUTS[-1]]
+    assert all(p.id not in model_input_ids for p in partials)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stream_shields_partial_persistence_before_reraising(tmp_path, monkeypatch):
+    services = build_services(tmp_path / "agent")
+    monkeypatch.setattr(router_module, "services", services)
+    monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [])
+    monkeypatch.setattr("agent.router.build_middleware", lambda: ())
+    monkeypatch.setattr(
+        "agent.router.build_chat_model",
+        lambda ref, sec: PausingChatModel([AIMessage(content="将被取消的部分文本")]),
+    )
+    task, sent, got_delta = await drive_asgi(
+        app_module.app, start_payload_json(thread_id="thread-cancel", run_id="protocol-cancel"),
+        mode="hold",
+    )
+    await asyncio.wait_for(got_delta.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=10)
+
+    partials: list = []
+    for _ in range(50):
+        thread = services.threads.get("thread-cancel")
+        partials = [m for m in thread.messages if m.role == "assistant" and m.partial]
+        if partials:
+            break
+        await asyncio.sleep(0.1)
+    assert partials, "取消后的部分 assistant 消息应当落盘"
+    run = services.runs.list_documents()[0]
+    assert run.status == "cancelled"
+    assert services.coordinator.active("thread-cancel") is None
+
+
+@pytest.mark.asyncio
+async def test_patch_during_active_run_adopts_revision(tmp_path, monkeypatch):
+    services = build_services(tmp_path / "agent")
+    monkeypatch.setattr(router_module, "services", services)
+    monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [])
+    monkeypatch.setattr("agent.router.build_middleware", lambda: ())
+    slow = PausingChatModel([AIMessage(content="慢速回答")])
+    slow.pause_seconds = 0.5
+    monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: slow)
+
+    task, sent, got_delta = await drive_asgi(
+        app_module.app, start_payload_json(thread_id="thread-patch", run_id="protocol-patch"),
+        mode="hold",
+    )
+    await asyncio.wait_for(got_delta.wait(), timeout=5)
+    patched = await services.coordinator.patch_thread("thread-patch", 1, "运行中改名")
+    assert patched.revision == 2
+    await asyncio.wait_for(task, timeout=15)
+
+    thread = services.threads.get("thread-patch")
+    assert thread.title == "运行中改名"
+    assert thread.last_run.status == "completed"
+    assert thread.revision >= 3

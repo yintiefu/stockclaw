@@ -3,13 +3,15 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import os
+from typing import TypeVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from ag_ui.core.events import RunErrorEvent, RunFinishedEvent
+from ag_ui.core.events import BaseEvent, RunErrorEvent, RunFinishedEvent
 from ag_ui.core.types import RunAgentInput
 from ag_ui.encoder import EventEncoder
+import anyio
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -17,7 +19,7 @@ from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 
 from agent.models import ModelRef, RunSecrets, RunSummary, RuntimeForwardedProps, ThreadDocument
-from agent.protocol import AgentProtocolBridge, PendingInterrupt
+from agent.protocol import AgentProtocolBridge, PendingInterrupt, thread_revision_updated
 from agent.runs import (
     DuplicateRunActive,
     DuplicateRunTerminal,
@@ -102,6 +104,52 @@ def _error_response(code: str, detail: str, status: int = 400) -> JSONResponse:
 
 def _error_event(message: str) -> RunErrorEvent:
     return RunErrorEvent(message=message, code="AGENT_RUN_FAILED")
+
+
+def _redact_value(value, secret: str):
+    if isinstance(value, str):
+        return value.replace(secret, "[redacted]")
+    if isinstance(value, list):
+        return [_redact_value(item, secret) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_value(item, secret) for item in value)
+    if isinstance(value, set):
+        return {_redact_value(item, secret) for item in value}
+    if isinstance(value, dict):
+        return {key: _redact_value(item, secret) for key, item in value.items()}
+    return value
+
+
+def _redact_model(model, secret: str):
+    updates = {key: _redact_value(value, secret) for key, value in model.__dict__.items()}
+    return model.model_copy(update=updates)
+
+
+def redact_event(event, model_key: str):
+    """对事件的字符串字段做密钥替换；不改变事件结构。"""
+    if not model_key or not hasattr(event, "model_copy"):
+        return event
+    return _redact_model(event, model_key)
+
+
+def _redact_frame(frame: str, model_key: str) -> str:
+    """字符串级兜底：任何序列化路径漏掉的密钥都在出口替换。"""
+    return frame.replace(model_key, "[redacted]") if model_key else frame
+
+
+def _event_kind(event) -> str:
+    return str(getattr(getattr(event, "type", None), "value", getattr(event, "type", "")))
+
+
+# 只进内存的事件（无 JSON 写，内联观察即可）
+_MEMORY_ONLY_KINDS = {
+    "TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT",
+    "TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END",
+}
+
+
+class _PersistenceFailure(RuntimeError):
+    """JSON 提交失败：必须显式告知客户端状态未持久化。"""
 
 
 def _classify(input_data: RunAgentInput) -> str:
@@ -237,26 +285,98 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
     adapter = handle.runtime.new_adapter(run_id)
     encoder = EventEncoder(accept=request.headers.get("accept"))
 
+    initial_revisions = list(getattr(locals().get("admission", None), "revisions", []) or [])
+
+    async def _commit_or_fail(commit_fn):
+        """执行持久化迁移；失败时抛 _PersistenceFailure（消息已脱敏）。"""
+        try:
+            return await commit_fn()
+        except _PersistenceFailure:
+            raise
+        except Exception as exc:
+            raise _PersistenceFailure(str(exc).replace(model_key, "[redacted]")[:500]) from exc
+
     async def event_generator():
         terminal: str = "completed"
         try:
+            # 准入阶段（接受用户消息）的 revision 事件：提交已成功，先行发出
+            for revision in initial_revisions:
+                yield encoder.encode(thread_revision_updated(thread_id, revision, utc_now()))
+
             async for event in adapter.run(adapter_input):
                 if await request.is_disconnected():
-                    await services.coordinator.cancel(thread_id)
+                    await services.coordinator.cancel_run(thread_id)
                     return
                 converted_events = bridge.convert(event)
-                if isinstance(event, RunFinishedEvent) and bridge.pending:
-                    handle.pending_interrupts = list(bridge.pending)
-                    await services.coordinator.mark_awaiting_approval(thread_id)
-                    terminal = "awaiting_approval"
+                if isinstance(event, RunFinishedEvent):
+                    if bridge.pending:
+                        # 中断：先持久化 pending 元数据 → revision 事件 → 释放 Graph → 再发标准 interrupt
+                        handle.pending_interrupts = list(bridge.pending)
+                        commits = await _commit_or_fail(
+                            lambda: services.coordinator.journal_interrupt(thread_id, bridge.pending)
+                        )
+                        for commit in commits:
+                            yield encoder.encode(thread_revision_updated(commit.thread_id, commit.revision, commit.persisted_at))
+                        await services.coordinator.mark_awaiting_approval(thread_id)
+                        terminal = "awaiting_approval"
+                    else:
+                        # 终局：最终 revision 事件必须先于 RUN_FINISHED
+                        commits = await _commit_or_fail(
+                            lambda: services.coordinator.journal_terminal(thread_id, "completed")
+                        )
+                        for commit in commits:
+                            yield encoder.encode(thread_revision_updated(commit.thread_id, commit.revision, commit.persisted_at))
+                        terminal = "completed"
+                    for converted in converted_events:
+                        yield encoder.encode(converted)
+                    continue
                 for converted in converted_events:
-                    yield encoder.encode(converted)
+                    safe_event = redact_event(converted, model_key)
+                    if _event_kind(safe_event) in _MEMORY_ONLY_KINDS:
+                        # 纯内存累积：不经过工作线程，也不持锁
+                        if handle.journal is not None and not handle.journal.closed:
+                            handle.journal.observe(safe_event)
+                    else:
+                        commits = await _commit_or_fail(
+                            lambda e=safe_event: services.coordinator.journal_observe(thread_id, e)
+                        )
+                        for commit in commits:
+                            yield encoder.encode(thread_revision_updated(commit.thread_id, commit.revision, commit.persisted_at))
+                    yield _redact_frame(encoder.encode(safe_event), model_key)
         except asyncio.CancelledError:
-            # anyio 取消作用域里不能 await，用同步路径清理
-            services.coordinator.cancel_sync(thread_id)
+            # anyio 取消作用域里不能普通 await：独立的持久化任务 + 限时 shield 汇合
+            persistence = asyncio.create_task(services.coordinator.cancel_run(thread_id))
+
+            def _observe_result(done_task):
+                if not done_task.cancelled() and done_task.exception() is not None:
+                    import sys
+                    print(f"agent cancel persistence failed: {done_task.exception()!r}", file=sys.stderr)
+            persistence.add_done_callback(_observe_result)
+
+            with anyio.move_on_after(2, shield=True):
+                await asyncio.shield(persistence)
+            # 超时也不取消持久化任务：它持有线程锁并在后台完成
             raise
+        except _PersistenceFailure as exc:
+            yield encoder.encode(RunErrorEvent(
+                message=f"运行状态未能持久化，本地历史可能不完整：{exc}",
+                code="PERSISTENCE_FAILED",
+            ))
+            terminal = "failed"
+            services.coordinator.cancel_sync(thread_id)
         except Exception as exc:
             message = str(exc).replace(model_key, "[redacted]")[:1000]
+            try:
+                commits = await _commit_or_fail(
+                    lambda: services.coordinator.journal_terminal(thread_id, "failed", "AGENT_RUN_FAILED", message)
+                )
+                for commit in commits:
+                    yield encoder.encode(thread_revision_updated(commit.thread_id, commit.revision, commit.persisted_at))
+            except _PersistenceFailure:
+                yield encoder.encode(RunErrorEvent(
+                    message=f"运行状态未能持久化，本地历史可能不完整：{message}",
+                    code="PERSISTENCE_FAILED",
+                ))
             yield encoder.encode(_error_event(message))
             terminal = "failed"
         finally:
@@ -374,6 +494,22 @@ async def delete_thread(thread_id: str):
     except DocumentCorrupt as exc:
         return _store_error_response(exc, 500)
     return Response(status_code=204)
+
+
+@router.post("/runs/{run_id}/cancel")
+async def cancel_run(run_id: str):
+    try:
+        run = await asyncio.to_thread(services.runs.get, run_id)
+    except InvalidDocumentId as exc:
+        return _store_error_response(exc, 400)
+    except DocumentNotFound as exc:
+        return _store_error_response(exc, 404)
+    except DocumentCorrupt as exc:
+        return _store_error_response(exc, 500)
+    # 幂等：断连 / REST 取消 / CancelledError 共用同一条持久化迁移
+    await services.coordinator.cancel_run(run.thread_id)
+    refreshed = await asyncio.to_thread(services.runs.get, run_id)
+    return refreshed.model_dump(mode="json")
 
 
 @router.get("/runs/{run_id}")

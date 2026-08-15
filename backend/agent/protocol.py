@@ -25,6 +25,18 @@ class RunCancelledEvent(ConfiguredBaseModel):
     run_id: str
 
 
+def thread_revision_updated(thread_id: str, revision: int, persisted_at: str) -> CustomEvent:
+    """提交成功后才能发出的 revision 事件（项目自有，绝不进 bridge.convert）。"""
+    return CustomEvent(
+        name="thread.revision.updated",
+        value=json.dumps({
+            "threadId": thread_id,
+            "revision": revision,
+            "persistedAt": persisted_at,
+        }, ensure_ascii=False),
+    )
+
+
 @dataclass(frozen=True)
 class PendingInterrupt:
     """桥接层自有 ID 的待审批中断；顺序独立于 LangGraph 内部 ID。"""

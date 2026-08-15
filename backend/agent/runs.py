@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from ag_ui.core.types import RunAgentInput
 
-from agent.models import AgentMessage, ModelRef, RunDocument, RunSecrets, RunSummary, ThreadDocument
+from agent.models import AgentMessage, ModelRef, RunDocument, RunSecrets, RunSummary, RunUsage, ThreadDocument
 from agent.protocol import PendingInterrupt
 from agent.runtime import AgentFactory, RuntimeHandle
 from agent.stores import DocumentNotFound, RevisionConflict, utc_now
@@ -33,6 +33,8 @@ class ActiveRunHandle:
     started_monotonic: float = field(default_factory=time.monotonic)
     # 脱敏的历史快照引用（进入后续模型输入的服务端历史）
     history_snapshot: tuple[AgentMessage, ...] = ()
+    # 语义边界持久化日志（不含密钥/闭包）
+    journal: "RunJournal | None" = None
 
 
 @dataclass
@@ -69,6 +71,231 @@ class MessageConflict(RuntimeError):
 
 class RetryNotAllowed(RuntimeError):
     code = "RETRY_NOT_ALLOWED"
+
+
+# 持久化工具摘要的截断边界（与 1A BUILTIN_RESULT_LIMIT 对齐）
+TOOL_SUMMARY_LIMIT = 6000
+
+
+@dataclass(frozen=True)
+class CommittedRevision:
+    """一次成功落盘后的 revision 事实；事件只能在提交之后发出。"""
+
+    thread_id: str
+    revision: int
+    persisted_at: str
+    reason: str
+
+
+class RunJournal:
+    """语义边界运行日志：只消费已脱敏的标准 AG-UI 事件。
+
+    文本增量只进内存；工具完成 / assistant 完成 / 中断 / 终态 / 取消才写 JSON。
+    绝不持有密钥或密钥闭包。
+    """
+
+    def __init__(self, *, threads: "ThreadStore", runs: "RunStore", handle: ActiveRunHandle):
+        self._threads = threads
+        self._runs = runs
+        self._handle = handle
+        self._assistant_buffers: dict[str, dict] = {}
+        self._tool_calls: dict[str, dict] = {}
+        self._tool_order: list[str] = []
+        self.closed = False
+        self.model_calls = 0
+        self.tool_calls = 0
+
+    # ---- 观察（同步；增量内联，边界经 asyncio.to_thread 调用） ----
+
+    def observe(self, event: Any) -> list[CommittedRevision]:
+        if self.closed:
+            return []
+        kind = str(getattr(getattr(event, "type", None), "value", getattr(event, "type", "")))
+        if kind == "TEXT_MESSAGE_START":
+            self.model_calls += 1
+            self._assistant_buffers.setdefault(event.message_id, {"content": "", "tool_calls": []})
+            return []
+        if kind == "TEXT_MESSAGE_CONTENT":
+            buffer = self._assistant_buffers.setdefault(event.message_id, {"content": "", "tool_calls": []})
+            buffer["content"] += event.delta
+            return []
+        if kind == "TEXT_MESSAGE_END":
+            return self._commit_assistant(event.message_id, partial=False)
+        if kind == "TOOL_CALL_START":
+            self._tool_calls.setdefault(event.tool_call_id, {"name": event.tool_call_name, "args": "", "message_id": None})
+            if event.tool_call_id not in self._tool_order:
+                self._tool_order.append(event.tool_call_id)
+            return []
+        if kind == "TOOL_CALL_ARGS":
+            entry = self._tool_calls.setdefault(event.tool_call_id, {"name": "", "args": "", "message_id": None})
+            entry["args"] += event.delta
+            return []
+        if kind == "TOOL_CALL_END":
+            return []
+        if kind == "TOOL_CALL_RESULT":
+            return self._commit_tool(event)
+        return []
+
+    # ---- 边界提交 ----
+
+    def persist_interrupt(self, pending: list[PendingInterrupt]) -> CommittedRevision:
+        metadata = [
+            {"id": item.bridge_interrupt_id, "toolCallId": item.tool_call_id}
+            for item in pending
+        ]
+        for message_id, buffer in self._assistant_buffers.items():
+            if message_id not in self._persisted_assistant_ids():
+                self._upsert_message(AgentMessage(
+                    id=message_id,
+                    role="assistant",
+                    content=buffer["content"],
+                    partial=False,
+                    pending_interrupt=True,
+                    interrupts=metadata,
+                    tool_calls=self._tool_call_records(),
+                ))
+        self._update_run({"status": "awaiting_approval"})
+        return self._commit_thread("interrupt")
+
+    def persist_terminal(self, status: str, error_code: str | None = None, error_message: str | None = None) -> CommittedRevision:
+        run_update: dict[str, Any] = {"status": status}
+        if error_code is not None:
+            run_update["error_code"] = error_code
+        if error_message is not None:
+            run_update["error_message"] = error_message
+        run_update["ended_at"] = utc_now()
+        run_update["elapsed_ms"] = self._elapsed_ms()
+        run_update["active_elapsed_ms"] = self._elapsed_ms()
+        run_update["usage"] = RunUsage(
+            model_calls=self.model_calls,
+            tool_calls=self.tool_calls,
+            input_tokens=None,
+            output_tokens=None,
+        )
+        self._update_run(run_update)
+        commit = self._commit_thread("terminal")
+        self._refresh_last_run(status)
+        self.closed = True
+        return commit
+
+    def persist_partial_cancel(self) -> CommittedRevision | None:
+        if self.closed:
+            return None
+        self.closed = True
+        for message_id, buffer in self._assistant_buffers.items():
+            if not buffer["content"]:
+                continue
+            self._upsert_message(AgentMessage(
+                id=message_id,
+                role="assistant",
+                content=buffer["content"],
+                partial=True,
+                tool_calls=self._tool_call_records(),
+            ))
+        self._update_run({
+            "status": "cancelled",
+            "ended_at": utc_now(),
+            "elapsed_ms": self._elapsed_ms(),
+            "error_code": "CLIENT_CANCELLED",
+            "error_message": "用户停止或断开连接，运行被取消",
+        })
+        commit = self._commit_thread("partial_cancel")
+        self._refresh_last_run("cancelled")
+        return commit
+
+    # ---- 内部 ----
+
+    def _elapsed_ms(self) -> int:
+        return int((time.monotonic() - self._handle.started_monotonic) * 1000)
+
+    def _persisted_assistant_ids(self) -> set[str]:
+        thread = self._threads.get(self._handle.runtime.thread_id)
+        return {m.id for m in thread.messages if m.role == "assistant"}
+
+    def _tool_call_records(self) -> list[dict]:
+        return [
+            {"id": call_id, "name": self._tool_calls[call_id]["name"], "args": self._tool_calls[call_id]["args"]}
+            for call_id in self._tool_order
+        ]
+
+    def _commit_assistant(self, message_id: str, *, partial: bool) -> list[CommittedRevision]:
+        buffer = self._assistant_buffers.get(message_id) or {"content": "", "tool_calls": []}
+        self._upsert_message(AgentMessage(
+            id=message_id,
+            role="assistant",
+            content=buffer["content"],
+            partial=partial,
+            tool_calls=self._tool_call_records(),
+            created_at=utc_now(),
+        ))
+        return [self._commit_thread("assistant_complete")]
+
+    def _commit_tool(self, event: Any) -> list[CommittedRevision]:
+        content = str(getattr(event, "content", "") or "")[:TOOL_SUMMARY_LIMIT]
+        self._upsert_message(AgentMessage(
+            id=event.message_id,
+            role="tool",
+            content=content,
+            tool_call_id=event.tool_call_id,
+            created_at=utc_now(),
+        ))
+        call = self._tool_calls.get(event.tool_call_id) or {}
+        self.tool_calls += 1
+        self._update_run({"tool_summaries": self._append_tool_summary({
+            "id": event.tool_call_id,
+            "name": call.get("name", ""),
+            "content": content,
+        })})
+        return [self._commit_thread("tool_complete")]
+
+    def _append_tool_summary(self, summary: dict) -> list[dict]:
+        run = self._current_run()
+        summaries = [item for item in run.tool_summaries if item.get("id") != summary["id"]]
+        summaries.append(summary)
+        return summaries[-20:]
+
+    def _current_run(self) -> RunDocument:
+        return self._runs.get(self._handle.product_run_id)
+
+    def _update_run(self, update: dict[str, Any]) -> None:
+        run = self._current_run()
+        self._runs.replace(run.model_copy(update={**update, "updated_at": utc_now()}))
+
+    def _upsert_message(self, message: AgentMessage) -> None:
+        def mutate(doc: ThreadDocument) -> ThreadDocument:
+            messages = [m for m in doc.messages if m.id != message.id]
+            messages.append(message)
+            return doc.model_copy(update={"messages": messages})
+
+        expected = self._handle.thread_revision
+        updated = self._threads.update(self._handle.runtime.thread_id, expected, mutate)
+        self._handle.thread_revision = updated.revision
+
+    def _commit_thread(self, reason: str) -> CommittedRevision:
+        # _upsert_message 已完成消息写入；这里只产生事实对象（updated_at 触碰）
+        def touch(doc: ThreadDocument) -> ThreadDocument:
+            return doc.model_copy(update={"updated_at": utc_now()})
+
+        expected = self._handle.thread_revision
+        updated = self._threads.update(self._handle.runtime.thread_id, expected, touch)
+        self._handle.thread_revision = updated.revision
+        return CommittedRevision(
+            thread_id=self._handle.runtime.thread_id,
+            revision=updated.revision,
+            persisted_at=updated.updated_at,
+            reason=reason,
+        )
+
+    def _refresh_last_run(self, status: str) -> None:
+        run = self._current_run()
+        summary = RunSummary(id=run.id, status=status, updated_at=utc_now(), retry_of=run.retry_of)
+        def mutate(doc: ThreadDocument) -> ThreadDocument:
+            if doc.last_run == summary:
+                return doc
+            return doc.model_copy(update={"last_run": summary})
+        expected = self._handle.thread_revision
+        updated = self._threads.update(self._handle.runtime.thread_id, expected, mutate)
+        self._handle.thread_revision = updated.revision
 
 
 class RunCoordinator:
@@ -283,7 +510,8 @@ class RunCoordinator:
             trigger_message_id=new_message.id,
             history_snapshot=tuple(model_history),
         )
-        # 7) 持久化成功后才安装句柄
+        # 7) 持久化成功后才安装句柄（并挂上语义边界日志）
+        handle.journal = RunJournal(threads=threads, runs=runs, handle=handle)
         self._handles[thread_id] = handle
         return StartAdmission(
             handle=handle,
@@ -449,9 +677,12 @@ class RunCoordinator:
                 return
             handle.phase = phase
             if phase in ("completed", "failed", "cancelled"):
+                if handle.journal is not None and not handle.journal.closed:
+                    await asyncio.to_thread(handle.journal.persist_terminal, phase)
                 handle.runtime.release_graph()
                 self._handles.pop(thread_id, None)
-                await asyncio.to_thread(self._persist_run_terminal, handle, phase)
+                if handle.journal is None:
+                    await asyncio.to_thread(self._persist_run_terminal, handle, phase)
 
     def _persist_run_terminal(self, handle: ActiveRunHandle, phase: str) -> None:
         """终态落盘：run 状态 + 线程 last_run 摘要（同一把线程锁内被调用）。"""
@@ -484,6 +715,46 @@ class RunCoordinator:
 
     def active(self, thread_id: str) -> ActiveRunHandle | None:
         return self._handles.get(thread_id)
+
+    # ---- 1B：语义边界日志（与准入/改名的锁共用） ----
+
+    def thread_lock(self, thread_id: str) -> asyncio.Lock:
+        return self._lock(thread_id)
+
+    async def _journal_write(self, thread_id: str, fn: Callable[["RunJournal"], Any]) -> list:
+        async with self._lock(thread_id):
+            handle = self._handles.get(thread_id)
+            if handle is None or handle.journal is None or handle.journal.closed:
+                return []  # 迟到事件：句柄已取消/关闭，直接丢弃
+            return await asyncio.to_thread(fn, handle.journal)
+
+    async def journal_observe(self, thread_id: str, event: Any) -> list[CommittedRevision]:
+        return await self._journal_write(thread_id, lambda journal: journal.observe(event))
+
+    async def journal_interrupt(self, thread_id: str, pending: list[PendingInterrupt]) -> list[CommittedRevision]:
+        return await self._journal_write(thread_id, lambda journal: [journal.persist_interrupt(pending)])
+
+    async def journal_terminal(
+        self, thread_id: str, status: str, error_code: str | None = None, error_message: str | None = None,
+    ) -> list[CommittedRevision]:
+        return await self._journal_write(
+            thread_id, lambda journal: [journal.persist_terminal(status, error_code, error_message)]
+        )
+
+    async def cancel_run(self, thread_id: str) -> str | None:
+        """幂等的持久化取消：断连 / REST 取消 / CancelledError 共用同一条迁移。"""
+        async with self._lock(thread_id):
+            handle = self._handles.get(thread_id)
+            if handle is None:
+                return None
+            handle.phase = "cancelled"  # 先标记：迟到的 journal 事件被拒
+            journal = handle.journal
+            product_run_id = handle.product_run_id
+            self._handles.pop(thread_id, None)
+            handle.runtime.release_graph()
+            if journal is not None and not journal.closed:
+                await asyncio.to_thread(journal.persist_partial_cancel)
+            return product_run_id
 
     # ---- 1B：线程 CRUD 走与 run 准入相同的每线程锁 ----
 
