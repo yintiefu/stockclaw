@@ -11,6 +11,8 @@ import type { AgentConflict } from "./types";
 type Conflict = AgentConflict;
 
 export type AgentTransportOptions = {
+  /** 当前服务端线程 ID（发送时读取；覆盖 runtime 内部的临时线程 ID）。 */
+  getThreadId?: () => string | null;
   /** 当前权威 revision（发送时读取）。 */
   getRevision?: () => number;
   /** 流内 thread.revision.updated 事件（提交后到达）。 */
@@ -130,8 +132,11 @@ export class AgentHttpAgent extends HttpAgent {
     if (retryOf) {
       nextRuntime.retryOf = retryOf;
     }
+    const serverThreadId = this.transportOptions.getThreadId?.();
     return super.requestInit({
       ...input,
+      // assistant-ui 内部线程 ID 与服务端线程 ID 不同：一律以服务端为准
+      threadId: serverThreadId ?? input.threadId,
       // retry 不携带新消息（messages=[]）；其余形状保持 runtime 生成的历史前缀
       messages: retryOf ? [] : input.messages,
       forwardedProps: {
@@ -158,6 +163,7 @@ export function AgentRuntimeProvider({
   children: ReactNode;
 }) {
   const threadId = controller?.getActiveThreadId() ?? null;
+  const getThreadId = useCallback(() => controller?.getActiveThreadId() ?? null, [controller]);
   const getRevision = useCallback(
     () => (threadId ? controller?.getRevision(threadId) ?? 0 : 0),
     [controller, threadId],
@@ -168,12 +174,13 @@ export function AgentRuntimeProvider({
       onConflict,
       (message) => onError(new Error(message)),
       {
+        getThreadId,
         getRevision,
         onRevision: (id, revision) => controller?.applyRevision(id, revision),
       },
     ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [config, onConflict, onError, getRevision],
+    [config, onConflict, onError, getThreadId, getRevision],
   );
   const historyAdapter = useMemo(() => controller?.historyAdapter(), [controller, threadId]);
   const runtime = useAgUiRuntime({

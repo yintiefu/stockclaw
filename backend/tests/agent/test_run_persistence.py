@@ -712,3 +712,114 @@ async def test_lost_revision_event_converges_via_409_without_duplicate_write(tmp
     assert stale.json()["code"] == "THREAD_REVISION_CONFLICT"
     assert services.threads.get("thread-cv").revision == server_revision
     assert len(services.runs.list_documents()) == 1
+
+
+# ---- Task 8：离线端到端生命周期 ----
+
+
+@pytest.mark.asyncio
+async def test_full_lifecycle_create_partial_retry_restart_next_turn(tmp_path, monkeypatch):
+    """create → start→tool→partial→disconnect → reload → retry → reload → 重启 → 下一轮。"""
+    services = build_services(tmp_path / "agent")
+    monkeypatch.setattr(router_module, "services", services)
+    monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [journal_tool])
+    monkeypatch.setattr("agent.router.build_middleware", lambda: ())
+    hdrs = {"X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"}
+    revisions_seen: list[int] = []
+
+    # 1) 创建线程
+    client = TestClient(app_module.app, client=("127.0.0.1", 50020))
+    created = client.post("/api/agent/threads", json={"title": "生命周期"})
+    assert created.status_code == 201
+    thread_id = created.json()["id"]
+    assert created.json()["revision"] == 0
+
+    def payload(run_id, content, user_id, revision, prefix):
+        return start_payload_json(thread_id=thread_id, run_id=run_id, content=content,
+                                  user_id=user_id, revision=revision, prefix=prefix)
+
+    # 2) start → 工具 → 部分文本 → 断连
+    RECORDED_INPUTS.clear()
+    monkeypatch.setattr(
+        "agent.router.build_chat_model",
+        lambda ref, sec: PausingChatModel([
+            AIMessage(content="", tool_calls=[{"id": "call-life", "name": "journal_tool", "args": {"code": "600519"}}]),
+            AIMessage(content="将被中断的部分回答"),
+        ]),
+    )
+    task, sent, got_delta = await drive_asgi(
+        app_module.app, payload("protocol-life-1", "原始问题", "user-life", 0, []),
+        mode="disconnect",
+    )
+    await asyncio.wait_for(got_delta.wait(), timeout=5)
+    await asyncio.wait_for(task, timeout=10)
+
+    # 3) reload：partial + cancelled
+    thread = services.threads.get(thread_id)
+    partials = [m for m in thread.messages if m.role == "assistant" and m.partial]
+    assert partials and partials[0].content
+    cancelled_run = sorted(services.runs.list_documents(), key=lambda r: r.updated_at)[-1]
+    assert cancelled_run.status == "cancelled"
+    get_resp = client.get(f"/api/agent/threads/{thread_id}")
+    assert get_resp.status_code == 200
+    assert any(m.get("partial") for m in get_resp.json()["messages"])
+
+    # 4) retry：全新 protocol/product ID → 成功终局
+    monkeypatch.setattr(
+        "agent.router.build_chat_model",
+        lambda ref, sec: RecordingModel([AIMessage(content="重试后的完整回答")]),
+    )
+    retry = client.post("/api/agent/run", json=retry_payload(
+        thread_id, "protocol-life-retry", thread.revision, cancelled_run.id,
+    ), headers=hdrs)
+    assert retry.status_code == 200, retry.text
+    for event in parse_sse(retry.text):
+        if event.get("type") == "CUSTOM" and event.get("name") == "thread.revision.updated":
+            revisions_seen.append(json.loads(event["value"])["revision"])
+
+    retry_run = sorted(services.runs.list_documents(), key=lambda r: r.updated_at)[-1]
+    assert retry_run.id != cancelled_run.id and retry_run.retry_of == cancelled_run.id
+
+    # 5) reload：一条原始 user + 完整重试回答
+    thread = services.threads.get(thread_id)
+    assert [m.id for m in thread.messages].count("user-life") == 1
+    completed = [m for m in thread.messages if m.role == "assistant" and not m.partial and not m.pending_interrupt]
+    assert completed and completed[-1].content == "重试后的完整回答"
+
+    # 6) 模拟进程重启：新 services + 对账 → 无活动句柄、历史不变
+    from agent.stores import reconcile_agent_data
+    fresh = build_services(tmp_path / "agent")
+    reconcile_agent_data(fresh.paths, fresh.threads, fresh.runs)
+    assert fresh.coordinator.active(thread_id) is None
+    assert [m.id for m in fresh.threads.get(thread_id).messages] == [m.id for m in thread.messages]
+
+    # 7) 下一轮正常提问：旧 partial 不进入模型输入
+    monkeypatch.setattr(router_module, "services", fresh)
+    RECORDED_INPUTS.clear()
+    monkeypatch.setattr(
+        "agent.router.build_chat_model",
+        lambda ref, sec: RecordingModel([AIMessage(content="下一轮回答")]),
+    )
+    thread = fresh.threads.get(thread_id)
+    def _c(m):
+        return m.content if isinstance(m.content, str) else json.dumps(m.content, ensure_ascii=False)
+    prefix_messages = []
+    for m in thread.messages:
+        entry = {"id": m.id, "role": m.role, "content": _c(m)}
+        if m.role == "tool" and m.tool_call_id:
+            entry["toolCallId"] = m.tool_call_id
+        prefix_messages.append(entry)
+    body = payload("protocol-life-2", "下一轮问题", "user-life-2", thread.revision, [])
+    body["messages"] = [*prefix_messages, {"id": "user-life-2", "role": "user", "content": "下一轮问题"}]
+    next_resp = client.post("/api/agent/run", json=body, headers=hdrs)
+    assert next_resp.status_code == 200, next_resp.text
+    model_ids = [getattr(m, "id", None) for m in RECORDED_INPUTS[-1]]
+    assert all(p.id not in model_ids for p in partials)
+    for event in parse_sse(next_resp.text):
+        if event.get("type") == "CUSTOM" and event.get("name") == "thread.revision.updated":
+            revisions_seen.append(json.loads(event["value"])["revision"])
+
+    # revision 在每个提交边界严格递增，并与 REST 文档一致
+    assert revisions_seen == sorted(revisions_seen) and len(revisions_seen) == len(set(revisions_seen))
+    final_thread = fresh.threads.get(thread_id)
+    assert final_thread.revision == revisions_seen[-1]

@@ -132,3 +132,21 @@ it("intercepts thread.revision.updated CUSTOM events monotonically", async () =>
   await new Promise((r) => setTimeout(r, 10));
   expect(revisions).toEqual([["thread-1", 2], ["thread-1", 1]]);
 });
+
+it("overrides the runtime thread id with the server thread id", async () => {
+  let captured: RequestInit | undefined;
+  vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
+    captured = init;
+    return sseStream();
+  }));
+  const agent = new AgentHttpAgent(CONFIG, vi.fn(), vi.fn(), {
+    getThreadId: () => "th-server-1",
+    getRevision: () => 2,
+  });
+  await new Promise<void>((resolve, reject) => {
+    agent.run({ ...INPUT, threadId: "runtime-internal-id" }).subscribe({ complete: resolve, error: reject });
+  });
+  const body = JSON.parse(String(captured?.body));
+  expect(body.threadId).toBe("th-server-1");
+  expect(body.threadId).not.toBe("runtime-internal-id");
+});

@@ -344,11 +344,13 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
 
     async def event_generator():
         terminal: str = "completed"
+        # 准入阶段（接受用户消息）的 revision 事件：提交已成功；但 @ag-ui/client
+        # 要求流的首个事件必须是 RUN_STARTED，故推迟到其后补发
+        pending_initial = [
+            encoder.encode(thread_revision_updated(thread_id, revision, utc_now()))
+            for revision in initial_revisions
+        ]
         try:
-            # 准入阶段（接受用户消息）的 revision 事件：提交已成功，先行发出
-            for revision in initial_revisions:
-                yield encoder.encode(thread_revision_updated(thread_id, revision, utc_now()))
-
             async for event in adapter.run(adapter_input):
                 if await request.is_disconnected():
                     await services.coordinator.cancel_run(thread_id)
@@ -375,6 +377,9 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                         terminal = "completed"
                     for converted in converted_events:
                         yield encoder.encode(converted)
+                    for frame in pending_initial:
+                        yield frame
+                    pending_initial = []
                     continue
                 for converted in converted_events:
                     safe_event = redact_event(converted, model_key)
@@ -389,6 +394,9 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                         for commit in commits:
                             yield encoder.encode(thread_revision_updated(commit.thread_id, commit.revision, commit.persisted_at))
                     yield _redact_frame(encoder.encode(safe_event), model_key)
+                    for frame in pending_initial:
+                        yield frame
+                    pending_initial = []
         except asyncio.CancelledError:
             # anyio 取消作用域里不能普通 await：独立的持久化任务 + 限时 shield 汇合
             persistence = asyncio.create_task(services.coordinator.cancel_run(thread_id))

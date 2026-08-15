@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Literal, Sequence
@@ -173,8 +174,10 @@ class RunJournal:
             output_tokens=None,
         )
         self._update_run(run_update)
-        commit = self._commit_thread("terminal")
+        # 先刷新 last_run（可能再提交一次 revision），再产生对外可见的终局 revision 事件，
+        # 保证 SSE 的最后一个 revision 与最终 REST 文档一致
         self._refresh_last_run(status)
+        commit = self._commit_thread("terminal")
         self.closed = True
         return commit
 
@@ -406,22 +409,67 @@ class RunCoordinator:
         if getattr(new_message, "role", None) != "user":
             raise MessageConflict("准入的新消息必须是 user 角色")
 
-        # 3) 客户端前缀必须与服务端完整历史逐条一致（id/role/content）；
-        #    服务端尾部的 partial/pending 消息不参与比较（可见但不计入模型历史）
+        # 3) 客户端前缀必须与服务端权威历史一致（id/role/content）。
+        #    允许两种长度：完整历史（partial 不计入），或额外带上服务端尾部的
+        #    partial/pending 消息（客户端水合后会原样回传）。
+        #    顺序不作要求：assistant-ui 水合后会把 assistant 消息排在 tool 结果之前。
         complete_history = thread.model_history()
-        if len(prefix) != len(complete_history):
-            raise MessageConflict(
-                f"客户端历史长度 {len(prefix)} 与服务端 {len(complete_history)} 不一致"
+        # assistant-ui 流式回合后可能把 tool 消息同时挂在 part 与独立消息上，
+        # 导致客户端前缀出现重复条目：先去重，再决定比较基线
+        seen_client_keys: set = set()
+        deduped_prefix = []
+        for client_msg in prefix:
+            key = (
+                getattr(client_msg, "role", None),
+                getattr(client_msg, "id", None)
+                or getattr(client_msg, "tool_call_id", None)
+                or getattr(client_msg, "toolCallId", None),
             )
-        for client_msg, server_msg in zip(prefix, complete_history):
-            if (
-                getattr(client_msg, "id", None) != server_msg.id
-                or getattr(client_msg, "role", None) != server_msg.role
-                or self._content_of(client_msg) != server_msg.content
-            ):
-                raise MessageConflict(
-                    f"客户端历史在消息 {server_msg.id} 处与服务端不一致"
+            if key in seen_client_keys:
+                continue
+            seen_client_keys.add(key)
+            deduped_prefix.append(client_msg)
+        if len(deduped_prefix) == len(thread.messages):
+            baseline = thread.messages
+        elif len(deduped_prefix) == len(complete_history):
+            baseline = complete_history
+        else:
+            raise MessageConflict(
+                f"客户端历史长度 {len(deduped_prefix)} 与服务端 {len(complete_history)} 不一致"
+            )
+        remaining = {msg.id: msg for msg in baseline}
+        for client_msg in deduped_prefix:
+            client_role = getattr(client_msg, "role", None)
+            client_id = getattr(client_msg, "id", None)
+            if client_role == "tool":
+                # assistant-ui 会把 tool 消息的 ID 换成 tool_call ID：按 call 引用匹配
+                call_ref = (
+                    getattr(client_msg, "tool_call_id", None)
+                    or getattr(client_msg, "toolCallId", None)
+                    or client_id
                 )
+                server_msg = next(
+                    (m for m in remaining.values()
+                     if m.role == "tool" and (m.tool_call_id == call_ref or m.id == client_id)),
+                    None,
+                )
+                if server_msg is not None and not self._tool_content_matches(client_msg, server_msg):
+                    raise MessageConflict(
+                        f"客户端历史在消息 {server_msg.id} 处与服务端不一致"
+                    )
+            else:
+                server_msg = remaining.get(client_id)
+                if server_msg is None or server_msg.role != client_role:
+                    raise MessageConflict("客户端历史消息 ID 集合与服务端不一致")
+                if self._content_of(client_msg) != server_msg.content:
+                    raise MessageConflict(
+                        f"客户端历史在消息 {server_msg.id} 处与服务端不一致"
+                    )
+            if server_msg is None:
+                raise MessageConflict("客户端历史消息 ID 集合与服务端不一致")
+            del remaining[server_msg.id]
+        if remaining:
+            raise MessageConflict("客户端历史消息 ID 集合与服务端不一致")
 
         # 消息 ID 重复：同 ID 不同内容 → 冲突；同 ID 同内容 → 按所属 run 判重复
         for server_msg in thread.messages:
@@ -519,6 +567,20 @@ class RunCoordinator:
             input=runtime.run_input(protocol_run_id=protocol_run_id, messages=model_history),
             revisions=[updated_thread.revision],
         )
+
+    @staticmethod
+    def _tool_content_matches(client_msg: Any, server_msg: AgentMessage) -> bool:
+        client_content = RunCoordinator._content_of(client_msg)
+        server_content = server_msg.content
+        if client_content == server_content:
+            return True
+        # 客户端可能把结果解析成对象；服务端是（截断后的）JSON 字符串
+        if isinstance(server_content, str):
+            try:
+                return json.loads(server_content) == client_content
+            except (json.JSONDecodeError, TypeError):
+                return str(client_content) == server_content
+        return str(client_content) == str(server_content)
 
     async def acquire_start(
         self,

@@ -23,6 +23,8 @@ export function Agent() {
     () => loadAgentModelConfig() ?? { provider: "", baseURL: "", model: "", apiKey: "" },
   );
   const [conflict, setConflict] = useState<string | null>(null);
+  // 409 权威重载后递增，强制 runtime 重建并从服务端重新水合消息
+  const [sessionEpoch, setSessionEpoch] = useState(0);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const [statusNote, setStatusNote] = useState<string | null>(null);
 
@@ -82,6 +84,7 @@ export function Agent() {
         // 重载失败保持提示可见
       }
       await syncFromController();
+      setSessionEpoch((epoch) => epoch + 1);
     }
   }, [controller, syncFromController]);
   const onError = useCallback((error: Error) => {
@@ -234,7 +237,7 @@ export function Agent() {
         />
         {complete && !loadingThread && activeThread ? (
           <AgentRuntimeProvider
-            key={activeThread.id}
+            key={`${activeThread.id}-${sessionEpoch}`}
             config={saved ?? draft}
             onConflict={onConflict}
             onError={onError}
