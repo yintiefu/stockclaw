@@ -2,7 +2,7 @@
 
 **日期：** 2026-08-15
 
-**状态：** 已根据第三轮评审修订，待书面复审
+**状态：** 已根据第四轮评审修订，待书面复审
 
 ## 1. 目标
 
@@ -26,7 +26,7 @@
 - `backend/chat.py` 中的自研 OpenAI-compatible function-calling loop。
 - `backend/tools.py` 中 24 个可复用的客观投研数据工具。
 - AI 复盘、页面问 AI、多空辩论和反思审计。
-- `backend/portfolio.py` 与 `backend/myreports.py` 已验证的用户目录原子写入模式。
+- `backend/portfolio.py` 与 `backend/myreports.py` 已有的临时文件加 `os.replace` 原子改名模式；文件与目录 `fsync` 是本期新增加固要求。
 - 浏览器本地保存的旧 LLM 配置和旧聊天记录。
 
 新 Agent 子系统只做增量接入。第一期不修改现有 AI 入口的行为。
@@ -146,12 +146,14 @@
 
 因此第一期不得直接注册 `add_langgraph_fastapi_endpoint`。`router.py` 使用自定义 FastAPI route，并通过 `AgentProtocolBridge` 完成以下转换：
 
-1. 收集后端 `CUSTOM/on_interrupt`，校验为项目定义的工具审批结构，不把旧 CUSTOM 事件继续发送到前端。
+1. 收集后端 `CUSTOM/on_interrupt`，校验为项目定义的工具审批结构，不把旧 CUSTOM 事件继续发送到前端。锁定适配器序列化后的事件没有可依赖的结构化 LangGraph interrupt ID，因此首次观察每个 interrupt 时由 bridge 生成稳定 UUID，作为前端可见的 `bridge_interrupt_id`。
 2. 把终止事件转换为带标准 `interrupt` outcome 的 `RUN_FINISHED`。
-3. 对纯 resume，把前端标准 `ResumeEntry[]` 按 interrupt ID 完整校验后，转换为 LangChain human-in-the-loop middleware 的 decision payload，再交给适配器的 `command.resume`；对 steer-away，识别全量 cancelled entries 后交给 `RunCoordinator` 结束旧 run，不把 cancellation 当作 middleware decision。
-4. malformed、缺失、重复或未知 interrupt ID 必须产生协议错误，不能按默认允许处理。
+3. 对纯 resume，把前端标准 `ResumeEntry[]` 按 `bridge_interrupt_id` 完整校验后，转换为 LangChain human-in-the-loop middleware 的 decision payload，再交给适配器的 `command.resume`；对 steer-away，识别全量 cancelled entries 后交给 `RunCoordinator` 结束旧 run，不把 cancellation 当作 middleware decision。
+4. malformed、缺失、重复或未知 `bridge_interrupt_id` 必须产生协议错误，不能按默认允许处理。
 
-桥接层必须保持 pending interrupt 的原始顺序来生成列表式 resume value；若锁定版本支持且合同测试通过，也可以使用 interrupt ID 到 value 的映射。两种方式都必须先完成全量 ID 校验并失败关闭。每个 HTTP 请求创建新的 `LangGraphAgent` 包装当前请求的 Graph，不能复用共享实例，也不能依赖库的 `clone()` 隔离 Graph，因为锁定版本的 clone 仍共享底层 Graph。
+`ActiveRunHandle` 保存 `bridge_interrupt_id -> 原始顺序、tool_call_id、审批结构` 的不可变映射，thread interrupt metadata 保存同一个 bridge ID 供页面刷新后恢复展示。相同 pending interrupt 被再次读取时必须复用原 ID。bridge 先针对该映射完成全量 ID 与 tool call 校验，再严格按原始顺序生成 `{"decisions": [...]}` 列表交给 LangGraph；不得把 bridge ID 当作 LangGraph 内部 ID，也不得使用 ID-map resume 路径。
+
+锁定版本使用 `HumanInTheLoopMiddleware(interrupt_on=...)`；项目对外审批 payload 的 `decision` 字段由 bridge 转换为中间件 decision 列表中的 `type` 字段。每个 HTTP 请求创建新的 `LangGraphAgent` 包装当前请求的 Graph，不能复用共享实例，也不能依赖库的 `clone()` 隔离 Graph，因为锁定版本的 clone 仍共享底层 Graph。
 
 该桥接是版本隔离层，不包含投研业务规则。1A 必须先完成离线协议 Spike；如果上述转换、请求级实例隔离或跨同构 Graph 恢复不能在锁定版本下通过合同测试，则停止后续里程碑并重新选择兼容版本，不能绕过审批降级上线。
 
@@ -192,6 +194,8 @@
 
 `runtime.tsx` 不包含投研业务规则。`ApprovalBridge` 是前端唯一允许调用版本敏感的 `useAgUiInterrupts`、`useAgUiSubmitInterruptResponses` 和 `useAgUiSteerAway` API 的模块，其他组件只消费项目自己的审批状态与 action。
 
+产品 run 为 `running` 时 Composer 禁用，只保留 Stop；确认旧 run 已持久化为终态并重新加载最新 revision 后才重新启用。`awaiting_approval` 时 Composer 可用，用于触发已经定义的全量 cancelled steer-away。第一期不支持在普通流式生成过程中用一条新消息同时取消并改向。
+
 ### 7.3 AG-UI 事件
 
 通用交互只使用标准事件：
@@ -210,7 +214,9 @@
 - `mcp.health_changed`
 - `thread.revision.updated`
 
-`thread.revision.updated` 只在 thread JSON 原子提交成功后由 `AgentProtocolBridge` 发出，payload 固定为 `thread_id`、`revision` 和 `persisted_at`。Runtime 截获它并更新本地 revision，不渲染到聊天正文，也不把 revision 写入 LangGraph state 或 checkpoint。若事件因断连丢失，下一次提交会收到 `409 THREAD_REVISION_CONFLICT`，前端再通过 REST 重载权威历史。
+`thread.revision.updated` 只在 thread JSON 原子提交成功后由 `AgentProtocolBridge` 发出，payload 固定为 `thread_id`、`revision` 和 `persisted_at`。Runtime 按 `thread_id` 截获并更新对应 thread 的本地 revision，不渲染到聊天正文，也不把 revision 写入 LangGraph state 或 checkpoint。来自 AG-UI 事件和 REST PATCH response 的 revision 都只在大于该 thread 本地值时应用，避免跨通道乱序使 revision 倒退。终态 revision 事件必须先于对应 `RUN_FINISHED` 发出。若事件因断连丢失，下一次提交会收到 `409 THREAD_REVISION_CONFLICT`，前端再通过 REST 重载权威历史。
+
+第一期生成的标准 interrupt outcome 不设置 `expiresAt`，后端 pending interrupt 也不实现基于时间的过期；它只在提交有效 resume、steer-away、run 取消或进程结束时失效。
 
 其余自定义事件通过注册的数据组件渲染。未知事件不得把原始 JSON 直接展示在聊天正文中。
 
@@ -257,25 +263,29 @@ provider、Base URL 和 model 通过 AG-UI `forwardedProps.runtime.model` 提供
 
 Graph 进入 interrupt 后，handle 必须释放 Graph 和模型对象，仅保留 MemorySaver、工具/Skill/Policy 的不可变无密钥快照及 pending interrupt。resume 使用新请求提供的密钥和原 MemorySaver 重建同构 Graph；该行为必须由 1A 合同测试验证。若锁定版本无法跨同构 Graph 实例恢复同一个 MemorySaver checkpoint，则协议 Spike 失败，不能通过在 awaiting approval 期间长期保留 API Key 来绕过。
 
-一个产品 run 可以对应多个 AG-UI protocol run ID：首个请求、每次审批 resume 都有新的 protocol run ID，但继续更新同一个 run JSON。run 文档保存 `protocol_run_ids`；retry 则创建新的产品 run ID。
+一个产品 run 可以对应多个 AG-UI protocol run ID：首个请求、每次审批 resume 都有新的 protocol run ID，但继续更新同一个 run JSON。run 文档保存 `protocol_run_ids`；retry 创建新的产品 run ID，并通过 `retry_of` 指向目标 run。
 
 同一个 thread 同时只允许一个 `ActiveRunHandle`。`RunCoordinator` 必须以原子方式完成检查与占用：
 
 - 普通新消息遇到 `running` 或 `awaiting_approval` 返回 `409 THREAD_BUSY`。
 - 携带完整 `resume[]` 且匹配该 handle 全部 pending interrupt 的请求，可以穿过 busy 守卫并恢复同一产品 run。
-- `useAgUiSteerAway` 产生的“全部 pending interrupt 为 cancelled，加恰好一条新 user message”请求可以穿过 busy 守卫。coordinator 在 thread 锁内校验全部 interrupt ID，先把旧产品 run 持久化为 `cancelled` 并关闭旧 handle，再为新消息创建新产品 run；pending MCP 工具不得执行。这个单次 HTTP 请求随后流式执行新 run，传入的 protocol run ID 只归属新产品 run。这里保证进程内无并发穿插，但不虚构跨两个 JSON 文件的事务；若新 run 写入失败，旧 run 保持 cancelled，返回持久化错误并要求前端重载。
+- `useAgUiSteerAway` 产生的“全部 pending interrupt 为 cancelled，加恰好一条新 user message”请求可以穿过 busy 守卫。coordinator 在 thread 锁内校验全部 `bridge_interrupt_id`，先把旧产品 run 持久化为 `cancelled` 并关闭旧 handle，再为新消息创建新产品 run；pending MCP 工具不得执行。这个单次 HTTP 请求随后流式执行新 run，传入的 protocol run ID 只归属新产品 run。这里保证进程内无并发穿插，但不虚构跨两个 JSON 文件的事务；若新 run 写入失败，旧 run 保持 cancelled，返回持久化错误并要求前端重载。
+- retry 只有在 thread 没有活跃 handle 时才能开始；遇到 `running` 或 `awaiting_approval` 返回 `409 THREAD_BUSY`。
 - `completed`、`failed`、`cancelled` 或 `interrupted` 后立即 `close()` 并从 coordinator 释放 handle。
 - 后端关闭时依次取消并关闭全部 handle；后端重启后不重建 MemorySaver，而是把遗留状态改为 `interrupted`。
 
-`/api/agent/run` 只接受三种请求形状：
+`/api/agent/run` 只接受四种请求形状：
 
 1. start：不含 `resume[]`，相对服务端 head 恰好有一条新 user message。
 2. resume：包含当前全部 pending interrupt 的 decision，不含新 user message。
 3. steer-away：当前全部 pending interrupt 都是 cancelled，且相对服务端 head 恰好有一条新 user message。
+4. retry：`forwardedProps.runtime.retryOf` 包含目标产品 run ID，不含 `resume[]`，也不含新 user message。
 
 其他混合形状一律作为协议错误失败关闭。steer-away 保留旧 pending assistant/tool-call turn 供 UI 显示，但该 turn 和 partial message 都不进入新 run 的模型输入。
 
-客户端提交的 messages 只用于 revision、head、message ID 和请求形状校验。`AgentProtocolBridge` 必须以服务端 thread JSON 重建交给适配器的 `RunAgentInput.messages`，不能把客户端历史直接合并进 Graph：start 使用最后完整历史和本次已接受的 user message；纯 resume 只从 MemorySaver checkpoint 恢复，不合并客户端历史；steer-away 使用最后完整历史和新的 user message。这样可以避免 `ag-ui-langgraph` 因客户端与 checkpoint 消息数不同而进入 time-travel/regenerate 启发式路径。
+retry 目标必须属于同一 thread，是该 thread 最近一次产品 run，状态为 `failed`、`cancelled` 或 `interrupted`，并且目标之后没有新增完整消息；否则返回 `409 RETRY_NOT_ALLOWED`。retry 不重复追加触发目标 run 的 user message，而是从目标 run 已持久化的最后完整、非 partial、非 pending-interrupt 历史继续，创建带 `retry_of` 的新产品 run。它使用请求中的当前 `ModelRef`、thread 当前选择的 Skills 和当前 policy 快照，因此是显式重新执行，不是目标 run 的逐字回放。模型密钥、HTTPS、revision、head、duplicate 和 busy 校验与 start 完全相同。
+
+客户端提交的 messages 只用于 revision、head、message ID 和请求形状校验。`AgentProtocolBridge` 必须以服务端 thread JSON 重建交给适配器的 `RunAgentInput.messages`，不能把客户端历史直接合并进 Graph：start 使用最后完整历史和本次已接受的 user message；纯 resume 将协议必填的 `messages` 明确设为空数组，只通过 `forwarded_props.command.resume` 和 MemorySaver checkpoint 恢复；steer-away 使用最后完整历史和新的 user message；retry 使用上述目标 run 对应的最后完整历史。锁定适配器在检测到非空 resume command 后会先于 regenerate heuristic 进入 `Command(resume=...)`，因此 resume 不需要也不应回填 checkpoint 历史。该行为必须由 1A 合同测试锁定。
 
 下一轮普通对话从服务端保存的完整、非 partial、非 pending-interrupt 历史创建新 Graph，不依赖上一轮 MemorySaver。这是第一期 JSON 历史与后续持久化 LangGraph checkpoint 之间的明确边界。
 
@@ -361,7 +371,7 @@ partial assistant 消息可以恢复显示，但不能进入下一轮模型历�
 
 1. 要求 revision 与当前 thread 相等，否则在模型调用前返回 `409 THREAD_REVISION_CONFLICT` 并让前端重新加载。
 2. 按 message ID 验证客户端历史与服务端 head 一致。
-3. 按 start、resume、steer-away 三种合法形状校验；start 只接受服务端 head 之后恰好一条新 user message，resume 不得带新消息，steer-away 必须同时带全部 cancelled resume entries 和恰好一条新 user message。
+3. 按 start、resume、steer-away、retry 四种合法形状校验；start 只接受服务端 head 之后恰好一条新 user message，resume 不得带新消息，steer-away 必须同时带全部 cancelled resume entries 和恰好一条新 user message，retry 必须带合法 `retryOf` 且不得带新消息或 resume。
 4. 不得把客户端请求中的完整历史再次 append，也不得把它作为 Graph 的权威输入。
 5. 在接受用户消息、完成工具、完成 assistant 消息和写入 run 终态时递增 revision；JSON 原子提交成功后，通过 `thread.revision.updated` 通知前端。
 
@@ -372,7 +382,7 @@ partial assistant 消息可以恢复显示，但不能进入下一轮模型历�
 - 两种情况都不能创建第二个 handle、追加消息或再次写入 run；前端统一通过 REST 重载服务端权威历史。
 - protocol run ID 和 message ID 指向不同产品 run，或已有 message ID 的内容不同，返回 `409 MESSAGE_CONFLICT`。
 
-网络断开已经把原 run 标记为 `cancelled` 时，同 ID 重放属于 terminal duplicate；用户必须通过 `/retry` 显式创建新产品 run。会话重命名、Skill 选择和其他 PATCH 请求也必须携带 revision。活跃 run 期间允许重命名，但删除 thread 返回 `409 THREAD_BUSY`。前端对所有 thread 409 采用同一简单策略：重载权威历史和 revision，再由用户决定重试。
+网络断开已经把原 run 标记为 `cancelled` 时，同 ID 重放属于 terminal duplicate；用户必须通过 `/api/agent/run` 的 retry 形状显式创建新产品 run。会话重命名、Skill 选择和其他 PATCH 请求也必须携带 revision。活跃 run 期间允许重命名，但删除 thread 返回 `409 THREAD_BUSY`。前端对所有 thread 409 采用同一简单策略：重载权威历史和 revision，再由用户决定重试。
 
 ### 9.3 Run 文档
 
@@ -382,8 +392,9 @@ partial assistant 消息可以恢复显示，但不能进入下一轮模型历�
 - `id`
 - `thread_id`
 - `protocol_run_ids`
+- 可选 `retry_of`
 - `status`：`running`、`awaiting_approval`、`completed`、`failed`、`cancelled`、`interrupted`
-- 开始、结束和耗时
+- 开始、结束、墙钟耗时、累计 active execution 耗时和审批等待耗时
 - 不可变的预算快照
 - 模型调用和工具调用次数
 - Provider 返回时的 token usage
@@ -472,7 +483,7 @@ stdio MCP 是受信任的本地程序，不是沙箱。`shell=False` 只避免 s
 
 “Skill scripts 不执行”只约束 Skill 子系统。用户仍可显式配置一个 stdio MCP executable；UI 必须把这两种能力清楚区分。第一期不提供 MCP 进程沙箱或 executable allowlist。
 
-Streamable HTTP URL 应用与模型 Base URL 相同的元数据地址和 public mode SSRF 规则。
+Streamable HTTP URL 应用与模型 Base URL 相同的元数据地址和 public mode SSRF 规则。现有 public mode 由设置 `VR_API_KEY` 触发，会拒绝解析到 loopback 或私网的 URL；因此该模式下不能连接 localhost Streamable HTTP MCP，只能使用 stdio 或可公开访问的 HTTPS MCP。第一期不为 MCP 增加绕过该规则的例外。
 
 ### 11.3 工具注册
 
@@ -511,7 +522,7 @@ session allowance 只在内存中存在，后端停止后失效。第一期不�
 }
 ```
 
-`thread_session` 只允许与 `approve` 组合。后端按 interrupt ID 和 tool call ID 验证 payload，再转换为 LangChain middleware decision。选择 session allowance 后，`RunCoordinator` 在 handle 之外记录 `(thread_id, server_id, tool_name)`，同一后端进程和 thread 的后续匹配调用由 Policy Middleware 自动允许，不再产生 interrupt。allowance 在 thread 删除、用户显式清除该 thread 的临时授权或后端停止时失效，不能写入 JSON。任何缺项、额外 pending interrupt 或无法识别的 decision 都失败关闭。
+`thread_session` 只允许与 `approve` 组合。后端按 `bridge_interrupt_id` 和 tool call ID 验证 payload，再转换为 LangChain middleware decision。选择 session allowance 后，`RunCoordinator` 在 handle 之外记录 `(thread_id, server_id, tool_name)`，同一后端进程和 thread 的后续匹配调用由 Policy Middleware 自动允许，不再产生 interrupt。allowance 在 thread 删除、用户显式清除该 thread 的临时授权或后端停止时失效，不能写入 JSON。任何缺项、额外 pending interrupt 或无法识别的 decision 都失败关闭。
 
 `useAgUiSteerAway` 产生的 transport-level cancelled response 不属于上述审批 payload。只有所有 pending interrupt 都各有一个 cancelled entry 且请求同时包含恰好一条新 user message 时，桥接层才接受该形状并交给 coordinator；它不得被转换为 approve/reject，也不得执行任何 pending MCP 工具。部分取消、取消中夹带审批 decision 或取消但没有新消息都失败关闭并保留原 `awaiting_approval`。
 
@@ -560,13 +571,13 @@ Artifact 不可原地覆盖。修订生成新 ID并指向 parent。
 - 每个 run 最多 8 次模型调用。
 - 每个 run 最多 16 次工具调用。
 - 单工具最多 30 秒。
-- 整次 run 最多 5 分钟。
-- 单个工具结果进入后续链路前最多 6,000 字符。
+- 整次 run 最多累计 5 分钟 active execution；`awaiting_approval` 的人工等待不计入。
+- 除 `load_skill` 和 `read_skill_resource` 外，单个工具结果进入后续链路前最多 6,000 字符；Skill 工具使用 10.2 的独立 60,000 字符上限。
 - Provider 格式化前的 prompt context 最多 120,000 字符。
 
 限制保存在 `policy.json`，UI 只能在校验范围内修改。
 
-所有计数按产品 run 累计，不能在审批 resume 时重置。`ActiveRunHandle` 保存项目侧累计 transition 数，并在 resume 时向新 Graph 传递剩余额度；1A 必须验证锁定版本的 transition 计数边界、`recursion_limit` 语义和跨同构 Graph resume 行为。如果无法证明可靠执行，就从第一期产品 policy 和 UI 中移除 transition 限制，只保留可由项目 middleware 硬性执行的 8 次模型调用与 16 次工具调用，不能把未验证的 `recursion_limit` 宣称为跨 resume 硬限制。一次并行返回的多个 tool call 按实际 call 数分别计数；第一期执行器仍逐个串行调用。预算快照在产品 run 创建时固定，运行中修改 `policy.json` 只影响下一 run。
+所有计数和 active execution 耗时按产品 run 累计，不能在审批 resume 时重置。active execution 从请求通过校验并占用 thread 后开始，在进入 `awaiting_approval` 时暂停，在合法 resume 重新取得 handle 后继续；模型等待、工具等待和 worker capacity 等待均计入，人工审批等待不计入。`ActiveRunHandle` 保存项目侧累计 transition 数和 active execution 耗时，并在 resume 时向新 Graph 传递剩余额度；1A 必须验证锁定版本的 transition 计数边界、`recursion_limit` 语义和跨同构 Graph resume 行为。如果无法证明可靠执行，就从第一期产品 policy 和 UI 中移除 transition 限制，只保留可由项目 middleware 硬性执行的 8 次模型调用与 16 次工具调用，不能把未验证的 `recursion_limit` 宣称为跨 resume 硬限制。一次并行返回的多个 tool call 按实际 call 数分别计数；第一期执行器仍逐个串行调用。预算快照在产品 run 创建时固定，运行中修改 `policy.json` 只影响下一 run。
 
 已启用的 transition 限制、模型、工具和整次 run 的限制是逻辑硬限制：到达限制后不得再发起新的模型或工具调用，并产生明确终态。当前 `backend/tools.py` 是同步阻塞实现，所有同步工具共用一个全局有界 worker pool，默认 `max_workers=4`；同一 run 的服务端工具仍串行执行。每次获取 worker 最多等待 1 秒，容量用尽时产生 `TOOL_CAPACITY_EXHAUSTED` 终态，不进入无界队列。
 
@@ -594,28 +605,30 @@ Provider 返回 token usage 时才记录；未返回就标记 unavailable。费�
 5. 后端从 thread JSON 的最后完整历史重建 `RunAgentInput.messages`，不把客户端历史传给 Graph。
 6. `AgentFactory` 解析 Agent、工具、Skill 和 Policy。
 7. 标准 AG-UI 事件流式返回前端。
-8. 在用户消息、工具完成、assistant 消息完成和 run 终态时持久化；不逐 token 写盘。每次原子提交成功后发出 `thread.revision.updated`。
+8. 在用户消息、工具完成、assistant 消息完成和 run 终态时持久化；不逐 token 写盘。每次原子提交成功后发出 `thread.revision.updated`，终态 revision 事件先于 `RUN_FINISHED`。
 9. 终态更新 thread 摘要与 run 文件。
 
 ### 14.2 MCP 审批
 
 1. 模型请求 MCP 工具。
 2. human-in-the-loop middleware 在执行前 interrupt。
-3. `ag-ui-langgraph` 发出 legacy `CUSTOM/on_interrupt`；`AgentProtocolBridge` 把它转换为带标准 interrupt outcome 的 `RUN_FINISHED`。
+3. `ag-ui-langgraph` 发出 legacy `CUSTOM/on_interrupt`；`AgentProtocolBridge` 生成或复用 `bridge_interrupt_id`，记录有序映射，持久化 interrupt metadata 和 assistant message，再先发送最新 `thread.revision.updated`，最后发送带标准 interrupt outcome 的 `RUN_FINISHED`。
 4. `ApprovalBridge` 展示请求并获取选择。
 5. 前端提交覆盖全部 pending interrupt 的标准 `ResumeEntry[]`，并重新提供模型 API Key。
-6. `AgentProtocolBridge` 校验和转换 resume，`RunCoordinator` 找到同一 `ActiveRunHandle`；请求中的 messages 不并入 Graph，新建 request-scoped `LangGraphAgent` 并通过原 MemorySaver 恢复同一产品 run。
+6. `AgentProtocolBridge` 校验和转换 resume，`RunCoordinator` 找到同一 `ActiveRunHandle`；bridge 把适配器输入的 `messages` 设为 `[]`，新建 request-scoped `LangGraphAgent` 并通过原 MemorySaver 恢复同一产品 run。
 
 服务端把 interrupt metadata 与 assistant message 一并写入权威 thread JSON，前端 history adapter 通过 REST 重新加载。页面刷新后，如果后端进程中的 `ActiveRunHandle` 和 MemorySaver 仍在，可以恢复审批 UI；只有 JSON 而没有 handle 时只能显示已中断状态，不能提交原审批。
 
 ### 14.3 取消与恢复
 
 - 用户停止会中止 HTTP 流和后续 Agent 步骤，并把 run 标记为 `cancelled`；已进入同步第三方库的工具可能继续到自身超时，但迟到结果必须丢弃。
-- 网络断开走相同取消路径；客户端不得用原 ID 重新附着，必须重载历史并显式调用 `/retry`。
+- 网络断开走相同取消路径；客户端不得用原 ID 重新附着，必须重载历史并通过 `/api/agent/run` 的 retry 形状显式重新执行。
 - 已完成工具和 partial assistant 内容继续可见，但 partial 内容不能进入下一次模型输入。
 - 用户在审批中输入新消息时，`useAgUiSteerAway` 在同一请求中发送全部 cancelled `resume[]` 和一条新 user message。后端在 thread 锁内结束旧 run、关闭 handle、禁止 pending MCP 调用，再以最后完整历史和新消息创建新 run；旧 pending assistant/tool-call turn 只供 UI 展示。
+- 普通 `running` 状态下 Composer 禁用；用户必须先 Stop，等待取消持久化与 revision 重载完成，再发送新消息。
 - 后端重启把遗留活跃 run 改为 `interrupted`。
-- 重试从最后完整模型历史创建新 run。
+- Retry action 生成新的 protocol run ID，在 `forwardedProps.runtime.retryOf` 中传入最近的目标产品 run ID，并携带当前 revision、模型配置和模型密钥；同一个 `/api/agent/run` response 直接承载新产品 run 的 AG-UI 事件流，不存在第二次附着。
+- retry 从目标 run 对应的最后完整模型历史创建新产品 run，不重复用户消息，不恢复原 MemorySaver。
 
 第一期不承诺重启后的原 interrupt 恢复。
 
@@ -626,6 +639,7 @@ Provider 返回 token usage 时才记录；未返回就标记 unavailable。费�
 | 模型/MCP/Skill 配置错误 | run 前 REST 4xx，或显示为不可启用项并给出修复信息 |
 | thread revision 或消息 head 冲突 | run 前返回 409，前端重新加载服务端权威历史 |
 | 活跃或终态 run 的重复 POST | 分别返回 `409 DUPLICATE_RUN_ACTIVE` 或 `409 DUPLICATE_RUN_TERMINAL` 和当前状态；不重放 SSE、不创建 handle，前端重载历史 |
+| retry 目标无效、不是最近 run 或 history 已前进 | 返回 `409 RETRY_NOT_ALLOWED`，不创建产品 run，前端重载历史 |
 | resume 模型配置变化 | 缺少密钥时在 Graph 构建前拒绝；`ModelRef` 变化返回 `409 RUN_CONFIG_MISMATCH` |
 | 非 loopback HTTP 携带模型密钥 | 在 Graph 构建前拒绝；只按受信代理配置接受 forwarded scheme |
 | 模型端点失败 | AG-UI `RUN_ERROR`，run 记录脱敏错误，不泄露 API Key |
@@ -654,7 +668,6 @@ DELETE /api/agent/threads/{thread_id}/allowances
 
 GET    /api/agent/runs/{run_id}
 POST   /api/agent/runs/{run_id}/cancel
-POST   /api/agent/runs/{run_id}/retry
 
 GET    /api/agent/skills
 GET    /api/agent/skills/{skill_name}
@@ -683,22 +696,23 @@ DELETE /api/agent/artifacts/{artifact_id}
 
 Skill 详情响应包含 frontmatter、校验状态，以及 `references`、`assets`、`scripts` 的受控 manifest。所有 `{skill_name}` 必须解析到当前 `SkillRegistry` 已扫描条目，不能直接作为目录名使用。文件接口只允许读取 `references/` 和 `assets/`：references 以受限 UTF-8 文本返回；assets 只允许安全图片、PDF 和纯文本 MIME，并设置 `Content-Disposition`、`X-Content-Type-Options: nosniff` 和限制性 CSP。请求未知或 NFC 冲突的 Skill、编码遍历、`scripts/`、HTML、符号链接或逃逸后的路径一律返回 400 或 403。
 
-所有 thread PATCH 请求体包含当前 `revision`；成功响应返回递增后的 revision。删除活跃 thread 返回 409。清除 allowances 只删除进程内该 thread 的临时 MCP 授权，不修改 thread revision。AG-UI `/run` 的模型 API Key 只从 `X-VR-Agent-Model-Key` 读取，不属于任何 REST response schema。前端为 `/run` 提供自定义 fetch/error adapter，识别所有结构化 409 后统一触发 REST history reload；第一期不尝试自动续接原事件流。
+所有 thread PATCH 请求体包含当前 `revision`；成功响应返回递增后的 revision。删除活跃 thread 返回 409。清除 allowances 只删除进程内该 thread 的临时 MCP 授权，不修改 thread revision。AG-UI `/run` 的 start、resume、steer-away 和 retry 都只从 `X-VR-Agent-Model-Key` 读取模型密钥，不属于任何 REST response schema。前端为 `/run` 提供自定义 fetch/error adapter，识别所有结构化 409 后统一触发 REST history reload；第一期不尝试自动续接原事件流。
 
 ## 17. 测试策略
 
 ### 17.1 后端单元测试
 
 - 每个现有工具 Schema 都被正确转换一次。
-- 工具裁剪和失败转换。
+- 普通工具 6,000 字符裁剪、Skill 工具独立 60,000 字符上限和失败转换。
 - thread/run 原子写入、损坏文件保留，以及启动时只清理固定命名的孤儿 `.tmp`。
 - revision 冲突、active/terminal duplicate 的结构化 409、message ID 内容冲突和活跃 thread 删除保护；重复请求不能产生第二个 handle 或重复落盘。
 - Skill frontmatter、zip、路径逃逸、symlink、大小和脚本拒绝；覆盖编码后的 `..`、未知 `skill_name`、NFC 碰撞，以及 Agent 与 REST 两条路径都不能读取 `scripts/`。
 - MCP 命名冲突、`server_id` 字符集、env 引用、生命周期和结果脱敏。
+- public mode 拒绝 localhost/private Streamable HTTP MCP，未设置 `VR_API_KEY` 的本地模式仍可连接 localhost。
 - stdio executable/args 指纹变化立即使确认失效；未确认的启用或连接测试不得拉起进程，创建配置不得拉起进程。
 - allowance 在线程删除、显式清除和进程重启后消失；清除 allowance 不递增 thread revision。
 - Artifact 类型、不可变、大小和安全渲染元数据。
-- 预算计数、超时、上下文裁剪、worker capacity 拒绝和终态。
+- 预算计数、active execution 超时、审批等待暂停计时、上下文裁剪、worker capacity 拒绝和终态。
 
 ### 17.2 协议合同测试
 
@@ -710,17 +724,21 @@ Skill 详情响应包含 frontmatter、校验状态，以及 `references`、`ass
 - `RUN_ERROR` 和 cancel 终态。
 - interrupt approve、deny、session allowance、reload、resume。
 - 锁定版本的 legacy `CUSTOM/on_interrupt` 到标准 outcome、标准 `resume[]` 到 middleware decision 的双向转换。
-- 缺失、重复、未知 interrupt ID 失败关闭，且不会执行目标 MCP 工具。
+- bridge 为 legacy interrupt 生成稳定 ID，并在刷新/重复读取时复用；bridge ID 与 LangGraph 内部 ID 不一致时，仍能通过 handle 映射按原始顺序恢复。
+- 缺失、重复、未知 bridge interrupt ID 失败关闭，且不会执行目标 MCP 工具。
 - steer-away 的“全部 pending interrupt cancelled + 一条新 user message”单请求：旧 run 为 `cancelled`、旧 handle 关闭、pending MCP 工具不执行、新 run 建立且 thread head 正确。
-- start、resume、steer-away 之外的混合请求形状全部失败关闭。
-- 运行中和终态后的重复 POST 分别返回定义好的 409，不创建第二个 handle、不重复持久化；断连取消后的同 ID 重放返回 terminal duplicate，显式 `/retry` 可以从持久化历史建立新 run。
-- 服务端重建 `RunAgentInput.messages`；包含 partial assistant 或 pending-interrupt assistant/tool turn 的客户端历史不能进入模型输入，也不能触发适配器的 time-travel/regenerate 路径。
+- start、resume、steer-away、retry 之外的混合请求形状全部失败关闭。
+- 运行中和终态后的重复 POST 分别返回定义好的 409，不创建第二个 handle、不重复持久化；断连取消后的同 ID 重放返回 terminal duplicate。
+- retry 形状不追加用户消息，创建带 `retry_of` 的新产品 run，并在同一个 `/api/agent/run` response 中从持久化历史完整返回 AG-UI 事件流；非最近、非可重试终态或 history 已前进返回 `RETRY_NOT_ALLOWED`。
+- 服务端重建 `RunAgentInput.messages`；start/steer-away/retry 排除不应进入模型的 partial 或 pending turn，resume 强制使用 `messages=[]` 并且不触发适配器的 time-travel/regenerate 路径。
 - interrupt 后丢弃 Graph 与 `LangGraphAgent`，使用同一 MemorySaver、同构新 Graph 和新适配器实例恢复同一产品 run。
 - `recursion_limit` 和项目侧 transition 计数能否跨 resume 按产品 run 累计；不能可靠阻断时验证 transition 限制不会出现在第一期 policy 和 UI。
 - resume 缺少模型密钥时在 Graph 构建前失败；更换原始密钥但保持同一 `ModelRef` 可以恢复，修改 `ModelRef` 返回 `409 RUN_CONFIG_MISMATCH`。
 - 未知 CUSTOM 事件。
 - history 导入导出不丢消息完整状态。
-- `thread.revision.updated` 只在原子提交后发送且不进入 Graph state；丢失该事件后下一次提交通过 revision 409 触发重载。
+- `thread.revision.updated` 只在原子提交后发送且不进入 Graph state，终态事件严格先于 `RUN_FINISHED`；丢失该事件后下一次提交通过 revision 409 触发重载。
+- 活跃 run 期间 PATCH 重命名与 AG-UI revision 事件乱序到达时，前端 revision 只能单调增加；后续请求要么使用最新值成功，要么通过 409 重载收敛。
+- 标准 interrupt outcome 不包含 `expiresAt`，pending interrupt 只按设计中的显式状态转换失效。
 - API Key 不出现在任何 SSE frame、Graph state、MemorySaver 序列化内容、异常文本或 JSON 文件中；覆盖重建 Graph 后 resume 的完整路径。
 
 ### 17.3 集成测试
@@ -735,6 +753,7 @@ Skill 详情响应包含 frontmatter、校验状态，以及 `references`、`ass
 - 慢速同步假工具反复取消：占用的 worker 不造成无界排队，容量耗尽按约定拒绝，迟到结果被丢弃，worker 释放后新 run 恢复。
 - 非 loopback HTTP 携带模型密钥被拒绝；只在显式受信代理来源下接受 `X-Forwarded-Proto: https`，loopback 开发代理可用。
 - 流中断连后 run 为 `cancelled`，partial assistant 被持久化并展示但不进入下一次模型输入，重载得到最新 revision。
+- 断连后通过 retry 形状重新执行，使用新 protocol/product run ID，不恢复旧 MemorySaver，并在同一 HTTP response 收到新事件流。
 
 默认测试不得依赖付费模型或公网。
 
@@ -746,7 +765,8 @@ Skill 详情响应包含 frontmatter、校验状态，以及 `references`、`ass
 - 移动端两个抽屉。
 - 流式文本与工具调用。
 - 审批、拒绝、session allowance，以及 steer-away 单请求交互。
-- 停止、重试、刷新和历史恢复；所有结构化 409 都重载服务端历史，不尝试重附着 SSE。
+- `running` 时 Composer 禁用且 Stop 可用；取消完成并重载 revision 后 Composer 恢复。
+- 停止、retry 形状、刷新和历史恢复；所有结构化 409 都重载服务端历史，不尝试重附着 SSE。
 - Artifact 预览与下载。
 - 错误提示和响应式无重叠。
 
@@ -773,7 +793,7 @@ Skill 详情响应包含 frontmatter、校验状态，以及 `references`、`ass
 退出条件：
 
 - fake model 完成多步工具 run。
-- 标准 interrupt outcome、标准 `resume[]`、steer-away、每请求新 `LangGraphAgent`、动态模型构造和断线取消在锁定版本下通过合同测试。
+- 标准 interrupt outcome、bridge interrupt ID 映射、标准 `resume[]`、`messages=[]` resume、steer-away、每请求新 `LangGraphAgent`、动态模型构造和断线取消在锁定版本下通过合同测试。
 - interrupt 后丢弃旧 Graph，再用同一 MemorySaver 和同构新 Graph 恢复；API Key 在该链路中不进入事件、checkpoint 或持久化。
 - 明确验证 `recursion_limit` 跨 resume 语义；若不能证明按产品 run 硬限制，就按第 13 节移除 transition 限制。协议转换或跨实例 resume 不通过则停止后续里程碑并重新选定兼容版本。
 - OpenAI 和 DeepSeek 各人工验证一次。
@@ -795,6 +815,7 @@ Skill 详情响应包含 frontmatter、校验状态，以及 `references`、`ass
 - partial 不进入下一轮模型历史。
 - 并发写不产生半截 JSON。
 - 重复 run/message 请求返回定义好的 409 且不重复落盘，历史分叉在模型调用前返回 409。
+- retry 通过同一 `/api/agent/run` response 建立新产品 run 并完整流式返回，不重复用户消息或附着旧流。
 - 断连 partial 可显示但不进入下一轮模型输入；`thread.revision.updated` 丢失后能通过 409 重载收敛。
 - 启动对账标记遗留 run 并清理固定命名的孤儿 `.tmp`。
 - 损坏文件保留并可识别。
