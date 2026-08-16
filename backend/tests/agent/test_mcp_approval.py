@@ -404,3 +404,87 @@ async def test_shutdown_clears_allowances(api_client_with_allowances):
     services.coordinator._allowances.grant("th-1", "fixture", "echo")
     await services.coordinator.shutdown()
     assert not services.coordinator._allowances.has("th-1", "fixture", "echo")
+
+
+# ---------------------------------------------------------------------------
+# Review 修复回归：生产路径元数据富集 + cancel_run 租约释放
+# ---------------------------------------------------------------------------
+
+async def test_production_capture_path_enriches_mcp_metadata(tmp_path):
+    """走真实 _capture（RAW → legacy on_interrupt）再富集，而非手工构造。"""
+    from ag_ui.core.events import CustomEvent, EventType, ToolCallArgsEvent, ToolCallEndEvent, ToolCallStartEvent
+    from agent.protocol import AgentProtocolBridge, interrupt_payloads
+
+    bridge = AgentProtocolBridge("th-1", "run-1")
+    # 生产观察路径：ToolCallStart/Args/End → legacy on_interrupt → _capture
+    bridge.convert(ToolCallStartEvent(
+        tool_call_id="call-9", tool_call_name="mcp__fixture__echo",
+        parent_message_id="assistant-1"))
+    bridge.convert(ToolCallArgsEvent(
+        tool_call_id="call-9", delta=json.dumps({"value": "sk-live-key-123"})))
+    bridge.convert(ToolCallEndEvent(tool_call_id="call-9"))
+    bridge.convert(CustomEvent(
+        type=EventType.CUSTOM, name="on_interrupt",
+        value={
+            "action_requests": [{
+                "name": "mcp__fixture__echo",
+                "args": {"value": "sk-live-key-123"},
+                "description": "审批",
+            }],
+            "review_configs": [{
+                "action_name": "mcp__fixture__echo",
+                "allowed_decisions": ["approve", "reject"],
+            }],
+        }))
+    assert bridge.pending, "生产 capture 路径必须产生 pending"
+
+    from agent.capabilities import enrich_pending_interrupts
+    from agent.mcp import McpToolBinding
+
+    binding = McpToolBinding(
+        server_id="fixture", original_name="echo", alias="mcp__fixture__echo",
+        description="d", args_schema={}, config_generation=1, catalog_generation=1,
+        server_name="财报服务")
+
+    class LeaseStub:
+        mcp_bindings = (binding,)
+        _registry = None
+
+    enriched = enrich_pending_interrupts(bridge.pending, LeaseStub(), "sk-live-key-123")
+    payload = interrupt_payloads(enriched)[0]
+    assert payload["serverId"] == "fixture"
+    assert payload["serverName"] == "财报服务"
+    assert payload["toolName"] == "echo"
+    assert payload["toolAlias"] == "mcp__fixture__echo"
+    assert payload["arguments"] == {"value": "[redacted]"}  # 模型密钥脱敏
+    # resume + thread_session 许可现在能推导出来
+    resume, allowances = AgentProtocolBridge(
+        "th-1", "run-1", pending=enriched).resume_value_with_allowances([
+        {"interruptId": enriched[0].bridge_interrupt_id, "status": "resolved",
+         "payload": {"decision": "approve", "scope": "thread_session"}}])
+    assert allowances == [("th-1", "fixture", "echo")]
+
+
+async def test_cancel_run_releases_capability_lease(tmp_path):
+    """断连/REST 取消路径必须释放租约（skill_in_use/mcp_server_in_use 复位）。"""
+    from agent.router import build_services
+    from agent.models import ThreadDocument
+    from ag_ui.core.types import UserMessage
+
+    services = build_services(tmp_path / "agent")
+    services.threads.create(ThreadDocument.new("th-1", "研究", now=utc_now()))
+    from tests.agent.fakes import ScriptedChatModel
+    from langchain_core.messages import AIMessage
+
+    admission = await services.coordinator.acquire_start(
+        model_ref=MODEL_REF, secrets=SECRETS,
+        model_builder=lambda ref, sec: ScriptedChatModel([AIMessage(content="ok")]),
+        thread_id="th-1", protocol_run_id="protocol-cancel",
+        messages=[UserMessage(id="u-cancel", content="问题")], client_revision=0)
+    handle = admission.handle
+    lease = handle.capability_lease
+    assert lease is not None
+    assert lease._released is False
+    await services.coordinator.cancel_run("th-1", handle.product_run_id)
+    assert lease._released is True
+    assert services.coordinator.skill_in_use("any") is False

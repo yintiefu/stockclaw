@@ -43,7 +43,12 @@ from agent.stores import (
     reconcile_agent_data,
     utc_now,
 )
-from agent.capabilities import AllowanceRegistry, CapabilityResolver, McpUnavailable
+from agent.capabilities import (
+    AllowanceRegistry,
+    CapabilityResolver,
+    McpUnavailable,
+    enrich_pending_interrupts,
+)
 from agent.mcp import (
     McpError,
     McpRegistry,
@@ -329,6 +334,9 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
         # fail-closed：相关 MCP server 不可用（流开始前 503，不触发 409 reload）
         return JSONResponse(status_code=503, content={
             "code": "MCP_UNAVAILABLE", "detail": str(exc)})
+    except McpError as exc:
+        # mcp.json 损坏等结构化 MCP 配置错误（含隔离文件名，无绝对路径）
+        return _mcp_error_response(exc)
     except ThreadBusy as exc:
         return _conflict_response(exc.code, str(exc), thread_id=thread_id)
     except ResumeRejected as exc:
@@ -397,6 +405,9 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                 converted_events = bridge.convert(event)
                 if isinstance(event, RunFinishedEvent):
                     if bridge.pending:
+                        # 中断：先富集 MCP 元数据（camelCase + 脱敏参数）再持久化
+                        bridge.pending = enrich_pending_interrupts(
+                            bridge.pending, handle.capability_lease, model_key)
                         # 中断：先持久化 pending 元数据 → revision 事件 → 释放 Graph → 再发标准 interrupt
                         handle.pending_interrupts = list(bridge.pending)
                         commits = await _commit_or_fail(

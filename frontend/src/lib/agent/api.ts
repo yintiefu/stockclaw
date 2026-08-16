@@ -87,14 +87,20 @@ export const agentApi = {
   getSkill: (name: string) =>
     agentRequest<SkillDetail>(`/api/agent/skills/${encodeURIComponent(name)}`),
   // multipart 上传：不手工设置 Content-Type，让浏览器提供 boundary
-  importSkill: (url: string, archive: File) => {
+  importSkill: (url: string, archive: File, options?: {
+    overwrite?: boolean;
+    expectedDigest?: string;
+  }) => {
     const form = new FormData();
     form.append("archive", archive);
+    if (options?.overwrite) form.append("overwrite", "true");
+    if (options?.expectedDigest) form.append("expected_digest", options.expectedDigest);
     return fetch(url, { method: "POST", headers: authHeaders(), body: form })
       .then(async (response) => {
+        const payload = await response.json().catch(() => ({})) as AgentConflict;
         if (!response.ok) {
-          const payload = await response.json().catch(() => ({})) as AgentConflict;
-          throw new AgentApiError(response.status, payload);
+          const error = new AgentApiError(response.status, payload);
+          throw error;
         }
         return await response.json() as SkillImportResult;
       });

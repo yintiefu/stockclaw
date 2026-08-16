@@ -1248,7 +1248,7 @@ class RunCoordinator:
             journal = handle.journal
             product_run_id = handle.product_run_id
             self._handles.pop(thread_id, None)
-            handle.runtime.release_graph()
+            self._release_handle(handle)  # 释放 Graph 与能力租约（与 cancel_sync 一致）
             if journal is not None and not journal.closed:
                 await asyncio.to_thread(journal.persist_partial_cancel)
             return product_run_id

@@ -330,28 +330,35 @@ class CapabilityResolver:
         if not relevant:
             return ()
         bindings: list = []
-        admitted: list[str] = []
         for server in relevant:
             try:
-                refreshed = await self._registry.refresh(server.id)
+                # 准入只做发现（连接/复用会话 + 官方 adapter Tool），不重写目录、
+                # 不 bump MCP document revision（规范 §11.1：与持久化目录一致即可）
+                generation = await self._registry._ensure_session(server)
+                tools_by_original = generation.tools
             except Exception as exc:
-                # fail-closed：释放已成功的部分引用，返回脱敏有界错误
-                for sid in admitted:
-                    await self._registry._close_server(sid)
+                # fail-closed：脱敏有界错误；共享会话/目录保持原状，不误杀其他线程
                 detail = str(exc)[:200]
                 raise McpUnavailable(
                     f"MCP server {server.display_name} 无法连接：{detail}"
                 ) from exc
-            admitted.append(server.id)
-            generation = self._registry._sessions.get(server.id)
-            tools_by_original = generation.tools if generation else {}
-            for entry in refreshed.tools:
+            if not tools_by_original:
+                # 会话存在但目录未发现：做一次只读发现（不持久化）
+                try:
+                    tools_by_original = await self._registry._discover_tools(
+                        server.id, generation)
+                except Exception as exc:
+                    raise McpUnavailable(
+                        f"MCP server {server.display_name} 工具发现失败：{str(exc)[:200]}"
+                    ) from exc
+            for entry in server.tools:
                 if not entry.enabled:
                     continue
                 adapter_tool = tools_by_original.get(entry.original_name)
                 if adapter_tool is None:
                     raise McpUnavailable(
-                        f"MCP server {server.display_name} 目录与连接不一致")
+                        f"MCP server {server.display_name} 目录与连接不一致"
+                        f"（缺少 {entry.original_name}）")
                 from agent.mcp import _tool_args_schema
 
                 bindings.append(McpToolBinding(
@@ -361,6 +368,43 @@ class CapabilityResolver:
                     description=entry.description,
                     args_schema=_tool_args_schema(adapter_tool),
                     config_generation=doc.revision,
-                    catalog_generation=generation.number if generation else 0,
+                    catalog_generation=generation.number,
+                    server_name=server.display_name,
                 ))
         return tuple(bindings)
+
+
+def enrich_pending_interrupts(pending, lease, model_key: str):
+    """按 alias→binding 映射为待审批中断填充 MCP 元数据（camelCase 线格式）。
+
+    参数先用模型密钥 + Registry secret set 递归脱敏，再进入 metadata/SSE/
+    thread JSON；非 MCP 工具的中断原样返回。返回新列表（不改动原对象）。
+    """
+    from dataclasses import replace
+
+    bindings = getattr(lease, "mcp_bindings", ()) or ()
+    if not bindings:
+        return list(pending)
+    by_alias = {b.alias: b for b in bindings}
+    secret_pool = {model_key}
+    registry = getattr(lease, "_registry", None)
+    if registry is not None:
+        for values in registry.secret_sets().values():
+            secret_pool |= values
+    secrets = {s for s in secret_pool if s}
+    enriched = []
+    for item in pending:
+        action = (item.value.get("action_requests") or [{}])[0]
+        binding = by_alias.get(action.get("name", ""))
+        if binding is None:
+            enriched.append(item)
+            continue
+        enriched.append(replace(
+            item,
+            server_id=binding.server_id,
+            server_name=binding.server_name,
+            original_tool_name=binding.original_name,
+            tool_alias=binding.alias,
+            arguments=_redact_value(action.get("args") or {}, secrets),
+        ))
+    return enriched

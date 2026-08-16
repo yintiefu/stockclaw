@@ -363,7 +363,7 @@ export function Agent() {
           skills={skills}
           onApplied={applySkills}
           onConflict={handleSkillConflict}
-          onClose={() => setManagerOpen(false)}
+          onClose={() => { setManagerOpen(false); setUnavailable(null); }}
           disabled={activeBusy || converging}
         />
       )}

@@ -24,6 +24,7 @@ export function McpManager({ onReload, disabled }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [trustPreview, setTrustPreview] = useState<StdioTrustPreview | null>(null);
+  const [trustServerId, setTrustServerId] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
 
   const reload = useCallback(async () => {
@@ -45,7 +46,9 @@ export function McpManager({ onReload, disabled }: Props) {
       await fn();
     } catch (e) {
       const preview = (e as { preview?: StdioTrustPreview }).preview;
-      if (preview) setTrustPreview(preview); // 先呈现完整命令供确认
+      if (preview) {
+        setTrustPreview(preview); // 先呈现完整命令供确认（归属 server 由 trust() 记录）
+      }
       const status = (e as { status?: number }).status;
       if (status === 409) {
         if (!preview) {
@@ -70,6 +73,7 @@ export function McpManager({ onReload, disabled }: Props) {
 
   const trust = (server: McpServer) =>
     run(async () => {
+      setTrustServerId(server.id); // 预览只归属该 server，防止跨 server 误确认
       // 触发信任预览；错误交给 run 统一呈现 preview
       await agentApi.testMcp(server.id, doc.revision);
     });
@@ -79,6 +83,7 @@ export function McpManager({ onReload, disabled }: Props) {
       if (!trustPreview) return;
       await agentApi.trustMcp(server.id, doc.revision, trustPreview.fingerprint);
       setTrustPreview(null);
+      setTrustServerId(null);
       await reload();
       onReload();
     });
@@ -182,7 +187,7 @@ export function McpManager({ onReload, disabled }: Props) {
               </div>
             </div>
 
-            {trustPreview && (
+            {trustPreview && trustServerId === server.id && (
               <div className="mt-2 rounded bg-black/30 p-2 text-xs">
                 <p className="font-medium">信任确认（stdio 是用户明确选择的本地程序，不是沙箱）</p>
                 <pre className="mt-1 whitespace-pre-wrap">{[
@@ -191,11 +196,18 @@ export function McpManager({ onReload, disabled }: Props) {
                   `args:       ${trustPreview.args.join(" ")}`,
                   `fingerprint: ${trustPreview.fingerprint}`,
                 ].join("\n")}</pre>
-                <button type="button" className={`${BTN} mt-1`}
-                  onClick={() => confirmTrust(server)} disabled={disabled || busy}>
-                  <ShieldCheck className="size-3.5" aria-hidden />
-                  确认信任此命令
-                </button>
+                <div className="mt-1 flex items-center gap-2">
+                  <button type="button" className={`${BTN} mt-1`}
+                    onClick={() => confirmTrust(server)} disabled={disabled || busy}>
+                    <ShieldCheck className="size-3.5" aria-hidden />
+                    确认信任此命令
+                  </button>
+                  <button type="button" className={`${BTN} mt-1`}
+                    onClick={() => { setTrustPreview(null); setTrustServerId(null); }}
+                    disabled={disabled || busy}>
+                    取消
+                  </button>
+                </div>
               </div>
             )}
 

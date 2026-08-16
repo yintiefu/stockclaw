@@ -102,8 +102,6 @@ class StreamableHttpTransport(BaseModel):
 
     @model_validator(mode="after")
     def check_url_and_headers(self):
-        if "/" in self.url or True:
-            pass
         try:
             validate_outbound_url(self.url, public_mode=False,
                                   require_public_https=True, allow_query=False,
@@ -246,10 +244,8 @@ class McpConfigStore:
 
     def update(self, expected_revision: int, mutate) -> McpDocument:
         with self._lock:
-            try:
-                current = self.load()
-            except McpConfigCorrupt:
-                current = McpDocument()  # 从损坏状态恢复为空文档
+            # fail-closed：损坏文件已隔离，但不用空文档覆盖——必须人工介入后重试
+            current = self.load()
             if current.revision != expected_revision:
                 raise McpRevisionConflict(
                     f"MCP 配置期望 revision {expected_revision}，实际 {current.revision}")
@@ -375,18 +371,6 @@ class _SessionGeneration:
     ready: "asyncio.Event" = field(default_factory=asyncio.Event)
     stop_event: "asyncio.Event" = field(default_factory=asyncio.Event)
     error: "str | None" = None
-
-
-class _AsyncExitStack:
-    """占位兼容（真实类型来自 contextlib）。"""
-
-    def __init__(self):
-        from contextlib import AsyncExitStack as _Real
-
-        self._real = _Real()
-
-    async def aclose(self):
-        await self._real.__aexit__(None, None, None)
 
 
 class McpRegistry:
@@ -574,6 +558,10 @@ class McpRegistry:
                 self._secret_sets.setdefault(server.id, set()).update(resolved_secrets)
                 generation.ready.set()
                 await generation.stop_event.wait()
+                # drain 契约：已取得引用的调用可以继续；物理关闭等引用归零（有界）
+                drain_deadline = asyncio.get_event_loop().time() + CALL_TIMEOUT
+                while generation.in_flight > 0 and asyncio.get_event_loop().time() < drain_deadline:
+                    await asyncio.sleep(0.05)
             except BaseException as exc:  # noqa: BLE001 —— 记录脱敏错误供等待方消费
                 generation.error = _redact_text(str(exc), self._secret_sets.get(server.id, set()))
                 generation.ready.set()
@@ -609,13 +597,37 @@ class McpRegistry:
         generation = _SessionGeneration(number=self._counter, server_id=server.id)
         self._spawn_supervisor(server, generation)
         try:
-            await asyncio.wait_for(generation.ready.wait(), timeout=2 * CONNECT_TIMEOUT)
+            await asyncio.wait_for(generation.ready.wait(), timeout=CONNECT_TIMEOUT)
         except asyncio.TimeoutError as exc:
             generation.stop_event.set()
             raise McpError("连接超时") from exc
         if generation.error is not None:
             raise McpError(f"连接失败: {generation.error[:HEALTH_DETAIL_LIMIT]}")
         self._secret_sets.setdefault(server.id, set())
+        return generation
+
+    async def _discover_tools(self, server_id: str, generation: _SessionGeneration) -> dict:
+        """只读发现官方 adapter Tool（不写目录、不 bump revision）。"""
+        tools = await asyncio.wait_for(
+            _load_mcp_tools(session=generation.client, server_name=server_id),
+            timeout=CONNECT_TIMEOUT)
+        secrets = self._secret_sets.get(server_id, set())
+        by_original = {}
+        for tool in tools:
+            description = _redact_text(getattr(tool, "description", "") or "", secrets)
+            setattr(tool, "description", description[:TOOL_DESCRIPTION_LIMIT])
+            by_original[getattr(tool, "name", "")] = tool
+        generation.tools = by_original
+        return by_original
+
+    async def _ensure_session(self, server: McpServer) -> "_SessionGeneration":
+        """复用 accepting 会话；否则建立并替换（不持久化目录，不 bump revision）。"""
+        async with self._state_lock:
+            existing = self._sessions.get(server.id)
+        if existing is not None and existing.state == "accepting" and existing.client is not None:
+            return existing
+        generation = await self._build_session(server)
+        await self._replace_session(server.id, generation)
         return generation
 
     async def test(self, server_id: str) -> McpHealth:
@@ -742,29 +754,39 @@ class McpRegistry:
     async def _call_with_session(self, server_id: str, alias: str, arguments: dict) -> str:
         loop = asyncio.get_event_loop()
         deadline = loop.time() + CALL_TIMEOUT
+        # 引用获取与 accepting 检查在同一状态锁临界区内原子完成（规范 §10.1）
         async with self._state_lock:
             generation = self._sessions.get(server_id)
-        if self._shutting_down or generation is None or generation.state != "accepting":
-            return _tool_error("MCP_UNAVAILABLE", "MCP 会话不可用（关闭中或未连接）")
-        original = _original_name_for_alias(server_id, alias, generation.tools) or alias
-        tool = generation.tools.get(original)
-        if tool is None:
-            return _tool_error("MCP_UNAVAILABLE", f"工具不在当前目录: {alias}")
-        secrets = self._secret_sets.get(server_id, set())
-        generation.in_flight += 1
+            if self._shutting_down or generation is None or generation.state != "accepting":
+                return _tool_error("MCP_UNAVAILABLE", "MCP 会话不可用（关闭中或未连接）")
+            generation.in_flight += 1
         try:
+            original = _original_name_for_alias(server_id, alias, generation.tools) or alias
+            tool = generation.tools.get(original)
+            if tool is None:
+                return _tool_error("MCP_UNAVAILABLE", f"工具不在当前目录: {alias}")
+            secrets = self._secret_sets.get(server_id, set())
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return _tool_error("MCP_UNAVAILABLE", "调用超时")
             try:
-                result = await asyncio.wait_for(
-                    tool.ainvoke(arguments), timeout=remaining)
+                result = await asyncio.wait_for(tool.ainvoke(arguments), timeout=remaining)
+            except asyncio.CancelledError:
+                # 已进入远端调用的取消：当前世代不再接受新调用（规范 §10.2）
+                self._mark_draining(generation)
+                raise
             except BaseException as exc:
                 detail = _redact_text(str(exc), secrets)[:HEALTH_DETAIL_LIMIT]
                 return _tool_error("MCP_TOOL_ERROR", detail)
         finally:
             generation.in_flight -= 1
         return _normalize_tool_result(result, secrets)
+
+    def _mark_draining(self, generation: _SessionGeneration) -> None:
+        """有界地把世代转入 draining（引用归零后由 supervisor 物理关闭）。"""
+        if generation.state == "accepting":
+            generation.state = "draining"
+            generation.stop_event.set()
 
     async def _write_health(self, server_id: str, health: McpHealth) -> None:
         def change(doc: McpDocument) -> McpDocument:
@@ -805,12 +827,6 @@ def _stdio_client(params):
     return stdio_client(params)
 
 
-def _streamable_http_client(url: str, headers: dict[str, str]):
-    from mcp.client.streamable_http import streamablehttp_client
-
-    return streamablehttp_client(url, headers=headers)
-
-
 def _client_session(read_stream, write_stream):
     from mcp.client.session import ClientSession
 
@@ -821,19 +837,6 @@ def _public_mode() -> bool:
     from agent.ssrf import public_mode
 
     return public_mode()
-
-
-async def _initialize(client) -> None:
-    await client.initialize()
-
-
-async def _safe_aclose(stack) -> None:
-    if stack is None:
-        return
-    try:
-        await asyncio.wait_for(stack.aclose(), timeout=2 * CONNECT_TIMEOUT)
-    except Exception:  # noqa: BLE001 —— 关闭路径尽力而为，不留孤儿
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -850,12 +853,6 @@ def _tool_args_schema(tool) -> dict:
         except Exception:  # noqa: BLE001
             return {}
     return {}
-
-
-def _original_name_of(alias: str, tools: dict) -> str | None:
-    if alias in tools:
-        return alias
-    return None
 
 
 def _original_name_for_alias(server_id: str, alias: str, tools: dict) -> str | None:
@@ -975,6 +972,7 @@ class McpToolBinding:
     args_schema: dict
     config_generation: int
     catalog_generation: int
+    server_name: str = ""
 
     def as_langchain_tool(self, registry: "McpRegistry") -> BaseTool:
         binding = self

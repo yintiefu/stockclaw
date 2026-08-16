@@ -687,7 +687,7 @@ class SkillImporter:
             if not backup.is_dir():
                 warnings.append(backup.name)
                 continue
-            inner = [p for p in backup.iterdir() if p.name != "SKILL.md" or True]
+
             # 判断 backup 内是否是「唯一 Skill 目录」形状（一个子目录 + 其余为单 Skill 文件）
             subdirs = [p for p in backup.iterdir() if p.is_dir()]
             has_skill_md = (backup / "SKILL.md").exists()

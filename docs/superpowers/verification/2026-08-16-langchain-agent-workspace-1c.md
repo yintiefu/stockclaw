@@ -94,3 +94,28 @@ pytest tests/test_live.py -m live -k 'mootdx_kline_route_live or mootdx_finance_
 1. 适配 `useAgUiSubmitInterruptResponses` 的历史恢复 resume 路径（或活跃 run 内验证）。
 2. 用户提供真实 provider 后补 Step 4 记录。
 3. `SkillManager.test.tsx` 目前并入 `CapabilityManagerDialog.test.tsx`（计划单列）。
+
+## Review 修复（2026-08-16，代码评审后）
+
+两个并行 review（后端/前端）后修复并回归：
+
+- **Critical** `protocol._capture` 生产路径从未填充 MCP 元数据 → router 在中断持久化前经
+  `enrich_pending_interrupts`（alias→binding + 模型密钥/secret set 脱敏）富集；新增生产
+  capture 路径回归测试（camelCase 元数据 + thread_session 许可推导 + 参数脱敏）。
+- **Critical** `RunCoordinator.cancel_run` 泄漏能力租约 → 改走 `_release_handle`；新增
+  断连/REST 取消路径的 lease 恰好一次释放测试。
+- **Important** 会话 drain 契约：引用获取与 accepting 检查移入同一 `_state_lock` 临界区；
+  supervisor 在 stop 后等 in-flight 归零再物理关闭；远端调用内取消标记 draining；
+  连接预算回到 15s。
+- **Important** run 准入不再调用 `refresh()` 重写目录：新增 `_ensure_session`/`_discover_tools`
+  只读发现路径（复用 accepting 会话、零 revision 递增、失败不误杀其他线程共享会话）。
+- **Important** `mcp.json` 损坏 fail-closed：`update` 不再从空文档恢复；`/run` 捕获
+  `McpError` 返回结构化错误。
+- **前端 Important** Skill 覆盖导入改走认证 `agentApi.importSkill`（含 409→digest 确认）；
+  信任预览按 server 定位（防跨 server 指纹误确认）并支持取消。
+- **Minor** `mcp.py`/`skills.py` 死代码清理、PDF 改 iframe 预览、切 Skill 清除文本预览、
+  503 横幅随管理器关闭清除、重复 eslint-disable、设计文档 metadata 命名空间同步为
+  `custom.agui.interrupts`。
+
+门禁：后端 345 passed（not live）；前端 vitest 54 + node 16 + strict build 全绿。
+仍未解决（与前文一致）：浏览器内 runtime resume 提交集成、真实 provider E2E。

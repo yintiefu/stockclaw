@@ -50,6 +50,7 @@ export function SkillManager({ skills, disabled, onChanged }: Props) {
   const openDetail = (name: string) =>
     run(async () => {
       revokeUrl();
+      setPreviewText(null); // 切换 Skill 时清除上一个的文本预览
       const loaded = await agentApi.getSkill(name);
       setDetail(loaded);
     });
@@ -65,18 +66,17 @@ export function SkillManager({ skills, disabled, onChanged }: Props) {
       try {
         await agentApi.importSkill("/api/agent/skills/import", file);
       } catch (e) {
-        // 目标已存在 → 用当前 digest 确认覆盖
+        // 目标已存在 → 用当前 digest 确认覆盖（仍走认证 API + 错误映射）
         const status = (e as { status?: number }).status;
         const code = (e as { code?: string }).code;
         if (status === 409 && code === "SKILL_CONFLICT") {
           const listed = await agentApi.listSkills();
           const target = listed.skills.find((s) => file.name.replace(/\.zip$/i, "") === s.name);
           if (target?.digest && window.confirm(`Skill 已存在，用当前版本覆盖 ${target.name}？`)) {
-            const form = new FormData();
-            form.append("archive", file);
-            form.append("overwrite", "true");
-            form.append("expected_digest", target.digest);
-            await fetch("/api/agent/skills/import", { method: "POST", body: form });
+            await agentApi.importSkill("/api/agent/skills/import", file, {
+              overwrite: true,
+              expectedDigest: target.digest,
+            });
             return;
           }
         }
@@ -99,15 +99,18 @@ export function SkillManager({ skills, disabled, onChanged }: Props) {
       const blob = await agentApi.fetchSkillFile(name, file.relative_path);
       revokeUrl();
       if (file.mime?.startsWith("image/") || file.mime === "application/pdf") {
+        setPreviewMime(file.mime ?? null);
         objectUrlRef.current = URL.createObjectURL(blob);
         setObjectUrl(objectUrlRef.current);
       } else {
+        setPreviewMime(null);
         const text = await blob.text();
         setPreviewText(text);
       }
     });
   };
   const [previewText, setPreviewText] = useState<string | null>(null);
+  const [previewMime, setPreviewMime] = useState<string | null>(null);
 
   return (
     <div className="space-y-3">
@@ -177,15 +180,13 @@ export function SkillManager({ skills, disabled, onChanged }: Props) {
           {previewText !== null && (
             <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-black/30 p-2">{previewText}</pre>
           )}
-          {objectUrl && fileIsViewable(detail) && (
-            <img src={objectUrl} alt="Skill 资源预览" className="mt-2 max-h-56 rounded" />
+          {objectUrl && (
+            objectUrl.startsWith("blob:") && previewMime === "application/pdf"
+              ? <iframe src={objectUrl} title="Skill PDF 预览" className="mt-2 h-72 w-full rounded" />
+              : <img src={objectUrl} alt="Skill 资源预览" className="mt-2 max-h-56 rounded" />
           )}
         </div>
       )}
     </div>
   );
-}
-
-function fileIsViewable(_detail: SkillDetail): boolean {
-  return true;
 }

@@ -204,7 +204,6 @@ export function AgentRuntimeProvider({
       },
     ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [config, onConflict, onError, getThreadId, getRevision, onStreamEnd, onUnavailable],
   );
   const historyAdapter = useMemo(() => controller?.historyAdapter(), [controller, threadId]);
