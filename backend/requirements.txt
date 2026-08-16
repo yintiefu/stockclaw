@@ -6,7 +6,7 @@ requests
 # 全栈数据源（较重）——一致预期 / 新闻 / 公告 / K线 / 财务
 # 未安装时对应端点会返回 501 + 安装提示，不影响行情/研报
 akshare>=1.10
-mootdx>=0.10
+./vendor/mootdx_compat
 pandas
 
 # Agent workspace protocol/runtime group. Upgrade and contract-test as one unit.
@@ -16,4 +16,9 @@ langgraph==1.2.11
 ag-ui-langgraph==0.0.42
 ag-ui-protocol==0.1.15
 ag-ui-a2ui-toolkit==0.0.4
-# langchain-mcp-adapters 与 mootdx 的 httpx 上下限互斥；待 1C 引入 MCP 时再评估拆分
+# 1C：MCP 运行时（本地 mootdx 0.11.7+vr1 已放宽 httpx 上限以兼容 0.28.1）
+langchain-mcp-adapters==0.3.2
+mcp==1.26.0
+httpx==0.28.1
+PyYAML>=6,<7
+python-multipart>=0.0.18,<1
