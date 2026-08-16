@@ -25,6 +25,28 @@ class RunCancelledEvent(ConfiguredBaseModel):
     run_id: str
 
 
+INTERRUPT_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision": {"enum": ["approve", "reject"]},
+        "scope": {"enum": ["once", "thread_session"]},
+    },
+    "required": ["decision", "scope"],
+}
+
+
+def interrupt_payloads(pending: list[PendingInterrupt]) -> list[dict[str, Any]]:
+    """待审批中断的标准载荷；SSE 与持久化元数据共用同一形状，
+    前端经 metadata.custom["ag-ui"].interrupts 水合后可直接 resume。"""
+    return [{
+        "id": item.bridge_interrupt_id,
+        "reason": "tool_call",
+        "message": item.value["action_requests"][0].get("description", "Tool approval required"),
+        "toolCallId": item.tool_call_id,
+        "responseSchema": INTERRUPT_RESPONSE_SCHEMA,
+    } for item in pending]
+
+
 def thread_revision_updated(thread_id: str, revision: int, persisted_at: str) -> CustomEvent:
     """提交成功后才能发出的 revision 事件（项目自有，绝不进 bridge.convert）。"""
     return CustomEvent(
@@ -101,20 +123,7 @@ class AgentProtocolBridge:
             self._capture(value)
             return []
         if isinstance(event, RunFinishedEvent) and self.pending:
-            interrupts = [{
-                "id": item.bridge_interrupt_id,
-                "reason": "tool_call",
-                "message": item.value["action_requests"][0].get("description", "Tool approval required"),
-                "toolCallId": item.tool_call_id,
-                "responseSchema": {
-                    "type": "object",
-                    "properties": {
-                        "decision": {"enum": ["approve", "reject"]},
-                        "scope": {"enum": ["once", "thread_session"]},
-                    },
-                    "required": ["decision", "scope"],
-                },
-            } for item in self.pending]
+            interrupts = interrupt_payloads(self.pending)
             return [RunFinishedEvent(
                 thread_id=self.thread_id,
                 run_id=self.run_id,

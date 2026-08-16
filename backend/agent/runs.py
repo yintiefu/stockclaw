@@ -10,7 +10,7 @@ from uuid import uuid4
 from ag_ui.core.types import RunAgentInput
 
 from agent.models import AgentMessage, ModelRef, RunDocument, RunSecrets, RunSummary, RunUsage, ThreadDocument
-from agent.protocol import PendingInterrupt
+from agent.protocol import PendingInterrupt, interrupt_payloads
 from agent.runtime import AgentFactory, RuntimeHandle
 from agent.stores import DocumentNotFound, RevisionConflict, utc_now
 
@@ -105,6 +105,9 @@ class RunJournal:
         self._tool_calls: dict[str, dict] = {}
         # 当前轮次尚未归属的 tool 请求调用（发起请求的 assistant 消息尚未持久化）
         self._pending_request_calls: list[str] = []
+        # 直播事件里 tool 请求所属的 assistant 消息 ID（parent_message_id）；有值时
+        # 请求消息用它作为持久化 ID，保证直播与刷新后的消息 ID 一致
+        self._request_parent_message_id: str | None = None
         self.closed = False
         self.model_calls = 0
         self.tool_calls = 0
@@ -128,6 +131,10 @@ class RunJournal:
         if kind == "TEXT_MESSAGE_END":
             return self._commit_assistant(event.message_id, partial=False)
         if kind == "TOOL_CALL_START":
+            if not self._pending_request_calls:
+                # 新一轮模型调用的开始：优先记住事件自带的父消息 ID
+                self._request_parent_message_id = getattr(event, "parent_message_id", None)
+                self.model_calls += 1
             self._tool_calls.setdefault(event.tool_call_id, {"name": event.tool_call_name, "args": "", "message_id": None})
             if event.tool_call_id not in self._pending_request_calls:
                 self._pending_request_calls.append(event.tool_call_id)
@@ -147,10 +154,8 @@ class RunJournal:
     # ---- 边界提交 ----
 
     def persist_interrupt(self, pending: list[PendingInterrupt]) -> CommittedRevision:
-        metadata = [
-            {"id": item.bridge_interrupt_id, "toolCallId": item.tool_call_id}
-            for item in pending
-        ]
+        # 完整标准载荷：前端刷新后经 metadata.custom["ag-ui"].interrupts 恢复 resume/steer-away
+        metadata = interrupt_payloads(pending)
         for message_id, buffer in self._assistant_buffers.items():
             if message_id not in self._persisted_assistant_ids():
                 self._upsert_message(AgentMessage(
@@ -177,14 +182,7 @@ class RunJournal:
         if error_message is not None:
             run_update["error_message"] = error_message
         run_update["ended_at"] = utc_now()
-        run_update["elapsed_ms"] = self._elapsed_ms()
-        run_update["active_elapsed_ms"] = self._elapsed_ms()
-        run_update["usage"] = RunUsage(
-            model_calls=self.model_calls,
-            tool_calls=self.tool_calls,
-            input_tokens=None,
-            output_tokens=None,
-        )
+        run_update.update(self._usage_update(self._approval_total_ms()))
         self._update_run(run_update)
         # 先刷新 last_run（可能再提交一次 revision），再产生对外可见的终局 revision 事件，
         # 保证 SSE 的最后一个 revision 与最终 REST 文档一致
@@ -211,9 +209,9 @@ class RunJournal:
         self._update_run({
             "status": "cancelled",
             "ended_at": utc_now(),
-            "elapsed_ms": self._elapsed_ms(),
             "error_code": "CLIENT_CANCELLED",
             "error_message": "用户停止或断开连接，运行被取消",
+            **self._usage_update(self._approval_total_ms()),
         })
         commit = self._commit_thread("partial_cancel")
         self._refresh_last_run("cancelled")
@@ -223,6 +221,31 @@ class RunJournal:
 
     def _elapsed_ms(self) -> int:
         return int((time.monotonic() - self._handle.started_monotonic) * 1000)
+
+    def _approval_total_ms(self) -> int:
+        """已结算的审批等待 + 当前未结算的等待段。"""
+        run = self._current_run()
+        settled = run.approval_wait_ms if run is not None else 0
+        open_wait = 0
+        if self._handle.approval_started_monotonic is not None:
+            open_wait = int((time.monotonic() - self._handle.approval_started_monotonic) * 1000)
+            self._handle.approval_started_monotonic = None
+        return settled + open_wait
+
+    def _usage_update(self, approval_wait_ms: int) -> dict[str, Any]:
+        """终态/取消共用的时长与用量字段：active 扣除审批等待。"""
+        elapsed = self._elapsed_ms()
+        return {
+            "elapsed_ms": elapsed,
+            "active_elapsed_ms": max(0, elapsed - approval_wait_ms),
+            "approval_wait_ms": approval_wait_ms,
+            "usage": RunUsage(
+                model_calls=self.model_calls,
+                tool_calls=self.tool_calls,
+                input_tokens=None,
+                output_tokens=None,
+            ),
+        }
 
     def _persisted_assistant_ids(self) -> set[str]:
         thread = self._threads.get(self._handle.runtime.thread_id)
@@ -249,8 +272,10 @@ class RunJournal:
         if not self._pending_request_calls:
             return []
         first_call = self._pending_request_calls[0]
+        message_id = self._request_parent_message_id or f"asst-req-{first_call}"
+        self._request_parent_message_id = None
         message = AgentMessage(
-            id=f"asst-req-{first_call}",
+            id=message_id,
             role="assistant",
             content="",
             partial=partial,
@@ -435,19 +460,37 @@ class RunCoordinator:
                     f"线程 {thread_id} 不存在，客户端 revision {client_revision} 无法对齐"
                 )
 
-        # 2) revision 比较（兼容期 client_revision=None → 用锁内读到的服务端值）
-        expected_revision = client_revision if client_revision is not None else thread.revision
-        if thread.revision != expected_revision:
-            raise RevisionConflict(
-                f"线程 {thread_id} 期望 revision {expected_revision}，实际 {thread.revision}"
-            )
-
         if not messages:
             raise MessageConflict("准入请求缺少新 user message")
         new_message = messages[-1]
         prefix = list(messages[:-1])
         if getattr(new_message, "role", None) != "user":
             raise MessageConflict("准入的新消息必须是 user 角色")
+
+        # 2) 消息 ID 重复：同 ID 不同内容 → 冲突；同 ID 同内容 → 按所属 run 判重复
+        #    （计划要求 message 重复检测先于 revision——重放已接受消息即使带着
+        #     陈旧 revision 也必须返回 DUPLICATE_RUN_*，而不是 revision 冲突）
+        for server_msg in thread.messages:
+            if server_msg.id == new_message.id:
+                if self._content_of(new_message) != server_msg.content:
+                    raise MessageConflict(
+                        f"{MessageConflict.code}: 消息 {server_msg.id} 已存在且内容不同"
+                    )
+                prior = runs.find_by_trigger_message_id(server_msg.id)
+                if prior is not None and prior.status in ("running", "awaiting_approval"):
+                    raise DuplicateRunActive(
+                        f"{DuplicateRunActive.code}: 消息 {server_msg.id} 的 run 仍在运行"
+                    )
+                raise DuplicateRunTerminal(
+                    f"{DuplicateRunTerminal.code}: 消息 {server_msg.id} 已被接受过"
+                )
+
+        # 3) revision 比较（兼容期 client_revision=None → 用锁内读到的服务端值）
+        expected_revision = client_revision if client_revision is not None else thread.revision
+        if thread.revision != expected_revision:
+            raise RevisionConflict(
+                f"线程 {thread_id} 期望 revision {expected_revision}，实际 {thread.revision}"
+            )
 
         # 3) 客户端前缀必须与服务端权威历史一致（id/role/content）。
         #    允许两种长度：完整历史（partial 不计入），或额外带上服务端尾部的
@@ -510,22 +553,6 @@ class RunCoordinator:
             del remaining[server_msg.id]
         if remaining:
             raise MessageConflict("客户端历史消息 ID 集合与服务端不一致")
-
-        # 消息 ID 重复：同 ID 不同内容 → 冲突；同 ID 同内容 → 按所属 run 判重复
-        for server_msg in thread.messages:
-            if server_msg.id == new_message.id:
-                if self._content_of(new_message) != server_msg.content:
-                    raise MessageConflict(
-                        f"{MessageConflict.code}: 消息 {server_msg.id} 已存在且内容不同"
-                    )
-                prior = runs.find_by_trigger_message_id(server_msg.id)
-                if prior is not None and prior.status in ("running", "awaiting_approval"):
-                    raise DuplicateRunActive(
-                        f"{DuplicateRunActive.code}: 消息 {server_msg.id} 的 run 仍在运行"
-                    )
-                raise DuplicateRunTerminal(
-                    f"{DuplicateRunTerminal.code}: 消息 {server_msg.id} 已被接受过"
-                )
 
         return thread, implicit_thread
 
@@ -666,8 +693,8 @@ class RunCoordinator:
     ) -> StartAdmission:
         self._require_stores()
         async with self._lock(thread_id):
-            # 重复检查先于 busy/revision（重放检测永远最优先）
-            self._check_protocol_duplicate(protocol_run_id)
+            # 重复检查先于 busy/revision（重放检测永远最优先）；目录扫描不阻塞事件循环
+            await asyncio.to_thread(self._check_protocol_duplicate, protocol_run_id)
             existing = self._handles.get(thread_id)
             if existing is not None and existing.phase in ("running", "awaiting_approval"):
                 raise ThreadBusy(f"{ThreadBusy.code}: thread {thread_id} already has an active run")
@@ -706,7 +733,7 @@ class RunCoordinator:
                 raise ResumeRejected(f"{ResumeRejected.code}: thread {thread_id} has no awaiting run")
             threads, runs = self._require_stores()
             # 重复检查先于 revision（resume 的 protocol run 重放同样要拒绝）
-            self._check_protocol_duplicate(protocol_run_id)
+            await asyncio.to_thread(self._check_protocol_duplicate, protocol_run_id)
             thread = await asyncio.to_thread(self._load_thread, thread_id)
             if thread is not None:
                 expected = client_revision if client_revision is not None else thread.revision
@@ -829,7 +856,7 @@ class RunCoordinator:
             existing = self._handles.get(thread_id)
             if existing is not None and existing.phase in ("running", "awaiting_approval"):
                 raise ThreadBusy(f"{ThreadBusy.code}: thread {thread_id} already has an active run")
-            self._check_protocol_duplicate(protocol_run_id)
+            await asyncio.to_thread(self._check_protocol_duplicate, protocol_run_id)
             try:
                 target = await asyncio.to_thread(runs.get, retry_of)
             except DocumentNotFound:
@@ -901,20 +928,22 @@ class RunCoordinator:
             try:
                 runtime = await asyncio.to_thread(_build_retry_runtime)
             except Exception:
-                runs.replace(run.model_copy(update={
-                    "status": "failed",
-                    "updated_at": utc_now(),
-                    "ended_at": utc_now(),
-                    "error_code": "GRAPH_BUILD_FAILED",
-                    "error_message": "Graph 构建失败",
-                }))
-                threads.update(
-                    thread_id,
-                    updated_thread.revision,
-                    lambda doc: doc.model_copy(update={"last_run": RunSummary(
-                        id=run_id, status="failed", updated_at=utc_now(), retry_of=retry_of,
-                    )}),
-                )
+                def _mark_retry_build_failed() -> None:
+                    runs.replace(run.model_copy(update={
+                        "status": "failed",
+                        "updated_at": utc_now(),
+                        "ended_at": utc_now(),
+                        "error_code": "GRAPH_BUILD_FAILED",
+                        "error_message": "Graph 构建失败",
+                    }))
+                    threads.update(
+                        thread_id,
+                        updated_thread.revision,
+                        lambda doc: doc.model_copy(update={"last_run": RunSummary(
+                            id=run_id, status="failed", updated_at=utc_now(), retry_of=retry_of,
+                        )}),
+                    )
+                await asyncio.to_thread(_mark_retry_build_failed)
                 raise
 
             handle = ActiveRunHandle(

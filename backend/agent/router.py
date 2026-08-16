@@ -120,6 +120,9 @@ def _error_event(message: str) -> RunErrorEvent:
 
 
 def _redact_value(value, secret: str):
+    if hasattr(value, "model_copy") and hasattr(value, "__dict__"):
+        # 嵌套的 pydantic 事件载荷（如 RunFinishedEvent.outcome）递归脱敏
+        return _redact_model(value, secret)
     if isinstance(value, str):
         return value.replace(secret, "[redacted]")
     if isinstance(value, list):
@@ -307,18 +310,18 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
         product_run_id = runtime_props.retry_of
         if product_run_id:
             try:
-                status = services.runs.get(product_run_id).status
+                status = (await asyncio.to_thread(services.runs.get, product_run_id)).status
             except Exception:
                 status = None
         return _conflict_response(exc.code, str(exc), thread_id=thread_id,
                                   product_run_id=product_run_id, run_status=status)
     except DuplicateRunActive as exc:
-        persisted = services.runs.find_by_protocol_run_id(run_id)
+        persisted = await asyncio.to_thread(services.runs.find_by_protocol_run_id, run_id)
         return _conflict_response(exc.code, str(exc), thread_id=thread_id,
                                   product_run_id=persisted.id if persisted else None,
                                   run_status=persisted.status if persisted else "running")
     except DuplicateRunTerminal as exc:
-        persisted = services.runs.find_by_protocol_run_id(run_id)
+        persisted = await asyncio.to_thread(services.runs.find_by_protocol_run_id, run_id)
         return _conflict_response(exc.code, str(exc), thread_id=thread_id,
                                   product_run_id=persisted.id if persisted else None,
                                   run_status=persisted.status if persisted else "completed")
@@ -360,6 +363,9 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                 if await request.is_disconnected():
                     await services.coordinator.cancel_run(thread_id, handle.product_run_id)
                     return
+                if handle.phase == "cancelled" or (handle.journal is not None and handle.journal.closed):
+                    # REST 取消/其他路径已终结本 run：丢弃所有迟到事件
+                    return
                 converted_events = bridge.convert(event)
                 if isinstance(event, RunFinishedEvent):
                     if bridge.pending:
@@ -381,7 +387,9 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                             yield encoder.encode(thread_revision_updated(commit.thread_id, commit.revision, commit.persisted_at))
                         terminal = "completed"
                     for converted in converted_events:
-                        yield encoder.encode(converted)
+                        # 中断 outcome 携带的工具描述/元数据同样可能夹带密钥：出口统一脱敏
+                        safe = redact_event(converted, model_key)
+                        yield _redact_frame(encoder.encode(safe), model_key)
                     for frame in pending_initial:
                         yield frame
                     pending_initial = []

@@ -25,6 +25,8 @@ export function Agent() {
   const [conflict, setConflict] = useState<string | null>(null);
   // 409 权威重载后递增，强制 runtime 重建并从服务端重新水合消息
   const [sessionEpoch, setSessionEpoch] = useState(0);
+  // 流结束→权威 reload 完成期间禁用输入，防止携带旧历史发送
+  const [converging, setConverging] = useState(false);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const [statusNote, setStatusNote] = useState<string | null>(null);
 
@@ -164,18 +166,26 @@ export function Agent() {
   const onStreamEnd = useCallback(() => {
     const threadId = controller.getActiveThreadId();
     if (!threadId) return;
-    const reloadOnce = async () => {
+    setConverging(true); // Stop/终态后先禁用输入，等待取消持久化 + 权威 reload
+    const reloadOnce = async (bumpEpoch: boolean) => {
       try {
         const thread = await controller.reload(threadId);
         await syncFromController();
+        if (bumpEpoch) {
+          // 用服务端权威历史替换 runtime 本地消息
+          setSessionEpoch((epoch) => epoch + 1);
+        }
         if (thread.last_run?.status === "running" || thread.last_run?.status === "awaiting_approval") {
           setTimeout(() => { void controller.reload(threadId).then(syncFromController).catch(() => undefined); }, 4000);
         }
       } catch {
         // 重载失败保持现状
+      } finally {
+        setConverging(false);
       }
     };
-    setTimeout(() => { void reloadOnce(); }, 1200);
+    // 后端 Stop 后仍在落盘 partial：先等一拍再重载
+    setTimeout(() => { void reloadOnce(true); }, 1200);
   }, [controller, syncFromController]);
 
   const activeBusy = activeThread?.last_run?.status === "running"
@@ -268,6 +278,7 @@ export function Agent() {
           >
             <AgentThread
               activeThread={activeThread}
+              composerDisabled={converging}
               onRetry={handleRetry}
               statusNote={statusNote ?? (activeThread.last_run?.status === "interrupted"
                 ? "后端重启导致上次运行中断，可重试本轮"

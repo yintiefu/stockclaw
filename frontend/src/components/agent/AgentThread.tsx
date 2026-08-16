@@ -84,10 +84,13 @@ export function AgentThread({
   activeThread = null,
   onRetry = () => {},
   statusNote = null,
+  composerDisabled = false,
 }: {
   activeThread?: AgentThread | null;
   onRetry?: (runId: string) => void;
   statusNote?: string | null;
+  /** 权威收敛期间禁用输入（Stop/终态后等待取消持久化与 reload 完成） */
+  composerDisabled?: boolean;
 }) {
   // 两个分支几何一致：running 状态不会撑动页面；队列在 runtime 层已禁用，
   // 禁用态无法提交第二次 start 请求。
@@ -109,10 +112,11 @@ export function AgentThread({
             <ThreadPrimitive.If running={false}>
               <ComposerPrimitive.Input
                 aria-label="Agent 消息"
-                placeholder="输入投研问题"
+                disabled={composerDisabled}
+                placeholder={composerDisabled ? "正在同步会话状态…" : "输入投研问题"}
                 className="max-h-40 min-h-8 flex-1 resize-none bg-transparent px-1 py-1 text-sm outline-none"
               />
-              <ComposerPrimitive.Send className="grid h-9 w-9 place-items-center rounded-md bg-primary text-primary-foreground" title="发送">
+              <ComposerPrimitive.Send disabled={composerDisabled} className="grid h-9 w-9 place-items-center rounded-md bg-primary text-primary-foreground disabled:opacity-40" title="发送">
                 <Send className="h-4 w-4" />
               </ComposerPrimitive.Send>
             </ThreadPrimitive.If>

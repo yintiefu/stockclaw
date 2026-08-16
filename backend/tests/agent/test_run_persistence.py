@@ -930,3 +930,71 @@ async def test_steer_away_preflight_failure_leaves_old_run_intact(tmp_path):
     assert handle.phase == "awaiting_approval"
     thread = threads.get("thread-1")
     assert [m.id for m in thread.messages] == ["user-1"]  # 无新消息写入
+
+
+@pytest.mark.asyncio
+async def test_replay_with_stale_revision_returns_duplicate_not_revision_conflict(tmp_path):
+    """评审修复5：重放已接受消息（带陈旧 revision）→ DUPLICATE_RUN_TERMINAL。"""
+    coordinator, threads, runs = make_coordinator(tmp_path)
+    await start(coordinator, protocol_run_id="protocol-1", revision=None)
+    await coordinator.finish_if_terminal("thread-1", "completed")
+
+    with pytest.raises(DuplicateRunTerminal):
+        await start(coordinator, protocol_run_id="protocol-replay", user_id="user-1",
+                    content="分析现金流", revision=0)  # 陈旧 revision + 已接受消息 ID
+
+
+def test_terminal_run_finished_event_is_redacted():
+    """评审修复1：中断/终局事件出口统一脱敏。
+
+    RunFinishedEvent.outcome 在序列化时组装（不在 __dict__），事件级
+    redact_event 覆盖不到，出口的帧级 _redact_frame 是最终兜底。
+    """
+    import sys
+    sys.path.insert(0, ".")
+    from agent.router import _redact_frame
+    from ag_ui.encoder import EventEncoder
+    from ag_ui.core.events import RunFinishedEvent
+
+    event = RunFinishedEvent(
+        thread_id="thread-1", run_id="run-1",
+        outcome={"type": "interrupt", "interrupts": [{
+            "id": "i1", "reason": "tool_call",
+            "message": "approve request-only-key tool", "toolCallId": "c1",
+        }]},
+    )
+    frame = _redact_frame(EventEncoder().encode(event), "request-only-key")
+    assert "request-only-key" not in frame
+    assert "[redacted]" in frame
+
+
+@pytest.mark.asyncio
+async def test_approval_wait_accounted_and_active_excludes_it(tmp_path):
+    """评审修复6：审批等待计入 approval_wait_ms，active 时长扣除审批等待。"""
+    import time as _time
+    coordinator, threads, runs = make_coordinator(tmp_path)
+    admission = await start(coordinator, protocol_run_id="protocol-1", revision=None)
+    handle = coordinator.active("thread-1")
+    handle.phase = "awaiting_approval"
+    handle.pending_interrupts = [PendingInterrupt(
+        bridge_interrupt_id="int-1", order=0, tool_call_id="call-1",
+        value={"action_requests": [{"name": "t", "args": {}, "description": "d"}], "review_configs": [{}]},
+    )]
+    handle.journal.persist_interrupt(handle.pending_interrupts)
+    _time.sleep(0.05)
+    await coordinator.acquire_resume(
+        "thread-1",
+        model_ref=MODEL_REF,
+        secrets=SECRETS,
+        model_builder=CountingBuilder(),
+        validate=lambda pending: {"int-1": {"accepted": True}},
+        client_revision=handle.thread_revision,
+        protocol_run_id="protocol-2",
+    )
+    await coordinator.finish_if_terminal("thread-1", "completed")
+
+    run = runs.get(admission.run.id)
+    assert run.approval_wait_ms >= 40  # 审批等待已被结算
+    assert run.active_elapsed_ms <= run.elapsed_ms  # active 扣除了审批等待
+    # 直接驱动协调器（无流式事件）时 usage 计数为 0 也必须持久化，字段不缺失
+    assert set(run.usage.model_dump()) == {"model_calls", "tool_calls", "input_tokens", "output_tokens"}

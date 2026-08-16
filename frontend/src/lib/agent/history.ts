@@ -83,11 +83,17 @@ export function toThreadMessageLike(
     : message.partial
       ? { type: "incomplete" as const, reason: "cancelled" as const }
       : undefined;
+  // 锁定 runtime 从 metadata.custom["ag-ui"].interrupts 恢复待审批中断：
+  // 不写入则刷新后 getPendingInterrupts() 为空，无法 resume / steer-away
+  const metadata = message.pending_interrupt && message.interrupts.length > 0
+    ? { custom: { "ag-ui": { interrupts: message.interrupts } } }
+    : undefined;
   return {
     id: message.id,
     role: "assistant",
     content: content as unknown as ThreadMessageLike["content"],
     status,
+    metadata,
     createdAt: dateOf(message.created_at),
   };
 }

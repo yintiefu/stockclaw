@@ -155,3 +155,20 @@ describe("AgentHistoryController", () => {
     await expect(controller.rename("th-1", "再次改名")).rejects.toBeInstanceOf(AgentApiError);
   });
 });
+
+it("水合 pending interrupt 元数据到 metadata.custom['ag-ui'].interrupts", async () => {
+  const doc: AgentThread = {
+    ...threaded("th-4", 2, "2026-08-15T12:00:00Z"),
+    messages: [{
+      id: "a-pending", role: "assistant", content: "", partial: false, pending_interrupt: true,
+      interrupts: [{ id: "int-1", reason: "tool_call", toolCallId: "call-1", responseSchema: { type: "object" } }],
+      tool_calls: [], tool_call_id: null, created_at: null,
+    }],
+  };
+  const repo = exportRepositoryOf(doc);
+  const pending = repo.messages[0].message;
+  expect(pending.status).toEqual({ type: "requires-action", reason: "interrupt" });
+  const custom = (pending.metadata as { custom?: Record<string, { interrupts?: unknown[] }> } | undefined)?.custom;
+  const interrupts = custom?.["ag-ui"]?.interrupts as Array<Record<string, unknown>>;
+  expect(interrupts?.[0]).toMatchObject({ id: "int-1", reason: "tool_call", toolCallId: "call-1" });
+});
