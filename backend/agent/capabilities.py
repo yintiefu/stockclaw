@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+
+from langchain_core.messages import AIMessage
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
@@ -157,11 +159,10 @@ class McpArgumentGuard(AgentMiddleware):
                              separators=(",", ":"))
         return len(encoded.encode("utf-8"))
 
-    async def awrap_model_call(self, state, runtime, call_llm, **kwargs):
-        from langchain_core.messages import AIMessage
-
-        response = await call_llm(**kwargs)
-        messages = response if isinstance(response, list) else [response]
+    async def awrap_model_call(self, request, call_llm, **kwargs):
+        """langchain 中间件协议：await handler(request)；此处 request 为 ModelRequest。"""
+        response = await call_llm(request)
+        messages = self._result_messages(response)
         for message in messages:
             if not isinstance(message, AIMessage):
                 continue
@@ -171,6 +172,29 @@ class McpArgumentGuard(AgentMiddleware):
                         raise McpArgumentsTooLarge(
                             f"{McpArgumentsTooLarge.code}: MCP tool call 参数超过 64 KB")
         return response
+
+    @staticmethod
+    def _result_messages(response) -> list:
+        """从 ModelResponse / ExtendedModelResponse / list 归一化出消息列表。"""
+        if isinstance(response, list):
+            return response
+        for attr in ("messages", "result", "generations"):
+            inner = getattr(response, attr, None)
+            if inner is None:
+                continue
+            if isinstance(inner, list) and inner and hasattr(inner[0], "message"):
+                return [g.message for g in inner]  # ChatGeneration 列表
+            if isinstance(inner, list):
+                return inner
+            generations = getattr(inner, "generations", None)
+            if generations and hasattr(generations[0], "message"):
+                return [g.message for g in generations]
+        result = getattr(response, "result", None)
+        if result is not None and isinstance(result, AIMessage):
+            return [result]
+        if isinstance(response, AIMessage):
+            return [response]
+        return []
 
 
 class AllowanceRegistry:
