@@ -12,11 +12,11 @@ from ag_ui.core.events import BaseEvent, RunErrorEvent, RunFinishedEvent
 from ag_ui.core.types import RunAgentInput
 from ag_ui.encoder import EventEncoder
 import anyio
-from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi import APIRouter, File, Form, Query, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import BaseTool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from agent.models import ModelRef, RunSecrets, RunSummary, RuntimeForwardedProps, ThreadDocument
 from agent.protocol import AgentProtocolBridge, PendingInterrupt, thread_revision_updated
@@ -43,6 +43,7 @@ from agent.stores import (
     reconcile_agent_data,
     utc_now,
 )
+from agent.skills import SkillError, SkillImporter, SkillRegistry, SkillResourceForbidden, SkillUnavailable
 from agent.tool_registry import build_builtin_tools
 
 router = APIRouter(prefix="/api/agent")
@@ -54,6 +55,8 @@ class AgentServices:
     threads: ThreadStore
     runs: RunStore
     coordinator: RunCoordinator
+    skills: SkillRegistry
+    importer: SkillImporter
 
 
 def build_services(root: Path | None = None) -> AgentServices:
@@ -61,7 +64,9 @@ def build_services(root: Path | None = None) -> AgentServices:
     threads = ThreadStore(paths)
     runs = RunStore(paths)
     coordinator = RunCoordinator(factory=AgentFactory(), threads=threads, runs=runs)
-    return AgentServices(paths, threads, runs, coordinator)
+    skills = SkillRegistry(paths.skills)
+    importer = SkillImporter(paths.skills, skills)
+    return AgentServices(paths, threads, runs, coordinator, skills, importer)
 
 
 services = build_services()
@@ -468,7 +473,14 @@ class ThreadCreate(BaseModel):
 
 class ThreadPatch(BaseModel):
     revision: int = Field(ge=0)
-    title: str = Field(min_length=1)
+    title: str | None = Field(default=None, min_length=1)
+    selected_skills: list[str] | None = None
+
+    @model_validator(mode="after")
+    def require_change(self):
+        if self.title is None and self.selected_skills is None:
+            raise ValueError("至少提交 title 或 selected_skills")
+        return self
 
 
 class ThreadSummaryResponse(BaseModel):
@@ -542,7 +554,16 @@ async def get_thread(thread_id: str):
 @router.patch("/threads/{thread_id}")
 async def patch_thread(thread_id: str, payload: ThreadPatch):
     try:
-        updated = await services.coordinator.patch_thread(thread_id, payload.revision, payload.title)
+        selected = payload.selected_skills
+        if selected is not None:
+            try:
+                # 与一次当前 generation 对照校验 + 去重（写前在 coordinator 线程锁内复检）
+                selected = await _validate_selected_skills(selected)
+            except SkillError as exc:
+                return _skill_error_response(exc)
+        updated = await services.coordinator.patch_thread(
+            thread_id, payload.revision, payload.title, selected,
+        )
     except InvalidDocumentId as exc:
         return _store_error_response(exc, 400)
     except DocumentNotFound as exc:
@@ -604,6 +625,154 @@ async def get_run(run_id: str):
     return run.model_dump(mode="json")
 
 
+# ---- 1C：Skill 管理 REST ----
+
+
+def _skill_error_response(exc: Exception, *, scripts_403: bool = True) -> JSONResponse:
+    code = getattr(exc, "code", "SKILL_INVALID")
+    status = 400
+    if code == "SKILL_UNAVAILABLE":
+        status = 404
+    elif code == "SKILL_CONFLICT":
+        status = 409
+    elif code == "SKILL_IN_USE":
+        status = 409
+    elif code == "SKILL_RESOURCE_FORBIDDEN":
+        status = 403
+    return JSONResponse(status_code=status, content={"code": code, "detail": str(exc)})
+
+
+async def _validate_selected_skills(names: list[str]) -> list[str]:
+    """对照同一个当前 generation 校验并去重；名称缺失返回 400。"""
+    generation = await asyncio.to_thread(services.skills.current)
+    if generation is None:
+        generation = await asyncio.to_thread(services.skills.refresh)
+    valid_names = {r.name for r in generation.skills if r.valid}
+    deduped: list[str] = []
+    for name in names:
+        if name not in valid_names:
+            raise SkillUnavailable(f"Skill 不存在或不可用: {name}")
+        if name not in deduped:
+            deduped.append(name)
+    return deduped
+
+
+class SkillFileResponse(BaseModel):
+    relative_path: str
+    category: str
+    size: int
+    mtime_ns: int
+    sha256: str
+    mime: str | None
+    downloadable: bool
+
+
+class SkillRecordResponse(BaseModel):
+    directory: str
+    name: str | None
+    description: str | None
+    digest: str | None
+    valid: bool
+    error_code: str | None = None
+    error_detail: str | None = None
+    files: list[SkillFileResponse] = []
+    instructions: str | None = None  # 仅 detail 返回
+
+
+def _skill_response(record, *, with_instructions: bool) -> SkillRecordResponse:
+    return SkillRecordResponse(
+        directory=record.directory, name=record.name, description=record.description,
+        digest=record.digest, valid=record.valid, error_code=record.error_code,
+        error_detail=record.error_detail,
+        files=[SkillFileResponse(**{
+            "relative_path": f.relative_path, "category": f.category, "size": f.size,
+            "mtime_ns": f.mtime_ns, "sha256": f.sha256, "mime": f.mime,
+            "downloadable": f.downloadable}) for f in record.files],
+        instructions=record.instructions if with_instructions else None,
+    )
+
+
+@router.get("/skills")
+async def list_skills():
+    generation = await asyncio.to_thread(services.skills.refresh)
+    return {
+        "generation": generation.number,
+        "skills": [_skill_response(r, with_instructions=False).model_dump() for r in generation.skills],
+    }
+
+
+@router.get("/skills/{skill_name}")
+async def get_skill(skill_name: str):
+    try:
+        record = await asyncio.to_thread(services.skills.require, skill_name)
+    except SkillError as exc:
+        return _skill_error_response(exc)
+    return _skill_response(record, with_instructions=True).model_dump()
+
+
+@router.post("/skills/import")
+async def import_skill(
+    archive: UploadFile = File(...),
+    overwrite: bool = Form(False),
+    expected_digest: str | None = Form(None),
+):
+    try:
+        staged = await services.importer.receive(archive)
+        result = await asyncio.to_thread(
+            services.importer.install, staged, overwrite=overwrite,
+            expected_digest=expected_digest,
+        )
+    except SkillError as exc:
+        return _skill_error_response(exc)
+    return {"record": _skill_response(result.record, with_instructions=True).model_dump(),
+            "created": result.created}
+
+
+@router.post("/skills/refresh")
+async def refresh_skills():
+    generation = await asyncio.to_thread(services.skills.refresh)
+    return {"generation": generation.number}
+
+
+@router.delete("/skills/{skill_name}")
+async def delete_skill(skill_name: str, expected_digest: str = Query(...)):
+    try:
+        record = await asyncio.to_thread(services.importer.delete, skill_name, expected_digest)
+    except SkillError as exc:
+        return _skill_error_response(exc)
+    return {"deleted": record.name}
+
+
+_SAFE_INLINE_MIMES = {
+    "image/png", "image/jpeg", "image/webp", "image/gif",
+    "application/pdf", "text/plain", "text/markdown", "application/json",
+}
+
+
+@router.get("/skills/{skill_name}/files/{relative_path:path}")
+async def get_skill_file(skill_name: str, relative_path: str):
+    try:
+        record, entry, path = await asyncio.to_thread(
+            services.skills.resolve_file, skill_name, relative_path)
+    except SkillError as exc:
+        return _skill_error_response(exc)
+    if not entry.downloadable or entry.mime not in _SAFE_INLINE_MIMES:
+        return _skill_error_response(
+            SkillResourceForbidden("该资源不允许下载或预览"))
+    disposition = "inline" if entry.mime.startswith(("image/", "text/")) or entry.mime in (
+        "application/json", "application/pdf") else "attachment"
+    filename = f"{record.directory}--{entry.relative_path.replace('/', '--')}"
+    return FileResponse(
+        path, media_type=entry.mime,
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "sandbox; default-src 'none'",
+            "Content-Disposition": f'{disposition}; filename="{filename}"',
+        },
+    )
+
+
+
 def _new_thread_id() -> str:
     from uuid import uuid4
 
@@ -617,6 +786,9 @@ async def startup_agent_services() -> None:
     # 调用时再解引用模块级 services，测试可先 monkeypatch 再进入 lifespan
     current = services
     await asyncio.to_thread(reconcile_agent_data, current.paths, current.threads, current.runs)
+    # 1C：Skill 导入恢复 + 首次扫描（不连接网络，也不触碰默认数据根以外的目录）
+    await asyncio.to_thread(current.importer.recover)
+    await asyncio.to_thread(current.skills.refresh)
 
 
 async def shutdown_agent_services() -> None:

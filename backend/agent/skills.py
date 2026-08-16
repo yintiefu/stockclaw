@@ -646,6 +646,12 @@ class SkillImporter:
                 _remove_tree(stage)
             Path(upload_path).unlink(missing_ok=True)
             return SkillInstallResult(record=record, created=created)
+        except SkillArchiveRejected:
+            # 无效压缩包：立即清理暂存与上传，不留 residue
+            if stage is not None and stage.exists():
+                _remove_tree(stage)
+            Path(upload_path).unlink(missing_ok=True)
+            raise
         except BaseException:
             if stage is not None and stage.exists():
                 _remove_tree(stage)
@@ -662,6 +668,7 @@ class SkillImporter:
             if target.exists():
                 _remove_tree(target)
                 _fsync_dir(self._root)
+            self._registry.refresh()
             return record
 
     # ---- 恢复 ----

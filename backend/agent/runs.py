@@ -1084,12 +1084,18 @@ class RunCoordinator:
             raise RuntimeError("RunCoordinator 未注入 ThreadStore/RunStore（1A 纯内存构造）")
         return self._threads, self._runs
 
-    async def patch_thread(self, thread_id: str, revision: int, title: str):
+    async def patch_thread(self, thread_id: str, revision: int, title: str | None,
+                           selected_skills: list[str] | None = None):
         threads, _ = self._require_stores()
         async with self._lock(thread_id):
+            changes: dict = {}
+            if title is not None:
+                changes["title"] = title
+            if selected_skills is not None:
+                changes["selected_skills"] = list(selected_skills)
             updated = await asyncio.to_thread(
                 threads.update, thread_id, revision,
-                lambda doc: doc.model_copy(update={"title": title}),
+                lambda doc: doc.model_copy(update=changes),
             )
             handle = self._handles.get(thread_id)
             if handle is not None:
