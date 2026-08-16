@@ -133,3 +133,53 @@ export type SkillImportResult = {
   record: SkillDetail;
   created: boolean;
 };
+
+/** Task 1C 切片 2：MCP 管理类型。 */
+export type McpEnvReference = { from_env: string };
+
+export type McpStdioTransport = {
+  type: "stdio";
+  executable: string;
+  args: string[];
+  env: Record<string, McpEnvReference>;
+};
+
+export type McpHttpTransport = {
+  type: "streamable_http";
+  url: string;
+  headers: Record<string, McpEnvReference>;
+};
+
+export type McpToolEntry = {
+  original_name: string;
+  alias: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+  enabled: boolean;
+  discovered_at: string;
+};
+
+export type McpServer = {
+  id: string;
+  display_name: string;
+  enabled: boolean;
+  transport: McpStdioTransport | McpHttpTransport;
+  trust_fingerprint: string | null;
+  trusted_at: string | null;
+  tools: McpToolEntry[];
+  health: { state: "unknown" | "ok" | "unreachable" | "error"; detail: string; checked_at: string };
+};
+
+export type McpDocument = {
+  schema_version: 1;
+  revision: number;
+  servers: McpServer[];
+  recovery_warnings?: string[];
+};
+
+export type StdioTrustPreview = {
+  executable: string;
+  resolved_executable: string;
+  args: string[];
+  fingerprint: string;
+};

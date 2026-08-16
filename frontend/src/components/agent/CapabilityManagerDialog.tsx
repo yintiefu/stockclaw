@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 
 import { agentApi } from "@/lib/agent/api";
 import type { AgentThread, SkillSummary } from "@/lib/agent/types";
+import { McpManager } from "./McpManager";
 import { SkillManager } from "./SkillManager";
 
 type Props = {
@@ -105,6 +106,9 @@ export function CapabilityManagerDialog({
         <div className="border-t border-border pt-3">
           <h3 className="mb-2 text-xs font-semibold text-muted-foreground">导入 / 管理 Skill</h3>
           <SkillManager skills={skills} disabled={disabled || busy} onChanged={onConflict} />
+        </div>
+        <div className="mt-4 border-t border-border pt-3">
+          <McpManager disabled={disabled || busy} onReload={() => onConflict()} />
         </div>
       </div>
     </div>

@@ -44,6 +44,14 @@ from agent.stores import (
     utc_now,
 )
 from agent.capabilities import CapabilityResolver
+from agent.mcp import (
+    McpError,
+    McpRegistry,
+    McpRevisionConflict,
+    McpSecretMissing,
+    McpServerNotFound,
+    StdioTrustRequired,
+)
 from agent.skills import SkillError, SkillImporter, SkillRegistry, SkillResourceForbidden, SkillUnavailable
 from agent.tool_registry import build_builtin_tools
 
@@ -58,6 +66,7 @@ class AgentServices:
     coordinator: RunCoordinator
     skills: SkillRegistry
     importer: SkillImporter
+    registry: McpRegistry
 
 
 def build_services(root: Path | None = None) -> AgentServices:
@@ -67,6 +76,8 @@ def build_services(root: Path | None = None) -> AgentServices:
     coordinator = RunCoordinator(factory=AgentFactory(), threads=threads, runs=runs)
     skills = SkillRegistry(paths.skills)
     importer = SkillImporter(paths.skills, skills)
+    registry = McpRegistry.for_root(paths.root)
+
     def _run_tools(skill_tools=()):
         # 测试接缝：1A/1B 通过 monkeypatch agent.router.build_builtin_tools 注入
         return [*build_builtin_tools(), *skill_tools]
@@ -76,7 +87,7 @@ def build_services(root: Path | None = None) -> AgentServices:
         resolver=CapabilityResolver(skills, tools_provider=_run_tools),
         middleware_provider=lambda: build_middleware(),
     )
-    return AgentServices(paths, threads, runs, coordinator, skills, importer)
+    return AgentServices(paths, threads, runs, coordinator, skills, importer, registry)
 
 
 services = build_services()
@@ -783,6 +794,164 @@ async def get_skill_file(skill_name: str, relative_path: str):
 
 
 
+# ---- 1C 切片 2：MCP 管理 REST ----
+
+
+def _mcp_error_response(exc: Exception) -> JSONResponse:
+    code = getattr(exc, "code", "MCP_CONFIG_ERROR")
+    if "STDIO_FINGERPRINT_MISMATCH" in str(exc):
+        code = "STDIO_FINGERPRINT_MISMATCH"
+    status = 400
+    if code == "MCP_SERVER_NOT_FOUND":
+        status = 404
+    elif code in ("MCP_REVISION_CONFLICT", "STDIO_TRUST_REQUIRED",
+                  "STDIO_FINGERPRINT_MISMATCH", "MCP_CONFIG_BUSY"):
+        status = 409
+    elif code == "MCP_CONFIG_CORRUPT":
+        status = 500
+    payload: dict = {"code": code, "detail": str(exc)}
+    if isinstance(exc, StdioTrustRequired):
+        payload["preview"] = {
+            "executable": exc.preview.executable,
+            "resolved_executable": exc.preview.resolved_executable,
+            "args": exc.preview.args,
+            "fingerprint": exc.preview.fingerprint,
+        }
+    return JSONResponse(status_code=status, content=payload)
+
+
+class McpAction(BaseModel):
+    revision: int = Field(ge=0)
+
+
+class McpAdd(BaseModel):
+    revision: int = Field(ge=0)
+    server: dict
+
+
+class McpPatch(BaseModel):
+    revision: int = Field(ge=0)
+    server: dict | None = None
+    tool_enabled: dict[str, bool] | None = None
+
+
+class McpTrust(BaseModel):
+    revision: int = Field(ge=0)
+    fingerprint: str
+
+
+@router.get("/mcp")
+async def get_mcp_document():
+    try:
+        doc = await asyncio.to_thread(services.registry.store.load)
+    except McpError as exc:
+        return _mcp_error_response(exc)
+    return doc.model_dump(mode="json")
+
+
+@router.post("/mcp")
+async def add_mcp_server(payload: McpAdd):
+    try:
+        server = await asyncio.to_thread(services.registry.store.validate_server, payload.server)
+        doc = await services.registry.add(server)
+    except McpError as exc:
+        return _mcp_error_response(exc)
+    except Exception as exc:  # pydantic 校验失败 → 400
+        return JSONResponse(status_code=400, content={"code": "MCP_CONFIG_ERROR", "detail": str(exc)})
+    return doc.model_dump(mode="json")
+
+
+@router.patch("/mcp/{server_id}")
+async def patch_mcp_server(server_id: str, payload: McpPatch):
+    from agent.mcp import StdioTransport, StreamableHttpTransport
+
+    def mutate(server):
+        updated = server
+        if payload.server is not None:
+            fields = payload.server
+            changes = {}
+            for key in ("display_name", "enabled"):
+                if key in fields:
+                    changes[key] = fields[key]
+            if "transport" in fields:
+                changes["transport"] = (
+                    StdioTransport.model_validate(fields["transport"])
+                    if fields["transport"].get("type") == "stdio"
+                    else StreamableHttpTransport.model_validate(fields["transport"]))
+            updated = server.model_copy(update=changes)
+        if payload.tool_enabled is not None:
+            tools = []
+            for tool in updated.tools:
+                enabled = payload.tool_enabled.get(tool.original_name, tool.enabled)
+                tools.append(tool.model_copy(update={"enabled": bool(enabled)}))
+            updated = updated.model_copy(update={"tools": tools})
+        return updated
+
+    try:
+        doc = await services.registry.patch_server(server_id, payload.revision, mutate)
+    except McpError as exc:
+        return _mcp_error_response(exc)
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"code": "MCP_CONFIG_ERROR", "detail": str(exc)})
+    return doc.model_dump(mode="json")
+
+
+@router.delete("/mcp/{server_id}")
+async def delete_mcp_server(server_id: str, revision: int = Query(...)):
+    try:
+        warnings = await services.registry.delete(server_id, revision)
+    except McpError as exc:
+        return _mcp_error_response(exc)
+    doc = await asyncio.to_thread(services.registry.store.load)
+    payload = doc.model_dump(mode="json")
+    payload["recovery_warnings"] = warnings
+    return payload
+
+
+@router.post("/mcp/{server_id}/trust")
+async def trust_mcp_server(server_id: str, payload: McpTrust):
+    try:
+        doc = await services.registry.trust(server_id, payload.fingerprint, payload.revision)
+    except McpError as exc:
+        if "STDIO_FINGERPRINT_MISMATCH" in str(exc):
+            preview = await services.registry.trust_preview(server_id)
+            return JSONResponse(status_code=409, content={
+                "code": "STDIO_FINGERPRINT_MISMATCH",
+                "detail": "指纹不匹配",
+                "preview": {
+                    "executable": preview.executable,
+                    "resolved_executable": preview.resolved_executable,
+                    "args": preview.args,
+                    "fingerprint": preview.fingerprint,
+                },
+            })
+        return _mcp_error_response(exc)
+    return doc.model_dump(mode="json")
+
+
+@router.post("/mcp/{server_id}/test")
+async def test_mcp_server(server_id: str, payload: McpAction):
+    try:
+        health = await services.registry.test(server_id)
+    except McpError as exc:
+        return _mcp_error_response(exc)
+    doc = await asyncio.to_thread(services.registry.store.load)
+    payload_out = doc.model_dump(mode="json")
+    payload_out["health"] = health.model_dump(mode="json")
+    return payload_out
+
+
+@router.post("/mcp/{server_id}/refresh")
+async def refresh_mcp_server(server_id: str, payload: McpAction):
+    try:
+        await services.registry.refresh(server_id)
+    except McpError as exc:
+        return _mcp_error_response(exc)
+    doc = await asyncio.to_thread(services.registry.store.load)
+    return doc.model_dump(mode="json")
+
+
+
 def _new_thread_id() -> str:
     from uuid import uuid4
 
@@ -803,3 +972,5 @@ async def startup_agent_services() -> None:
 
 async def shutdown_agent_services() -> None:
     await services.coordinator.shutdown()
+    # coordinator lease 释放后排空 MCP 会话
+    await services.registry.shutdown()

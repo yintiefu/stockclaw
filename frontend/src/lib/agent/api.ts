@@ -9,6 +9,7 @@ import type {
   SkillDetail,
   SkillImportResult,
   SkillListResponse,
+  McpDocument,
 } from "./types";
 
 export class AgentApiError extends Error {
@@ -98,6 +99,30 @@ export const agentApi = {
       }
       return await response.json() as { deleted: string };
     }),
+  getMcp: () => agentRequest<McpDocument>("/api/agent/mcp"),
+  addMcp: (revision: number, server: Record<string, unknown>) =>
+    agentRequest<McpDocument>("/api/agent/mcp", "POST", { revision, server }),
+  patchMcp: (
+    serverId: string,
+    revision: number,
+    patch: { server?: Record<string, unknown>; tool_enabled?: Record<string, boolean> },
+  ) =>
+    agentRequest<McpDocument>(
+      `/api/agent/mcp/${encodeURIComponent(serverId)}`, "PATCH",
+      { revision, ...patch },
+    ),
+  deleteMcp: (serverId: string, revision: number) =>
+    agentRequest<McpDocument & { recovery_warnings: string[] }>(
+      `/api/agent/mcp/${encodeURIComponent(serverId)}?revision=${revision}`, "DELETE"),
+  trustMcp: (serverId: string, revision: number, fingerprint: string) =>
+    agentRequest<McpDocument>(`/api/agent/mcp/${encodeURIComponent(serverId)}/trust`, "POST",
+      { revision, fingerprint }),
+  testMcp: (serverId: string, revision: number) =>
+    agentRequest<McpDocument & { health: McpDocument["servers"][number]["health"] }>(
+      `/api/agent/mcp/${encodeURIComponent(serverId)}/test`, "POST", { revision }),
+  refreshMcp: (serverId: string, revision: number) =>
+    agentRequest<McpDocument>(`/api/agent/mcp/${encodeURIComponent(serverId)}/refresh`, "POST",
+      { revision }),
   fetchSkillFile: async (name: string, relativePath: string): Promise<Blob> => {
     const response = await fetch(
       `/api/agent/skills/${encodeURIComponent(name)}/files/${relativePath
