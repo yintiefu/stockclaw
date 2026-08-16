@@ -52,6 +52,14 @@ class AgentPaths:
     def skills(self) -> Path:
         return self.root / "skills"
 
+    @property
+    def mcp_config(self) -> Path:
+        return self.root / "mcp.json"
+
+    @property
+    def mcp_work(self) -> Path:
+        return self.root / "mcp-work"
+
 
 class StoreError(RuntimeError):
     code = "AGENT_STORE_ERROR"

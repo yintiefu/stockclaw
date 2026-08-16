@@ -81,38 +81,12 @@ _PRIVATE_NETS = [ipaddress.ip_network(n) for n in
                  ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "::1/128", "fc00::/7")]
 
 
-def _ip_blocked(host: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return False  # 非字面 IP（域名）——交给 _check_base_url 决定是否解析核对
-    if any(ip in n for n in _METADATA_NETS):  # 云元数据 / 链路本地：SSRF 头号目标，始终禁
-        return True
-    if _PUBLIC_MODE and any(ip in n for n in _PRIVATE_NETS):  # 公网姿态再禁内网 / 本机
-        return True
-    return False
-
-
 def _check_base_url(url: str) -> None:
-    """挡住把用户自带 baseURL 指向云元数据 / 内网的 SSRF。
-    本地单用户（未设 VR_API_KEY）放行 127.0.0.1 等本机地址（方便接本机 Ollama / 网关），只挡 169.254 元数据；
-    公网部署（设了 VR_API_KEY）额外禁内网，并解析域名核对，防 DNS 指向内网。"""
-    p = urlparse(url or "")
-    if p.scheme not in ("http", "https"):
-        raise RuntimeError("Base URL 必须以 http:// 或 https:// 开头")
-    host = p.hostname or ""
-    if not host:
-        raise RuntimeError("Base URL 缺少主机名")
-    if _ip_blocked(host):
-        raise RuntimeError("Base URL 指向了不允许的地址（云元数据 / 内网）")
-    if _PUBLIC_MODE:  # 公网姿态：域名也解析核对，防 DNS rebinding 指向内网
-        try:
-            infos = socket.getaddrinfo(host, None)
-        except socket.gaierror as e:
-            raise RuntimeError("Base URL 域名无法解析") from e
-        for info in infos:
-            if _ip_blocked(info[4][0]):
-                raise RuntimeError("Base URL 解析到了不允许的内网地址")
+    """兼容包装：模型 BaseURL 的既有校验语义不变，策略移至 agent.ssrf。"""
+    from agent.ssrf import validate_outbound_url
+
+    validate_outbound_url(url, public_mode=_PUBLIC_MODE,
+                          require_public_https=False, allow_query=False, allow_userinfo=False)
 
 
 def _call_llm(cfg: dict, messages: list, use_tools: bool) -> dict:
