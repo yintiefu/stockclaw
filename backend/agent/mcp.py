@@ -308,3 +308,432 @@ class McpConfigStore:
             return doc.model_copy(update={"servers": servers})
 
         return self.update(expected_revision, mutate)
+
+
+# ---------------------------------------------------------------------------
+# Registry：连接、信任与会话世代（Task 8 先落 stdio；Task 9 补 HTTP/目录）
+# ---------------------------------------------------------------------------
+
+import asyncio
+import hashlib
+import shutil as _shutil
+from dataclasses import dataclass, field
+
+CONNECT_TIMEOUT = 15.0
+CALL_TIMEOUT = 60.0
+HEALTH_DETAIL_LIMIT = 500
+
+
+@dataclass(frozen=True)
+class StdioTrustPreview:
+    executable: str
+    resolved_executable: str
+    args: list[str]
+    fingerprint: str
+
+
+class StdioTrustRequired(McpError):
+    code = "STDIO_TRUST_REQUIRED"
+
+    def __init__(self, preview: StdioTrustPreview):
+        super().__init__(f"{self.code}: stdio server 需要信任确认后才能启动")
+        self.preview = preview
+
+
+def stdio_fingerprint(resolved_executable: str, args: list[str] | tuple[str, ...]) -> str:
+    canonical = json.dumps(
+        {"resolved_executable": resolved_executable, "args": list(args)},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _resolve_executable(executable: str) -> str:
+    """PATH 查找 + 绝对化；不解析符号链接（venv python 的 symlink 语义必须保留）。"""
+    import os
+
+    resolved = _shutil.which(executable) or executable
+    return os.path.abspath(resolved)
+
+
+def _redact_text(text: str, secrets: set[str]) -> str:
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    return text
+
+
+@dataclass
+class _SessionGeneration:
+    number: int
+    server_id: str = ""
+    state: str = "accepting"  # accepting | draining | closed
+    in_flight: int = 0
+    client: "object | None" = None
+    tools: dict = field(default_factory=dict)
+    supervisor: "asyncio.Task | None" = None
+    ready: "asyncio.Event" = field(default_factory=asyncio.Event)
+    stop_event: "asyncio.Event" = field(default_factory=asyncio.Event)
+    error: "str | None" = None
+
+
+class _AsyncExitStack:
+    """占位兼容（真实类型来自 contextlib）。"""
+
+    def __init__(self):
+        from contextlib import AsyncExitStack as _Real
+
+        self._real = _Real()
+
+    async def aclose(self):
+        await self._real.__aexit__(None, None, None)
+
+
+class McpRegistry:
+    """管理面 MCP 连接注册表：信任、会话世代与受限调用包装。
+
+    每个会话世代由独立的 supervisor task 持有（anyio cancel scope 要求
+    进入/退出同一 task）；关闭 = 置位 stop 事件并在有界时间内等待。
+    secret set 只在实例内用于脱敏，关闭时清空。
+    """
+
+    def __init__(self, store: McpConfigStore, work_root: Path):
+        self.store = store
+        self._work_root = Path(work_root)
+        self._sessions: dict[str, _SessionGeneration] = {}
+        self._server_locks: dict[str, asyncio.Lock] = {}
+        self._state_lock = asyncio.Lock()
+        self._counter = 0
+        self._secret_sets: dict[str, set[str]] = {}
+        self._shutting_down = False
+
+    @classmethod
+    def for_root(cls, root: Path) -> "McpRegistry":
+        root = Path(root)
+        return cls(McpConfigStore(root / "mcp.json"), root / "mcp-work")
+
+    # ---- 状态 ----
+
+    @property
+    def process_count(self) -> int:
+        return sum(1 for gen in self._sessions.values() if gen.state != "closed")
+
+    def _server_lock(self, server_id: str) -> asyncio.Lock:
+        if server_id not in self._server_locks:
+            self._server_locks[server_id] = asyncio.Lock()
+        return self._server_locks[server_id]
+
+    def _require_server(self, doc: McpDocument, server_id: str) -> McpServer:
+        server = next((s for s in doc.servers if s.id == server_id), None)
+        if server is None:
+            raise McpServerNotFound(f"MCP server 不存在: {server_id}")
+        return server
+
+    # ---- 配置面 ----
+
+    async def add(self, server: McpServer) -> McpDocument:
+        def mutate(doc: McpDocument) -> McpDocument:
+            if any(s.id == server.id for s in doc.servers):
+                raise McpError(f"server 已存在: {server.id}")
+            return doc.model_copy(update={"servers": [*doc.servers, server]})
+
+        return await asyncio.to_thread(self.store.update, self.store.load().revision, mutate)
+
+    async def patch_server(self, server_id: str, revision: int, mutate) -> McpDocument:
+        def change(doc: McpDocument) -> McpDocument:
+            server = self._require_server(doc, server_id)
+            updated = mutate(server)
+            old_transport = server.transport
+            new_transport = updated.transport
+            fingerprint_cleared = (
+                isinstance(old_transport, StdioTransport)
+                and isinstance(new_transport, StdioTransport)
+                and (old_transport.executable != new_transport.executable
+                     or old_transport.args != new_transport.args)
+            )
+            if fingerprint_cleared:
+                updated = updated.model_copy(update={"trust_fingerprint": None, "trusted_at": None})
+            servers = [updated if s.id == server_id else s for s in doc.servers]
+            return doc.model_copy(update={"servers": servers})
+
+        return await asyncio.to_thread(self.store.update, revision, change)
+
+    async def delete(self, server_id: str, revision: int) -> list[str]:
+        await self._close_server(server_id)
+        warnings: list[str] = []
+
+        def change(doc: McpDocument) -> McpDocument:
+            self._require_server(doc, server_id)
+            servers = [s for s in doc.servers if s.id != server_id]
+            return doc.model_copy(update={"servers": servers})
+
+        await asyncio.to_thread(self.store.update, revision, change)
+        work = self._work_root / server_id
+        if work.is_dir():
+            try:
+                next(work.iterdir())
+                non_empty = True
+            except StopIteration:
+                non_empty = False
+            if non_empty:
+                warnings.append(f"mcp-work/{server_id} 非空，已保留为用户数据")
+            else:
+                import shutil
+
+                shutil.rmtree(work, ignore_errors=True)
+        self._secret_sets.pop(server_id, None)
+        return warnings
+
+    async def trust(self, server_id: str, fingerprint: str, revision: int) -> McpDocument:
+        doc = await asyncio.to_thread(self.store.load)
+        server = self._require_server(doc, server_id)
+        if not isinstance(server.transport, StdioTransport):
+            raise McpError("只有 stdio server 需要信任")
+        resolved = await asyncio.to_thread(_resolve_executable, server.transport.executable)
+        current = stdio_fingerprint(resolved, server.transport.args)
+        if current != fingerprint:
+            raise McpError("STDIO_FINGERPRINT_MISMATCH: 页面显示的指纹与当前解析结果不一致")
+
+        def change(d: McpDocument) -> McpDocument:
+            servers = []
+            for s in d.servers:
+                if s.id == server_id:
+                    s = s.model_copy(update={"trust_fingerprint": current, "trusted_at": _utc_now()})
+                servers.append(s)
+            return d.model_copy(update={"servers": servers})
+
+        return await asyncio.to_thread(self.store.update, revision, change)
+
+    # ---- 连接面 ----
+
+    def _stdio_trust_preview(self, server: McpServer) -> StdioTrustPreview:
+        transport = server.transport
+        assert isinstance(transport, StdioTransport)
+        resolved = _resolve_executable(transport.executable)
+        return StdioTrustPreview(
+            executable=transport.executable,
+            resolved_executable=resolved,
+            args=list(transport.args),
+            fingerprint=stdio_fingerprint(resolved, transport.args),
+        )
+
+    async def trust_preview(self, server_id: str) -> StdioTrustPreview:
+        """当前解析出的信任预览（UI 显示与 POST /trust 的一致性来源）。"""
+        doc = await asyncio.to_thread(self.store.load)
+        server = self._require_server(doc, server_id)
+        if not isinstance(server.transport, StdioTransport):
+            raise McpError("只有 stdio server 需要信任")
+        return await asyncio.to_thread(self._stdio_trust_preview, server)
+
+    def _spawn_supervisor(self, server: McpServer, generation: _SessionGeneration) -> None:
+        """supervisor task：同一 task 内进出 SDK context（anyio cancel scope 约束）。"""
+
+        async def _run() -> None:
+            from contextlib import AsyncExitStack
+
+            stack = AsyncExitStack()
+            try:
+                if isinstance(server.transport, StdioTransport):
+                    transport = server.transport
+                    env = _default_environment()
+                    for name, ref in transport.env.items():
+                        env[name] = ref.resolve()
+                    work = self._work_root / server.id
+                    work.mkdir(parents=True, exist_ok=True)
+                    resolved = _resolve_executable(transport.executable)
+                    params = _stdio_parameters(resolved, list(transport.args), env, str(work))
+                    streams = await asyncio.wait_for(
+                        stack.enter_async_context(_stdio_client(params)), timeout=CONNECT_TIMEOUT)
+                else:
+                    transport = server.transport
+                    assert isinstance(transport, StreamableHttpTransport)
+                    headers = {}
+                    for name, ref in transport.headers.items():
+                        headers[name] = ref.resolve()
+                    transport.validate_public(public_mode=_public_mode())
+                    streams = await asyncio.wait_for(
+                        stack.enter_async_context(_streamable_http_client(transport.url, headers)),
+                        timeout=CONNECT_TIMEOUT)
+                read_stream, write_stream = streams[0], streams[1]
+                client = await stack.enter_async_context(_client_session(read_stream, write_stream))
+                await asyncio.wait_for(client.initialize(), timeout=CONNECT_TIMEOUT)
+                generation.client = client
+                generation.ready.set()
+                await generation.stop_event.wait()
+            except BaseException as exc:  # noqa: BLE001 —— 记录脱敏错误供等待方消费
+                generation.error = _redact_text(str(exc), self._secret_sets.get(server.id, set()))
+                generation.ready.set()
+            finally:
+                generation.state = "closed"
+                try:
+                    await asyncio.wait_for(stack.aclose(), timeout=2 * CONNECT_TIMEOUT)
+                except Exception:  # noqa: BLE001 —— 有界尽力关闭，不留孤儿
+                    pass
+
+        generation.supervisor = asyncio.create_task(_run())
+
+    async def _build_session(self, server: McpServer) -> _SessionGeneration:
+        if self._shutting_down:
+            raise McpError("MCP_UNAVAILABLE: Registry 正在关闭")
+        # 信任/env 校验先行（无 spawn / 无网络）
+        if isinstance(server.transport, StdioTransport):
+            preview = self._stdio_trust_preview(server)
+            if server.trust_fingerprint != preview.fingerprint:
+                raise StdioTrustRequired(preview)
+        # 预解析 env/header，缺失 secret 不建立 transport
+        if isinstance(server.transport, StdioTransport):
+            for ref in server.transport.env.values():
+                ref.resolve()
+        else:
+            transport = server.transport
+            assert isinstance(transport, StreamableHttpTransport)
+            transport.validate_public(public_mode=_public_mode())
+            for ref in transport.headers.values():
+                ref.resolve()
+
+        self._counter += 1
+        generation = _SessionGeneration(number=self._counter, server_id=server.id)
+        self._spawn_supervisor(server, generation)
+        try:
+            await asyncio.wait_for(generation.ready.wait(), timeout=2 * CONNECT_TIMEOUT)
+        except asyncio.TimeoutError as exc:
+            generation.stop_event.set()
+            raise McpError("连接超时") from exc
+        if generation.error is not None:
+            raise McpError(f"连接失败: {generation.error[:HEALTH_DETAIL_LIMIT]}")
+        self._secret_sets.setdefault(server.id, set())
+        return generation
+
+    async def test(self, server_id: str) -> McpHealth:
+        """initialize + 基础能力检查；health 写回配置文档（revision +1）。"""
+        doc = await asyncio.to_thread(self.store.load)
+        server = self._require_server(doc, server_id)
+        try:
+            generation = await self._build_session(server)
+            tool_count = 0
+            try:
+                tools = await asyncio.wait_for(generation.client.list_tools(), timeout=CONNECT_TIMEOUT)
+                tool_count = len(tools.tools)
+            except Exception:  # noqa: BLE001
+                tool_count = -1
+            health = McpHealth(state="ok", detail=f"tools={tool_count}", checked_at=_utc_now())
+            await self._replace_session(server_id, generation)
+        except (StdioTrustRequired, McpSecretMissing):
+            raise
+        except McpError as exc:
+            health = McpHealth(state="unreachable", detail=str(exc)[:HEALTH_DETAIL_LIMIT],
+                               checked_at=_utc_now())
+        await self._write_health(server_id, health)
+        return health
+
+    async def _replace_session(self, server_id: str, generation: _SessionGeneration) -> None:
+        async with self._state_lock:
+            old = self._sessions.get(server_id)
+            if old is not None and old.state == "accepting":
+                old.state = "draining"
+                old.stop_event.set()
+            self._sessions[server_id] = generation
+
+    async def _close_generation(self, generation: _SessionGeneration) -> None:
+        if generation.state == "closed" and generation.supervisor is None:
+            return
+        generation.stop_event.set()
+        supervisor = generation.supervisor
+        if supervisor is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(supervisor), timeout=2 * CONNECT_TIMEOUT)
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+            supervisor.cancel()
+            try:
+                await supervisor
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
+    async def _close_server(self, server_id: str) -> None:
+        async with self._state_lock:
+            generation = self._sessions.pop(server_id, None)
+        if generation is not None:
+            await self._close_generation(generation)
+        self._secret_sets.pop(server_id, None)
+
+    async def shutdown(self) -> None:
+        """有界关闭全部世代（SDK 的 stdin close → terminate → kill 合同）。"""
+        self._shutting_down = True
+        generations = list(self._sessions.values())
+        self._sessions.clear()
+        await asyncio.wait_for(
+            asyncio.gather(*(self._close_generation(g) for g in generations),
+                           return_exceptions=True),
+            timeout=2 * CONNECT_TIMEOUT + 5,
+        )
+        self._secret_sets.clear()
+
+    async def _write_health(self, server_id: str, health: McpHealth) -> None:
+        def change(doc: McpDocument) -> McpDocument:
+            servers = []
+            for s in doc.servers:
+                if s.id == server_id:
+                    s = s.model_copy(update={"health": health})
+                servers.append(s)
+            return doc.model_copy(update={"servers": servers})
+
+        revision = (await asyncio.to_thread(self.store.load)).revision
+        await asyncio.to_thread(self.store.update, revision, change)
+
+
+def _utc_now() -> str:
+    from agent.stores import utc_now
+
+    return utc_now()
+
+
+def _default_environment() -> dict[str, str]:
+    from mcp.client.stdio import get_default_environment
+
+    return dict(get_default_environment())
+
+
+def _stdio_parameters(command: str, args: list[str], env: dict[str, str], cwd: str):
+    from mcp import StdioServerParameters
+
+    return StdioServerParameters(command=command, args=args, env=env, cwd=cwd)
+
+
+def _stdio_client(params):
+    from mcp import StdioServerParameters  # noqa: F401
+
+    from mcp.client.stdio import stdio_client
+
+    return stdio_client(params)
+
+
+def _streamable_http_client(url: str, headers: dict[str, str]):
+    from mcp.client.streamable_http import streamablehttp_client
+
+    return streamablehttp_client(url, headers=headers)
+
+
+def _client_session(read_stream, write_stream):
+    from mcp.client.session import ClientSession
+
+    return ClientSession(read_stream, write_stream)
+
+
+def _public_mode() -> bool:
+    from agent.ssrf import public_mode
+
+    return public_mode()
+
+
+async def _initialize(client) -> None:
+    await client.initialize()
+
+
+async def _safe_aclose(stack) -> None:
+    if stack is None:
+        return
+    try:
+        await asyncio.wait_for(stack.aclose(), timeout=2 * CONNECT_TIMEOUT)
+    except Exception:  # noqa: BLE001 —— 关闭路径尽力而为，不留孤儿
+        pass
