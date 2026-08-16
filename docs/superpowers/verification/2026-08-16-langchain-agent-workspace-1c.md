@@ -1,7 +1,7 @@
 # 1C 端到端验证记录（2026-08-16）
 
-**结论：PARTIAL**（自动化门禁、mootdx live 冒烟、浏览器审批/steer-away/503 闭环全部通过；
-仅剩真实 provider 审批流一项未执行——本环境无可用 API key。）
+**结论：PASS**（自动化门禁、mootdx live 冒烟、浏览器审批/steer-away/503 闭环、
+真实 provider（BigModel GLM-5.2）审批流全部通过。）
 
 ## 提交范围
 
@@ -61,10 +61,22 @@ puppeteer-core 驱动本机 Chrome。截图存 `/tmp/vr-e2e-shots/`（14 张）�
    `"agui"`，而 1B 注入的是 `"ag-ui"` —— 刷新后审批面板无法水合。已改为
    `custom.agui.interrupts` 并迁移测试。
 
-## Step 4 真实 provider 审批流 ⛔ NOT RUN
+## Step 4 真实 provider 审批流 ✅ PASS（2026-08-16 用户提供的 BigModel GLM-5.2）
 
-本环境没有可用的 OpenAI 兼容 function-calling key（密钥只存用户浏览器
-localStorage，后端/测试均无）。**未执行**，需用户提供 provider 后补验。
+- Provider：bigmodel / `https://open.bigmodel.cn/api/coding/paas/v4` / GLM-5.2
+  （`/v4` 后缀不被追加 `/v1`，issue #22 规则生效）；密钥只存浏览器 localStorage。
+- 中性研究提示 → 模型发起 `mcp__fixture__echo {"value":"贵州茅台"}` 工具调用 →
+  HITL 审批中断（6-26 秒内，camelCase 元数据/参数可见）→ 用户选
+  「本会话允许」（approve+thread_session）→ resume → 工具真实执行 → 模型
+  客观转述结果并主动声明「不构成任何投资建议」（中立红线遵守）（截图 real-01/02）。
+- **thread_session 许可**：同线程第二次调用 `mcp__fixture__echo` 免审批直接执行
+  并完成（截图 real-03）。
+- 密钥核验：临时数据根全部文件与后端日志 grep 密钥串 0 命中。
+
+本轮发现并修复的缺陷：router 的 resume 校验 lambda 用空 thread_id 构造
+`AgentProtocolBridge`，导致 thread_session 许可登记到 `("", server, tool)` 而 HITL
+按真实 thread_id 查询——第二次调用仍被中断。已改为真实 thread_id 并补回归测试
+（`test_allowance_key_uses_real_thread_id`，覆盖 enrich→resume→grant→when 放行全链）。
 
 ## 浏览器审批提交闭环（approve/steer-away/503）✅ PASS（2026-08-16 二轮）
 

@@ -310,7 +310,8 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                 model_ref=model_ref,
                 secrets=secrets,
                 model_builder=model_builder,
-                validate=lambda pending: AgentProtocolBridge("", "", pending=pending).resume_value_with_allowances(resume_entries),
+                # thread_id 必须真实：approve+thread_session 的许可以其为键登记
+                validate=lambda pending: AgentProtocolBridge(thread_id, "", pending=pending).resume_value_with_allowances(resume_entries),
                 protocol_run_id=run_id,
                 client_revision=runtime_props.thread_revision,
             )

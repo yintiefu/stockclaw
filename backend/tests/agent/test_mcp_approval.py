@@ -488,3 +488,43 @@ async def test_cancel_run_releases_capability_lease(tmp_path):
     await services.coordinator.cancel_run("th-1", handle.product_run_id)
     assert lease._released is True
     assert services.coordinator.skill_in_use("any") is False
+
+
+async def test_allowance_key_uses_real_thread_id(tmp_path):
+    """router resume 路径的许可必须登记到真实 thread_id（HITL 查询键）。"""
+    from ag_ui.core.events import CustomEvent, EventType, ToolCallArgsEvent, ToolCallEndEvent, ToolCallStartEvent
+    from agent.capabilities import AllowanceRegistry, enrich_pending_interrupts, build_hitl_policy
+    from agent.mcp import McpToolBinding
+    from agent.protocol import AgentProtocolBridge
+
+    bridge = AgentProtocolBridge("th-real", "run-1")
+    bridge.convert(ToolCallStartEvent(tool_call_id="c1", tool_call_name="mcp__fixture__echo",
+                                      parent_message_id="a1"))
+    bridge.convert(ToolCallArgsEvent(tool_call_id="c1", delta='{"value": "x"}'))
+    bridge.convert(ToolCallEndEvent(tool_call_id="c1"))
+    bridge.convert(CustomEvent(type=EventType.CUSTOM, name="on_interrupt", value={
+        "action_requests": [{"name": "mcp__fixture__echo", "args": {"value": "x"}, "description": "d"}],
+        "review_configs": [{"action_name": "mcp__fixture__echo", "allowed_decisions": ["approve", "reject"]}],
+    }))
+
+    class LeaseStub:
+        mcp_bindings = (McpToolBinding(server_id="fixture", original_name="echo",
+                                       alias="mcp__fixture__echo", description="d",
+                                       args_schema={}, config_generation=1,
+                                       catalog_generation=1, server_name="夹具"),)
+        _registry = None
+
+    enriched = enrich_pending_interrupts(bridge.pending, LeaseStub(), "sk-x")
+    # 与 router 相同的 thread_id 构造 bridge
+    validate = AgentProtocolBridge("th-real", "", pending=enriched)
+    _, allowances = validate.resume_value_with_allowances([
+        {"interruptId": enriched[0].bridge_interrupt_id, "status": "resolved",
+         "payload": {"decision": "approve", "scope": "thread_session"}}])
+    registry = AllowanceRegistry()
+    for thread_id, server_id, tool_name in allowances:
+        registry.grant(thread_id, server_id, tool_name)
+    # HITL 的 when 谓词在真实 thread_id 下放行
+    policy = build_hitl_policy(thread_id="th-real", bindings=LeaseStub.mcp_bindings,
+                               allowances=registry)
+    entry = policy.interrupt_on["mcp__fixture__echo"]
+    assert entry["when"](type("R", (), {"tool_call": {"name": "mcp__fixture__echo"}})) is False
