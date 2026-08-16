@@ -434,7 +434,7 @@ class McpRegistry:
     async def add(self, server: McpServer) -> McpDocument:
         def mutate(doc: McpDocument) -> McpDocument:
             if any(s.id == server.id for s in doc.servers):
-                raise McpError(f"server 已存在: {server.id}")
+                raise McpRevisionConflict(f"MCP server 已存在: {server.id}")
             return doc.model_copy(update={"servers": [*doc.servers, server]})
 
         return await asyncio.to_thread(self.store.update, self.store.load().revision, mutate)
@@ -941,3 +941,43 @@ def _streamable_http_client(url: str, headers: dict[str, str]):
         )
 
     return streamablehttp_client(url, headers=headers, httpx_client_factory=_client_factory)
+
+
+# ---------------------------------------------------------------------------
+# Task 11：休眠稳定绑定（切片 3 才接入生产 Graph）
+# ---------------------------------------------------------------------------
+
+from langchain_core.tools import BaseTool, StructuredTool
+
+
+@dataclass(frozen=True)
+class McpToolBinding:
+    """无密钥、无 session 的稳定工具绑定。
+
+    name/description/schema 从准入时官方 adapter Tool 冻结，
+    不从持久化 catalog JSON 重建。
+    """
+
+    server_id: str
+    original_name: str
+    alias: str
+    description: str
+    args_schema: dict
+    config_generation: int
+    catalog_generation: int
+
+    def as_langchain_tool(self, registry: "McpRegistry") -> BaseTool:
+        binding = self
+
+        async def _invoke(**arguments):
+            # 60s 端到端预算由 registry.call_tool 强制（队列等待 + 远端调用）
+            return await registry.call_tool(
+                binding.server_id, binding.alias, arguments)
+
+        return StructuredTool.from_function(
+            coroutine=_invoke,
+            name=binding.alias,
+            description=binding.description,
+            args_schema=binding.args_schema or {
+                "type": "object", "properties": {}, "required": []},
+        )

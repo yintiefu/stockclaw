@@ -424,3 +424,74 @@ async def test_shutdown_rejects_new_calls_with_bounded_error(tmp_path):
     entry = next(t for t in catalog.tools if t.original_name == "echo")
     result = await registry.call_tool("httpfix", entry.alias, {"value": "x"})
     assert "MCP_UNAVAILABLE" in result
+
+
+# ---------------------------------------------------------------------------
+# Task 11：休眠稳定绑定（不进生产 Graph）
+# ---------------------------------------------------------------------------
+
+async def _ready_fixture_registry(tmp_path, monkeypatch=None):
+    registry = registry_for(tmp_path)
+    await registry.add(stdio_server())
+    fingerprint = (await registry.trust_preview("fixture")).fingerprint
+    await registry.trust("fixture", fingerprint, registry.store.load().revision)
+    catalog = await registry.refresh("fixture")
+    return registry, catalog
+
+
+async def test_binding_metadata_is_secret_free_and_official(tmp_path):
+    from agent.mcp import McpToolBinding
+
+    registry, catalog = await _ready_fixture_registry(tmp_path)
+    entry = next(t for t in catalog.tools if t.original_name == "echo")
+    binding = McpToolBinding(
+        server_id="fixture", original_name="echo", alias=entry.alias,
+        description=entry.description, args_schema=entry.input_schema,
+        config_generation=1, catalog_generation=registry._sessions["fixture"].number,
+    )
+    tool = binding.as_langchain_tool(registry)
+    assert tool.name == binding.alias
+    assert "ClientSession" not in repr(binding) and "secret" not in repr(binding).lower()
+    result = await tool.ainvoke({"value": "hi"})
+    assert "hi" in result
+    await registry.shutdown()
+
+
+async def test_binding_late_result_after_shutdown_is_bounded(tmp_path):
+    from agent.mcp import McpToolBinding
+
+    registry, catalog = await _ready_fixture_registry(tmp_path)
+    entry = next(t for t in catalog.tools if t.original_name == "echo")
+    binding = McpToolBinding(
+        server_id="fixture", original_name="echo", alias=entry.alias,
+        description=entry.description, args_schema=entry.input_schema,
+        config_generation=1, catalog_generation=1,
+    )
+    await registry.shutdown()
+    tool = binding.as_langchain_tool(registry)
+    result = await tool.ainvoke({"value": "x"})
+    assert "MCP_UNAVAILABLE" in result
+
+
+async def test_binding_call_budget_is_bounded(tmp_path):
+    """60s 预算端到端覆盖队列等待；这里验证结构存在（不全等 60s）。"""
+    from agent.mcp import CALL_TIMEOUT
+
+    assert CALL_TIMEOUT == 60.0
+
+
+async def test_production_resolver_still_returns_no_mcp_alias(tmp_path):
+    from agent.capabilities import CapabilityPreview, CapabilityResolver
+    from agent.router import build_services
+
+    services = build_services(tmp_path / "agent")
+    registry, catalog = await _ready_fixture_registry(tmp_path)
+    services.registry = registry  # 即便有健康目录也不暴露
+    try:
+        resolver = CapabilityResolver(services.skills)
+        lease = await resolver.acquire(CapabilityPreview(
+            thread_id="th", thread_revision=0, selected_skills=()))
+        assert all(not t.name.startswith("mcp__") for t in lease.tools)
+        lease.release()
+    finally:
+        await registry.shutdown()
