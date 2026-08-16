@@ -533,11 +533,13 @@ class McpRegistry:
 
             stack = AsyncExitStack()
             try:
+                resolved_secrets: set[str] = set()
                 if isinstance(server.transport, StdioTransport):
                     transport = server.transport
                     env = _default_environment()
                     for name, ref in transport.env.items():
                         env[name] = ref.resolve()
+                        resolved_secrets.add(env[name])
                     work = self._work_root / server.id
                     work.mkdir(parents=True, exist_ok=True)
                     resolved = _resolve_executable(transport.executable)
@@ -550,6 +552,7 @@ class McpRegistry:
                     headers = {}
                     for name, ref in transport.headers.items():
                         headers[name] = ref.resolve()
+                        resolved_secrets.add(headers[name])
                     transport.validate_public(public_mode=_public_mode())
                     streams = await asyncio.wait_for(
                         stack.enter_async_context(_streamable_http_client(transport.url, headers)),
@@ -558,6 +561,7 @@ class McpRegistry:
                 client = await stack.enter_async_context(_client_session(read_stream, write_stream))
                 await asyncio.wait_for(client.initialize(), timeout=CONNECT_TIMEOUT)
                 generation.client = client
+                self._secret_sets.setdefault(server.id, set()).update(resolved_secrets)
                 generation.ready.set()
                 await generation.stop_event.wait()
             except BaseException as exc:  # noqa: BLE001 —— 记录脱敏错误供等待方消费
@@ -609,7 +613,10 @@ class McpRegistry:
         doc = await asyncio.to_thread(self.store.load)
         server = self._require_server(doc, server_id)
         try:
-            generation = await self._build_session(server)
+            generation = self._sessions.get(server_id)
+            if generation is None or generation.state != "accepting" or generation.client is None:
+                generation = await self._build_session(server)
+                await self._replace_session(server_id, generation)
             tool_count = 0
             try:
                 tools = await asyncio.wait_for(generation.client.list_tools(), timeout=CONNECT_TIMEOUT)
@@ -617,7 +624,6 @@ class McpRegistry:
             except Exception:  # noqa: BLE001
                 tool_count = -1
             health = McpHealth(state="ok", detail=f"tools={tool_count}", checked_at=_utc_now())
-            await self._replace_session(server_id, generation)
         except (StdioTrustRequired, McpSecretMissing):
             raise
         except McpError as exc:
@@ -668,6 +674,87 @@ class McpRegistry:
             timeout=2 * CONNECT_TIMEOUT + 5,
         )
         self._secret_sets.clear()
+
+    # ---- 目录与调用（Task 9） ----
+
+    async def refresh(self, server_id: str) -> McpServer:
+        """连接 + load_mcp_tools 发现目录；同名继承 enabled；失败保留旧目录。"""
+        doc = await asyncio.to_thread(self.store.load)
+        server = self._require_server(doc, server_id)
+        generation = await self._build_session(server)
+        secrets = self._secret_sets.get(server_id, set())
+        try:
+            tools = await asyncio.wait_for(
+                _load_mcp_tools(session=generation.client, server_name=server_id),
+                timeout=CONNECT_TIMEOUT)
+        except BaseException as exc:
+            await self._close_generation(generation)
+            detail = _redact_text(str(exc), secrets)[:HEALTH_DETAIL_LIMIT]
+            raise McpError(f"目录发现失败: {detail}") from exc
+        discovered = []
+        for tool in tools:
+            description = _redact_text(getattr(tool, "description", "") or "", secrets)
+            discovered.append({
+                "name": getattr(tool, "name", ""),
+                "description": description[:TOOL_DESCRIPTION_LIMIT],
+                "input_schema": _tool_args_schema(tool),
+                "discovered_at": _utc_now(),
+            })
+        try:
+            updated = await asyncio.to_thread(
+                self.store.apply_tool_refresh, server_id, discovered,
+                expected_revision=(await asyncio.to_thread(self.store.load)).revision,
+            )
+        except Exception:
+            await self._close_generation(generation)
+            raise
+        generation.tools = {tool.name: tool for tool in tools}
+        await self._replace_session(server_id, generation)
+        refreshed = next(s for s in updated.servers if s.id == server_id)
+        await self._write_health(server_id, McpHealth(
+            state="ok", detail=f"tools={len(refreshed.tools)}", checked_at=_utc_now()))
+        return refreshed
+
+    async def call_tool(self, server_id: str, alias: str, arguments: dict) -> str:
+        """绑定调用入口：server 串行锁 + 60s 端到端预算 + 脱敏/内容/截断。"""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + CALL_TIMEOUT
+
+        async with self._server_lock(server_id):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return _tool_error("MCP_UNAVAILABLE", "调用超时（等待 server 锁）")
+            return await asyncio.wait_for(
+                self._call_with_session(server_id, alias, arguments),
+                timeout=remaining,
+            )
+
+    async def _call_with_session(self, server_id: str, alias: str, arguments: dict) -> str:
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + CALL_TIMEOUT
+        async with self._state_lock:
+            generation = self._sessions.get(server_id)
+        if self._shutting_down or generation is None or generation.state != "accepting":
+            return _tool_error("MCP_UNAVAILABLE", "MCP 会话不可用（关闭中或未连接）")
+        original = _original_name_for_alias(server_id, alias, generation.tools) or alias
+        tool = generation.tools.get(original)
+        if tool is None:
+            return _tool_error("MCP_UNAVAILABLE", f"工具不在当前目录: {alias}")
+        secrets = self._secret_sets.get(server_id, set())
+        generation.in_flight += 1
+        try:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return _tool_error("MCP_UNAVAILABLE", "调用超时")
+            try:
+                result = await asyncio.wait_for(
+                    tool.ainvoke(arguments), timeout=remaining)
+            except BaseException as exc:
+                detail = _redact_text(str(exc), secrets)[:HEALTH_DETAIL_LIMIT]
+                return _tool_error("MCP_TOOL_ERROR", detail)
+        finally:
+            generation.in_flight -= 1
+        return _normalize_tool_result(result, secrets)
 
     async def _write_health(self, server_id: str, health: McpHealth) -> None:
         def change(doc: McpDocument) -> McpDocument:
@@ -737,3 +824,120 @@ async def _safe_aclose(stack) -> None:
         await asyncio.wait_for(stack.aclose(), timeout=2 * CONNECT_TIMEOUT)
     except Exception:  # noqa: BLE001 —— 关闭路径尽力而为，不留孤儿
         pass
+
+
+# ---------------------------------------------------------------------------
+# adapter 工具辅助
+# ---------------------------------------------------------------------------
+
+def _tool_args_schema(tool) -> dict:
+    schema = getattr(tool, "args_schema", None)
+    if isinstance(schema, dict):
+        return schema
+    if schema is not None and hasattr(schema, "model_json_schema"):
+        try:
+            return schema.model_json_schema()
+        except Exception:  # noqa: BLE001
+            return {}
+    return {}
+
+
+def _original_name_of(alias: str, tools: dict) -> str | None:
+    if alias in tools:
+        return alias
+    return None
+
+
+def _original_name_for_alias(server_id: str, alias: str, tools: dict) -> str | None:
+    for original in tools:
+        if mcp_alias(server_id, original) == alias:
+            return original
+    return None
+
+
+def _tool_error(code: str, detail: str) -> str:
+    return json.dumps({"error": code, "detail": detail}, ensure_ascii=False)
+
+
+def _recursive_redact(value, secrets: set[str]):
+    if isinstance(value, str):
+        text = value
+        for secret in secrets:
+            if secret:
+                text = text.replace(secret, "[redacted]")
+        return text
+    if isinstance(value, dict):
+        return {k: _recursive_redact(v, secrets) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_recursive_redact(v, secrets) for v in value]
+    return value
+
+
+def _normalize_tool_result(result, secrets: set[str]) -> str:
+    """先递归脱敏 → 支持内容检查 → 编码 → 截断 6000（顺序不可颠倒）。"""
+    RESULT_LIMIT = 6000
+    redacted = _recursive_redact(result, secrets)
+    if isinstance(redacted, str):
+        payload = redacted
+    elif isinstance(redacted, list):
+        # adapter 工具返回内容块列表
+        texts = []
+        for block in redacted:
+            if isinstance(block, dict):
+                if block.get("type") not in ("text",):
+                    return _tool_error(
+                        "MCP_CONTENT_UNSUPPORTED", "仅支持文本与 JSON structuredContent")
+                texts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                texts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                texts.append(block.get("text", ""))
+            else:
+                # MCP 对象内容块：仅 text 可用，image/audio/resource 一律拒绝
+                if getattr(block, "type", "text") != "text":
+                    return _tool_error(
+                        "MCP_CONTENT_UNSUPPORTED", "仅支持文本与 JSON structuredContent")
+                texts.append(getattr(block, "text", "") or "")
+        payload = "".join(texts)
+    else:
+        payload = json.dumps(redacted, ensure_ascii=False, default=str)
+    if len(payload) > RESULT_LIMIT:
+        payload = payload[: RESULT_LIMIT - len("...[truncated]")] + "...[truncated]"
+    return payload
+
+
+def _load_mcp_tools(*, session, server_name: str):
+    from langchain_mcp_adapters.tools import load_mcp_tools
+
+    return load_mcp_tools(session=session, server_name=server_name)
+
+
+def _build_http_client_options(url: str, headers: dict[str, str]) -> dict:
+    """Streamable HTTP 的自定义 client 参数：不跟随 redirect、不用系统代理、
+    连接 15s / 读 60s。URL/地址校验在连接前完成。"""
+    import httpx
+
+    return {
+        "follow_redirects": False,
+        "trust_env": False,
+        "timeout": httpx.Timeout(connect=15.0, read=60.0, write=15.0, pool=15.0),
+    }
+
+
+def _streamable_http_client(url: str, headers: dict[str, str]):
+    from mcp.client.streamable_http import streamablehttp_client
+
+    import httpx
+
+    options = _build_http_client_options(url, headers)
+
+    def _client_factory(headers=None, timeout=None, auth=None) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            follow_redirects=options["follow_redirects"],
+            trust_env=options["trust_env"],
+            timeout=timeout if timeout is not None else options["timeout"],
+            headers=headers or {},
+            auth=auth,
+        )
+
+    return streamablehttp_client(url, headers=headers, httpx_client_factory=_client_factory)

@@ -34,6 +34,14 @@ async def sleep(seconds: float) -> str:
 
 
 @mcp.tool()
+async def env_value(name: str) -> str:
+    """返回服务端进程环境变量值（验证 Registry 脱敏边界）。"""
+    import os
+
+    return os.environ.get(name, "")
+
+
+@mcp.tool()
 async def fail(message: str = "boom") -> str:
     """总是抛错（isError 路径）。"""
     raise RuntimeError(message)
@@ -46,9 +54,11 @@ async def large(n: int = 100) -> str:
 
 
 @mcp.tool()
-async def unsupported(kind: str = "image") -> dict:
+async def unsupported(kind: str = "image"):
     """返回非文本内容（验证 MCP_CONTENT_UNSUPPORTED）。"""
-    return {"content": [{"type": "image", "data": "aGk=", "mimeType": "image/png"}]}
+    from mcp.server.fastmcp import Image
+
+    return Image(data=b"hi", format="png")
 
 
 def main() -> None:
@@ -61,16 +71,24 @@ def main() -> None:
     if args.http:
         import uvicorn
 
-        if args.port == 0:
-            import socket
+        # port=0 由内核分配，避免随机端口竞争；实际端口从日志行解析
+        config = uvicorn.Config(mcp.streamable_http_app(), host=args.host, port=0,
+                                log_level="warning")
+        server = uvicorn.Server(config)
 
-            with socket.socket() as sock:
-                sock.bind((args.host, 0))
-                args.port = sock.getsockname()[1]
-        print(f"PORT={args.port}", file=sys.stderr, flush=True)
-        # FastMCP 的 streamable_http_app 挂载在 /mcp 路径
-        uvicorn.run(mcp.streamable_http_app(), host=args.host, port=args.port,
-                    log_level="error")
+        def _announce() -> None:
+            import time as _time
+
+            deadline = _time.monotonic() + 10
+            while not server.started and _time.monotonic() < deadline:
+                _time.sleep(0.02)
+            port = server.servers[0].sockets[0].getsockname()[1] if server.servers else -1
+            print(f"PORT={port}", file=sys.stderr, flush=True)
+
+        import threading
+
+        threading.Thread(target=_announce, daemon=True).start()
+        server.run()
     else:
         mcp.run(transport="stdio")
 
