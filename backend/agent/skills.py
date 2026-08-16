@@ -13,6 +13,7 @@ import re
 import stat
 import threading
 import unicodedata
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -461,3 +462,312 @@ class SkillRegistry:
         if not resolved.is_relative_to(self._root / record.directory) or resolved.is_symlink():
             raise SkillResourceForbidden("解析后的路径越界")
         return record, entry, resolved
+
+
+# ---------------------------------------------------------------------------
+# 导入 / 删除 / 恢复
+# ---------------------------------------------------------------------------
+
+UPLOAD_LIMIT = 20 * 1024 * 1024
+EXTRACT_LIMIT = 50 * 1024 * 1024
+ENTRY_LIMIT = 500
+CHUNK_SIZE = 65536
+
+_UPLOAD_RE = re.compile(r"^\.skill-upload-([^.]+)\.tmp$")
+_IMPORT_RE = re.compile(r"^\.skill-import-([^.]+)\.tmp$")
+_BACKUP_RE = re.compile(r"^\.skill-backup-([^.]+)\.tmp$")
+
+
+
+def _remove_tree(path: Path) -> None:
+    """删除目录树；对消失的路径静默。"""
+    import shutil
+
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _fsync_children(directory: Path) -> None:
+    """递归 fsync 普通文件与各级目录（落位前的持久化保证）。"""
+    for current, dirnames, filenames in os.walk(directory, followlinks=False):
+        for filename in filenames:
+            try:
+                fd = os.open(os.path.join(current, filename), os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
+        _fsync_dir(Path(current))
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+@dataclass(frozen=True)
+class SkillInstallResult:
+    record: SkillRecord
+    created: bool  # True=新导入 False=覆盖
+
+
+class SkillImporter:
+    """限量暂存 → zip 初检 → 逐 entry 受控解压 → 原子落位。"""
+
+    def __init__(self, root: Path, registry: SkillRegistry):
+        self._root = Path(root)
+        self._registry = registry
+
+    # ---- 暂存 ----
+
+    def receive_chunks(self, chunks) -> Path:
+        """固定 chunk 写入根目录内暂存文件；超 20MB 立即删除并拒绝。"""
+        import uuid
+
+        self._root.mkdir(parents=True, exist_ok=True)
+        staged = self._root / f".skill-upload-{uuid.uuid4().hex}.tmp"
+        written = 0
+        try:
+            with staged.open("wb") as handle:
+                for chunk in chunks:
+                    written += len(chunk)
+                    if written > UPLOAD_LIMIT:
+                        raise SkillArchiveRejected("上传超过 20 MB 限制")
+                    handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+            return staged
+        except BaseException:
+            staged.unlink(missing_ok=True)
+            raise
+
+    async def receive(self, upload) -> Path:
+        """async multipart 接收：逐块读 UploadFile，共用 20MB 上限与清理语义。"""
+        import asyncio
+        import uuid
+
+        self._root.mkdir(parents=True, exist_ok=True)
+        staged = self._root / f".skill-upload-{uuid.uuid4().hex}.tmp"
+        written = 0
+        try:
+            def write_chunk(chunk: bytes) -> None:
+                nonlocal written
+                written += len(chunk)
+                if written > UPLOAD_LIMIT:
+                    raise SkillArchiveRejected("上传超过 20 MB 限制")
+
+            with staged.open("wb") as handle:
+                while True:
+                    chunk = await upload.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    write_chunk(chunk)
+                    await asyncio.to_thread(handle.write, chunk)
+                await asyncio.to_thread(handle.flush)
+                await asyncio.to_thread(os.fsync, handle.fileno())
+            return staged
+        except BaseException:
+            await asyncio.to_thread(staged.unlink, True)
+            raise
+
+    # ---- 安装 ----
+
+    def install(self, upload_path: Path, *, overwrite: bool, expected_digest: str | None) -> SkillInstallResult:
+        import uuid
+
+        self._root.mkdir(parents=True, exist_ok=True)
+        if Path(upload_path).stat().st_size > UPLOAD_LIMIT:
+            Path(upload_path).unlink(missing_ok=True)
+            raise SkillArchiveRejected("上传超过 20 MB 限制")
+
+        stage: Path | None = None
+        try:
+            # zip 中央目录初检
+            try:
+                archive = zipfile.ZipFile(upload_path)
+            except (zipfile.BadZipFile, OSError) as exc:
+                raise SkillArchiveRejected(f"不是合法 zip: {exc}") from exc
+            with archive:
+                infos = archive.infolist()
+                if len(infos) > ENTRY_LIMIT:
+                    raise SkillArchiveRejected(f"zip entry 超过 {ENTRY_LIMIT}")
+                declared = sum(zi.file_size for zi in infos)
+                if declared > EXTRACT_LIMIT:
+                    raise SkillArchiveRejected(f"声明解压总量超过 {EXTRACT_LIMIT // (1024 * 1024)} MB")
+                stage = self._root / f".skill-import-{uuid.uuid4().hex}.tmp"
+                stage.mkdir()
+                self._extract(archive, infos, stage)
+            payload_root = self._payload_root(stage)
+            staged_record = _scan_skill(payload_root.name, payload_root)
+            if not staged_record.valid:
+                raise SkillArchiveRejected(f"压缩包内 Skill 无效: {staged_record.error_detail}")
+            assert staged_record.name is not None
+            target = self._root / staged_record.name
+            created = True
+            with self._registry._lock:
+                existing = target if target.exists() else None
+                if existing is not None:
+                    current = self._registry.refresh()
+                    existing_record = next(
+                        (r for r in current.skills if r.directory == staged_record.name and r.valid), None)
+                    if not overwrite:
+                        raise SkillConflict(f"Skill 已存在: {staged_record.name}")
+                    if expected_digest is None or existing_record is None \
+                            or existing_record.digest != expected_digest:
+                        raise SkillConflict("覆盖需要匹配的 expected_digest")
+                    # 旧目录改名 backup → 新目录落位 → fsync → 删 backup
+                    backup = self._root / f".skill-backup-{uuid.uuid4().hex}.tmp"
+                    os.replace(target, backup)
+                    try:
+                        _fsync_children(payload_root)
+                        os.replace(payload_root, target)
+                        _fsync_dir(self._root)
+                    except BaseException:
+                        # 落位失败：恢复 backup，保持可恢复状态
+                        if not target.exists() and backup.exists():
+                            os.replace(backup, target)
+                        raise
+                    _remove_tree(backup)
+                    created = False
+                else:
+                    _fsync_children(payload_root)
+                    os.replace(payload_root, target)
+                    _fsync_dir(self._root)
+            generation = self._registry.refresh()
+            record = generation.require(staged_record.name)
+            # 清理 stage 外壳与上传文件
+            if stage.exists():
+                _remove_tree(stage)
+            Path(upload_path).unlink(missing_ok=True)
+            return SkillInstallResult(record=record, created=created)
+        except BaseException:
+            if stage is not None and stage.exists():
+                _remove_tree(stage)
+            raise
+
+    # ---- 删除 ----
+
+    def delete(self, name: str, expected_digest: str | None) -> SkillRecord:
+        with self._registry._lock:
+            record = self._registry.require(name)
+            if expected_digest is None or record.digest != expected_digest:
+                raise SkillConflict("删除需要匹配的 expected_digest")
+            target = self._root / record.directory
+            if target.exists():
+                _remove_tree(target)
+                _fsync_dir(self._root)
+            return record
+
+    # ---- 恢复 ----
+
+    def recover(self) -> list[str]:
+        """只处理自有固定名称；归属不明的保留并返回相对名警告。"""
+        warnings: list[str] = []
+        backups = {m.group(1): p for p in self._root.iterdir()
+                   if p.name.startswith(".") and (m := _BACKUP_RE.fullmatch(p.name))}
+        for suffix, backup in backups.items():
+            if not backup.is_dir():
+                warnings.append(backup.name)
+                continue
+            inner = [p for p in backup.iterdir() if p.name != "SKILL.md" or True]
+            # 判断 backup 内是否是「唯一 Skill 目录」形状（一个子目录 + 其余为单 Skill 文件）
+            subdirs = [p for p in backup.iterdir() if p.is_dir()]
+            has_skill_md = (backup / "SKILL.md").exists()
+            target_name: str | None = None
+            if has_skill_md and subdirs:
+                warnings.append(backup.name)  # SKILL.md 与子目录并存：归属不明确
+                continue
+            if has_skill_md and not subdirs:
+                # 目录名被 rename 掩盖——从 SKILL.md frontmatter 解析目标 name
+                try:
+                    text = (backup / "SKILL.md").read_text(encoding="utf-8")
+                    parsed = _parse_frontmatter(text)
+                    if parsed and isinstance(parsed[0].get("name"), str) \
+                            and NAME_RE.fullmatch(parsed[0]["name"]):
+                        target_name = parsed[0]["name"]
+                except (OSError, UnicodeDecodeError):
+                    target_name = None
+            if target_name is None and len(subdirs) == 1 and (subdirs[0] / "SKILL.md").exists():
+                target_name = subdirs[0].name
+            if target_name is None:
+                warnings.append(backup.name)
+                continue
+            target = self._root / target_name
+            if target.exists():
+                # target 已提交：删除 backup
+                _remove_tree(backup)
+            else:
+                # 只有合法 backup：恢复
+                if (backup / "SKILL.md").exists() and not subdirs:
+                    os.replace(backup, target)
+                else:
+                    inner = subdirs[0]
+                    os.replace(inner, target)
+                    _remove_tree(backup)
+                _fsync_dir(self._root)
+        for pattern, regex in ((".skill-upload-*", _UPLOAD_RE), (".skill-import-*", _IMPORT_RE)):
+            for stray in self._root.glob(pattern):
+                if regex.fullmatch(stray.name):
+                    if stray.is_dir():
+                        _remove_tree(stray)
+                    else:
+                        stray.unlink(missing_ok=True)
+        return warnings
+
+    # ---- 内部 ----
+
+    def _extract(self, archive: zipfile.ZipFile, infos: list[zipfile.ZipInfo], stage: Path) -> None:
+        seen_folded: set[str] = set()
+        extracted = 0
+        for info in infos:
+            name = info.filename
+            if info.flag_bits & 0x1:
+                raise SkillArchiveRejected(f"加密 entry: {name}")
+            mode = info.external_attr >> 16
+            file_type = mode & 0o170000  # 类型位；writestr 产物类型位为 0（普通文件）
+            if info.create_system == 3 and file_type and file_type != 0o100000:
+                raise SkillArchiveRejected(f"特殊 Unix 文件 mode（symlink/设备/FIFO）: {name}")
+            if name.endswith("/"):
+                continue  # 目录 entry：由文件 entry 创建
+            parts = tuple(name.split("/"))
+            rel = _validate_relative_path(parts)
+            if rel is None:
+                raise SkillArchiveRejected(f"路径非法: {name}")
+            folded = unicodedata.normalize("NFC", rel).casefold()
+            if folded in seen_folded:
+                raise SkillArchiveRejected(f"NFC/casefold 路径碰撞: {name}")
+            seen_folded.add(folded)
+            target = stage.joinpath(*parts)
+            if not target.resolve().is_relative_to(stage.resolve()):
+                raise SkillArchiveRejected(f"目录逃逸: {name}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            remaining = EXTRACT_LIMIT - extracted
+            if info.file_size > remaining:
+                raise SkillArchiveRejected("实际解压总量超过 50 MB")
+            with archive.open(info) as src, target.open("wb") as dst:
+                copied = 0
+                while chunk := src.read(CHUNK_SIZE):
+                    copied += len(chunk)
+                    if copied > info.file_size:
+                        raise SkillArchiveRejected(f"实际大小超过声明: {name}")
+                    dst.write(chunk)
+                extracted += copied
+                dst.flush()
+                os.fsync(dst.fileno())
+        _fsync_dir(stage)
+
+    def _payload_root(self, stage: Path) -> Path:
+        children = [p for p in stage.iterdir()]
+        if (stage / "SKILL.md").is_file():
+            return stage
+        dirs = [p for p in children if p.is_dir()]
+        files = [p for p in children if p.is_file()]
+        if len(dirs) == 1 and not files and (dirs[0] / "SKILL.md").is_file():
+            return dirs[0]
+        raise SkillArchiveRejected("zip 必须根级或唯一顶层目录内包含 SKILL.md")
