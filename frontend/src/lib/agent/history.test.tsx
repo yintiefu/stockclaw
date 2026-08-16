@@ -159,6 +159,8 @@ describe("AgentHistoryController", () => {
 it("水合 pending interrupt 元数据到 metadata.custom['ag-ui'].interrupts", async () => {
   const doc: AgentThread = {
     ...threaded("th-4", 2, "2026-08-15T12:00:00Z"),
+    last_run: { id: "r-1", status: "awaiting_approval", updated_at: "2026-08-15T12:00:00Z", retry_of: null },
+    resume_available: true,
     messages: [{
       id: "a-pending", role: "assistant", content: "", partial: false, pending_interrupt: true,
       interrupts: [{ id: "int-1", reason: "tool_call", toolCallId: "call-1", responseSchema: { type: "object" } }],

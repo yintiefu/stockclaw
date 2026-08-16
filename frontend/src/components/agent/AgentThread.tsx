@@ -5,6 +5,8 @@ import {
 } from "@assistant-ui/react";
 import { RotateCcw, Send, Square, Wrench } from "lucide-react";
 
+import { SteerAwayComposer } from "./SteerAwayComposer";
+
 import type { AgentThread } from "@/lib/agent/types";
 
 function UserMessage() {
@@ -85,12 +87,15 @@ export function AgentThread({
   onRetry = () => {},
   statusNote = null,
   composerDisabled = false,
+  pendingApproval = false,
 }: {
   activeThread?: AgentThread | null;
   onRetry?: (runId: string) => void;
   statusNote?: string | null;
   /** 权威收敛期间禁用输入（Stop/终态后等待取消持久化与 reload 完成） */
   composerDisabled?: boolean;
+  /** 待审批且可恢复：普通 Composer 让位给 SteerAwayComposer */
+  pendingApproval?: boolean;
 }) {
   // 两个分支几何一致：running 状态不会撑动页面；队列在 runtime 层已禁用，
   // 禁用态无法提交第二次 start 请求。
@@ -108,6 +113,7 @@ export function AgentThread({
             </div>
           ) : null}
           <RetryAction activeThread={activeThread} onRetry={onRetry} />
+          {pendingApproval ? <SteerAwayComposer disabled={composerDisabled} /> : (
           <ComposerPrimitive.Root className="flex min-h-12 items-end gap-2 rounded-md border border-border bg-background p-2">
             <ThreadPrimitive.If running={false}>
               <ComposerPrimitive.Input
@@ -131,6 +137,7 @@ export function AgentThread({
               </ComposerPrimitive.Cancel>
             </ThreadPrimitive.If>
           </ComposerPrimitive.Root>
+          )}
         </ThreadPrimitive.ViewportFooter>
       </ThreadPrimitive.Viewport>
     </ThreadPrimitive.Root>

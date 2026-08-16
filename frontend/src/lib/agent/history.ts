@@ -40,6 +40,7 @@ function dateOf(value: string | null): Date | undefined {
 export function toThreadMessageLike(
   message: AgentMessage,
   toolResultsByCallId: Map<string, unknown>,
+  options: { actionable?: boolean } = {},
 ): ThreadMessageLike | null {
   if (message.role === "tool") {
     // 工具结果挂在 assistant 的 tool-call part 上，不单独成条
@@ -85,7 +86,7 @@ export function toThreadMessageLike(
       : undefined;
   // 锁定 runtime 从 metadata.custom["ag-ui"].interrupts 恢复待审批中断：
   // 不写入则刷新后 getPendingInterrupts() 为空，无法 resume / steer-away
-  const metadata = message.pending_interrupt && message.interrupts.length > 0
+  const metadata = message.pending_interrupt && message.interrupts.length > 0 && options.actionable
     ? { custom: { "ag-ui": { interrupts: message.interrupts } } }
     : undefined;
   return {
@@ -105,10 +106,14 @@ export function exportRepositoryOf(thread: AgentThread): ReturnType<typeof Expor
       toolResults.set(message.tool_call_id, message.content);
     }
   }
+  // 只有 awaiting + 服务端确认可恢复时，interrupts 才是 actionable；
+  // 否则 pending 内容可见但不注入恢复 metadata（刷新后不可误恢复）。
+  const actionable = thread.last_run?.status === "awaiting_approval"
+    && thread.resume_available === true;
   let parentId: string | null = null;
   const items = [] as Array<{ message: ThreadMessageLike; parentId: string | null }>;
   for (const message of thread.messages) {
-    const converted = toThreadMessageLike(message, toolResults);
+    const converted = toThreadMessageLike(message, toolResults, { actionable });
     if (converted) {
       items.push({ message: converted, parentId });
       parentId = message.id;

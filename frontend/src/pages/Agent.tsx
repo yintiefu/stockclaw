@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { AgentThread } from "@/components/agent/AgentThread";
 import { AgentThreadList } from "@/components/agent/AgentThreadList";
+import { ApprovalPanel } from "@/components/agent/ApprovalPanel";
 import { CapabilityBar } from "@/components/agent/CapabilityBar";
 import { CapabilityManagerDialog } from "@/components/agent/CapabilityManagerDialog";
 import {
@@ -30,6 +31,7 @@ export function Agent() {
   // 流结束→权威 reload 完成期间禁用输入，防止携带旧历史发送
   const [converging, setConverging] = useState(false);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
+  const [unavailable, setUnavailable] = useState<string | null>(null);
   const [statusNote, setStatusNote] = useState<string | null>(null);
 
   const controllerRef = useRef<AgentHistoryController | null>(null);
@@ -95,6 +97,10 @@ export function Agent() {
   }, [controller, syncFromController]);
   const onError = useCallback((error: Error) => {
     setRuntimeError(error.message || "Agent 运行出错");
+  }, []);
+  // 流开始前的 503（MCP_UNAVAILABLE）：保留消息、不重试、不 409 reload
+  const onUnavailable = useCallback((detail: string) => {
+    setUnavailable(detail);
   }, []);
 
   const complete = Boolean(
@@ -287,6 +293,15 @@ export function Agent() {
           {runtimeError}
         </div>
       )}
+      {unavailable && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm text-muted-foreground">
+          <span>MCP 服务不可用：{unavailable}（本次提问未发出，请修复连接后重试）</span>
+          <button type="button" onClick={() => setManagerOpen(true)}
+            className="shrink-0 rounded-md px-2 py-1 text-xs text-primary hover:bg-primary/10">
+            管理 MCP
+          </button>
+        </div>
+      )}
 
       <section className="glass-card space-y-3 rounded-xl p-4">
         <AgentThreadList
@@ -312,15 +327,23 @@ export function Agent() {
             config={saved ?? draft}
             onConflict={onConflict}
             onError={onError}
+            onUnavailable={onUnavailable}
             controller={controller}
             onRuntime={(refs) => {
               runtimeRefs.current = refs;
             }}
             onStreamEnd={onStreamEnd}
           >
+            {activeThread.last_run?.status === "awaiting_approval" && activeThread.resume_available && (
+              <div className="mb-3">
+                <ApprovalPanel disabled={converging} />
+              </div>
+            )}
             <AgentThread
               activeThread={activeThread}
               composerDisabled={converging}
+              pendingApproval={activeThread.last_run?.status === "awaiting_approval"
+                && activeThread.resume_available === true}
               onRetry={handleRetry}
               statusNote={statusNote ?? (activeThread.last_run?.status === "interrupted"
                 ? "后端重启导致上次运行中断，可重试本轮"

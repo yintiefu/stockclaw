@@ -38,6 +38,8 @@ export type AgentThread = {
   messages: AgentMessage[];
   artifact_ids: string[];
   last_run: AgentRunSummary | null;
+  /** 计算字段：仅 thread detail 响应携带，不持久化。 */
+  resume_available?: boolean;
 };
 
 export type AgentThreadSummary = {
@@ -182,4 +184,28 @@ export type StdioTrustPreview = {
   resolved_executable: string;
   args: string[];
   fingerprint: string;
+};
+
+/** Task 1C：审批交互类型。 */
+export type McpInterruptMetadata = {
+  source: "mcp";
+  serverId: string;
+  serverName: string;
+  toolName: string;
+  toolAlias: string;
+  arguments: Record<string, unknown>;
+};
+
+export type AgentInterruptPayload = {
+  id: string;
+  reason?: string;
+  message?: string;
+  toolCallId?: string;
+  responseSchema?: Record<string, unknown>;
+} & Partial<McpInterruptMetadata>;
+
+export type ApprovalDecision = {
+  id: string;
+  decision: "approve" | "reject";
+  scope: "once" | "thread_session";
 };

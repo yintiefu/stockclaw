@@ -19,6 +19,8 @@ export type AgentTransportOptions = {
   onRevision?: (threadId: string, revision: number) => void;
   /** 流结束（终局 / 停止 / 断连）后触发一次，用于收敛到服务端权威状态。 */
   onStreamEnd?: () => void;
+  /** 流开始前的 503（MCP_UNAVAILABLE）：不重试、不 reload。 */
+  onUnavailable?: (detail: string) => void;
 };
 
 function parseSsePayload(line: string): Record<string, unknown> | null {
@@ -86,6 +88,13 @@ export class AgentHttpAgent extends HttpAgent {
       if (response.status === 409) {
         const payload = await response.clone().json().catch(() => ({})) as Conflict;
         onConflict(payload);
+        return response;
+      }
+      if (response.status === 503) {
+        // fail-closed MCP 准入失败：流从未开始。只上报脱敏 detail；
+        // 不触发 409 权威 reload，也不自动重试。
+        const payload = await response.clone().json().catch(() => ({})) as Conflict;
+        transportOptions.onUnavailable?.(payload.detail ?? payload.code ?? "MCP 服务不可用");
         return response;
       }
       // 流内 RUN_ERROR / thread.revision.updated 不会走 runtime 回调，
@@ -163,6 +172,7 @@ export function AgentRuntimeProvider({
   controller,
   onRuntime,
   onStreamEnd,
+  onUnavailable,
   children,
 }: {
   config: AgentModelConfig;
@@ -171,6 +181,7 @@ export function AgentRuntimeProvider({
   controller?: AgentHistoryController;
   onRuntime?: (refs: { agent: AgentHttpAgent; startRun: (parentId: string | null) => void }) => void;
   onStreamEnd?: () => void;
+  onUnavailable?: (detail: string) => void;
   children: ReactNode;
 }) {
   const threadId = controller?.getActiveThreadId() ?? null;
@@ -189,11 +200,12 @@ export function AgentRuntimeProvider({
         getRevision,
         onRevision: (id, revision) => controller?.applyRevision(id, revision),
         onStreamEnd,
+        onUnavailable,
       },
     ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [config, onConflict, onError, getThreadId, getRevision, onStreamEnd],
+    [config, onConflict, onError, getThreadId, getRevision, onStreamEnd, onUnavailable],
   );
   const historyAdapter = useMemo(() => controller?.historyAdapter(), [controller, threadId]);
   const runtime = useAgUiRuntime({
