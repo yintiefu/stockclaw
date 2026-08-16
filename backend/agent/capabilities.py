@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
-from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware import AgentMiddleware, HumanInTheLoopMiddleware
 from langchain_core.tools import BaseTool
 
+from agent.mcp import McpRegistry, McpServer, McpToolBinding, StdioTrustRequired
 from agent.skills import SkillRegistry, SkillRuntimeItem, SkillRuntimeSnapshot
 
 
@@ -27,7 +29,7 @@ class CapabilityLease:
     """一次 run 的能力租约：工具目录 + 系统上下文 + 请求级中间件工厂。
 
     密钥只在 build_request_middleware(secrets) 时被消费，绝不出现在本对象上。
-    aclose() 幂等且恰好执行一次底层释放。
+    aclose() 幂等且恰好执行一次底层释放。mcp_bindings 无 session/密钥。
     """
 
     def __init__(
@@ -37,12 +39,20 @@ class CapabilityLease:
         system_context: str,
         middleware: tuple = (),
         skill_digests: tuple[tuple[str, str], ...] = (),
+        mcp_bindings: tuple = (),
+        thread_id: str = "",
+        allowances: "AllowanceRegistry | None" = None,
+        registry: "McpRegistry | None" = None,
         on_release: Callable[[], None] | None = None,
     ):
         self._tools = tuple(tools)
         self.system_context = system_context
         self._middleware = tuple(middleware)
         self.skill_digests = tuple(skill_digests)
+        self.mcp_bindings = tuple(mcp_bindings)
+        self._thread_id = thread_id
+        self._allowances = allowances
+        self._registry = registry
         self._released = False
 
         def _release() -> None:
@@ -60,8 +70,24 @@ class CapabilityLease:
         return tuple(name for name, _ in self.skill_digests)
 
     def build_request_middleware(self, secrets) -> tuple:
-        """请求级中间件；切片 1 的 Skill lease 不追加额外中间件。"""
-        return self._middleware
+        """请求级中间件：附加中间件 + （有 MCP bindings 时）guard 先于 HITL。"""
+        middleware = list(self._middleware)
+        if self.mcp_bindings:
+            registry_secrets = (
+                {sid: set(vals) for sid, vals in self._registry.secret_sets().items()}
+                if self._registry is not None else {})
+            guard = McpArgumentGuard(
+                aliases={b.alias for b in self.mcp_bindings},
+                secrets=secrets,
+                registry_secrets=registry_secrets,
+            )
+            hitl = build_hitl_policy(
+                thread_id=self._thread_id,
+                bindings=self.mcp_bindings,
+                allowances=self._allowances or AllowanceRegistry(),
+            )
+            middleware = [*middleware, guard, hitl]
+        return tuple(middleware)
 
     async def aclose(self) -> None:
         self.release()
@@ -78,7 +104,128 @@ class StaticCapabilityLease(CapabilityLease):
 
 
 class CapabilityUnavailable(RuntimeError):
+    """fail-closed 准入：相关 server 不可用（HTTP 503 语义）。"""
+
     code = "MCP_UNAVAILABLE"
+
+
+class McpUnavailable(CapabilityUnavailable):
+    pass
+
+
+class McpArgumentsTooLarge(RuntimeError):
+    code = "MCP_ARGUMENTS_TOO_LARGE"
+
+
+ARGUMENTS_BYTE_LIMIT = 65_536
+
+
+def _redact_value(value, secrets: set[str]):
+    if isinstance(value, str):
+        text = value
+        for secret in secrets:
+            if secret:
+                text = text.replace(secret, "[redacted]")
+        return text
+    if isinstance(value, dict):
+        return {k: _redact_value(v, secrets) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_value(v, secrets) for v in value]
+    return value
+
+
+class McpArgumentGuard(AgentMiddleware):
+    """请求级 MCP 参数守卫：模型响应后、HITL/写状态前检查 tool call 参数。
+
+    只对副本脱敏做大小检查；不修改原始参数、不产生 interrupt、不触发任何
+    MCP server I/O。超限抛 McpArgumentsTooLarge（无敏感详情）。
+    """
+
+    def __init__(self, *, aliases: tuple[str, ...] | set[str], secrets,
+                 registry_secrets: dict[str, set[str]] | None = None):
+        super().__init__()
+        self._aliases = frozenset(aliases)
+        self._model_key = secrets.model_api_key.get_secret_value() if secrets is not None else ""
+        self._registry_secrets = registry_secrets or {}
+
+    def _encoded_size(self, arguments: dict) -> int:
+        secret_pool = {self._model_key}
+        for values in self._registry_secrets.values():
+            secret_pool |= values
+        redacted = _redact_value(arguments, {s for s in secret_pool if s})
+        encoded = json.dumps(redacted, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"))
+        return len(encoded.encode("utf-8"))
+
+    async def awrap_model_call(self, state, runtime, call_llm, **kwargs):
+        from langchain_core.messages import AIMessage
+
+        response = await call_llm(**kwargs)
+        messages = response if isinstance(response, list) else [response]
+        for message in messages:
+            if not isinstance(message, AIMessage):
+                continue
+            for tool_call in message.tool_calls or []:
+                if tool_call.get("name") in self._aliases:
+                    if self._encoded_size(tool_call.get("args") or {}) > ARGUMENTS_BYTE_LIMIT:
+                        raise McpArgumentsTooLarge(
+                            f"{McpArgumentsTooLarge.code}: MCP tool call 参数超过 64 KB")
+        return response
+
+
+class AllowanceRegistry:
+    """线程级 thread_session 许可（内存，不落盘）。"""
+
+    def __init__(self):
+        self._granted: set[tuple[str, str, str]] = set()
+
+    def has(self, thread_id: str, server_id: str, original_tool_name: str) -> bool:
+        return (thread_id, server_id, original_tool_name) in self._granted
+
+    def grant(self, thread_id: str, server_id: str, original_tool_name: str) -> None:
+        self._granted.add((thread_id, server_id, original_tool_name))
+
+    def clear_thread(self, thread_id: str) -> int:
+        removed = [k for k in self._granted if k[0] == thread_id]
+        self._granted -= set(removed)
+        return len(removed)
+
+    def clear_server(self, server_id: str) -> int:
+        removed = [k for k in self._granted if k[1] == server_id]
+        self._granted -= set(removed)
+        return len(removed)
+
+    def clear_tool(self, server_id: str, original_tool_name: str) -> int:
+        removed = [k for k in self._granted
+                   if k[1] == server_id and k[2] == original_tool_name]
+        self._granted -= set(removed)
+        return len(removed)
+
+    def clear_all(self) -> int:
+        count = len(self._granted)
+        self._granted.clear()
+        return count
+
+
+def build_hitl_policy(*, thread_id: str, bindings, allowances: AllowanceRegistry):
+    """穷举 HITL：interrupt_on 集合与已启用 alias 严格相等。"""
+    interrupt_on = {}
+    for binding in bindings:
+        def _when(request, _b=binding):
+            return not allowances.has(thread_id, _b.server_id, _b.original_name)
+
+        description = f"MCP 工具 {_b_description(binding)} 需要审批"
+        interrupt_on[binding.alias] = {
+            "allowed_decisions": ["approve", "reject"],
+            "when": _when,
+            "description": description,
+        }
+    assert set(interrupt_on) == {binding.alias for binding in bindings}
+    return HumanInTheLoopMiddleware(interrupt_on=interrupt_on)
+
+
+def _b_description(binding) -> str:
+    return f"{binding.server_id}/{binding.original_name}"
 
 
 class SkillUnavailableError(RuntimeError):
@@ -91,10 +238,14 @@ class CapabilityResolver:
     切片 2 之前不向 Graph 暴露任何 MCP alias。
     """
 
-    def __init__(self, skills: SkillRegistry, tools_provider=None):
+    def __init__(self, skills: SkillRegistry, tools_provider=None,
+                 registry: McpRegistry | None = None,
+                 allowances: "AllowanceRegistry | None" = None):
         self._skills = skills
         # 组合点可注入（router 测试接缝）；默认走 tool_registry
         self._tools_provider = tools_provider
+        self._registry = registry
+        self._allowances = allowances
 
     async def acquire(self, preview: CapabilityPreview) -> CapabilityLease:
         registry = self._skills
@@ -117,6 +268,11 @@ class CapabilityResolver:
         snapshot = SkillRuntimeSnapshot.from_records(generation.number, tuple(items))
         skill_tools = snapshot.build_tools(registry)
 
+        # 切片 3：fail-closed MCP 准入（相关 server 全部连接成功才给 bindings）
+        bindings: tuple = ()
+        if self._registry is not None:
+            bindings = await self._admit_mcp(preview.thread_id)
+
         # 内置工具与 Skill 工具组合（tool_registry 是唯一组合点）
         if self._tools_provider is not None:
             tools = await asyncio.to_thread(self._tools_provider, skill_tools)
@@ -124,8 +280,63 @@ class CapabilityResolver:
             from agent.tool_registry import compose_run_tools
 
             tools = await asyncio.to_thread(compose_run_tools, skill_tools)
+        if bindings:
+            tools = [*tools, *(b.as_langchain_tool(self._registry) for b in bindings)]
         return CapabilityLease(
             tools=tools,
             system_context=snapshot.render_catalog(),
             skill_digests=tuple(digests),
+            mcp_bindings=bindings,
+            thread_id=preview.thread_id,
+            allowances=self._allowances,
+            registry=self._registry,
         )
+
+    async def _admit_mcp(self, thread_id: str) -> tuple:
+        """相关 server = 全局 enabled 且 catalog 至少一个 enabled tool。
+
+        任一相关 server 连接失败 → 释放全部部分引用并抛 McpUnavailable。
+        """
+        assert self._registry is not None
+        doc = await asyncio.to_thread(self._registry.store.load)
+        relevant: list[McpServer] = [
+            server for server in doc.servers
+            if server.enabled and any(tool.enabled for tool in server.tools)
+        ]
+        if not relevant:
+            return ()
+        bindings: list = []
+        admitted: list[str] = []
+        for server in relevant:
+            try:
+                refreshed = await self._registry.refresh(server.id)
+            except Exception as exc:
+                # fail-closed：释放已成功的部分引用，返回脱敏有界错误
+                for sid in admitted:
+                    await self._registry._close_server(sid)
+                detail = str(exc)[:200]
+                raise McpUnavailable(
+                    f"MCP server {server.display_name} 无法连接：{detail}"
+                ) from exc
+            admitted.append(server.id)
+            generation = self._registry._sessions.get(server.id)
+            tools_by_original = generation.tools if generation else {}
+            for entry in refreshed.tools:
+                if not entry.enabled:
+                    continue
+                adapter_tool = tools_by_original.get(entry.original_name)
+                if adapter_tool is None:
+                    raise McpUnavailable(
+                        f"MCP server {server.display_name} 目录与连接不一致")
+                from agent.mcp import _tool_args_schema
+
+                bindings.append(McpToolBinding(
+                    server_id=server.id,
+                    original_name=entry.original_name,
+                    alias=entry.alias,
+                    description=entry.description,
+                    args_schema=_tool_args_schema(adapter_tool),
+                    config_generation=doc.revision,
+                    catalog_generation=generation.number if generation else 0,
+                ))
+        return tuple(bindings)

@@ -32,19 +32,34 @@ INTERRUPT_RESPONSE_SCHEMA = {
         "scope": {"enum": ["once", "thread_session"]},
     },
     "required": ["decision", "scope"],
+    "additionalProperties": False,
 }
 
 
 def interrupt_payloads(pending: list[PendingInterrupt]) -> list[dict[str, Any]]:
     """待审批中断的标准载荷；SSE 与持久化元数据共用同一形状，
-    前端经 metadata.custom["ag-ui"].interrupts 水合后可直接 resume。"""
-    return [{
-        "id": item.bridge_interrupt_id,
-        "reason": "tool_call",
-        "message": item.value["action_requests"][0].get("description", "Tool approval required"),
-        "toolCallId": item.tool_call_id,
-        "responseSchema": INTERRUPT_RESPONSE_SCHEMA,
-    } for item in pending]
+    前端经 metadata.custom["ag-ui"].interrupts 水合后可直接 resume。
+    MCP 自定义元数据固定 camelCase，即使经 REST history 也不转 snake_case。"""
+    payloads = []
+    for item in pending:
+        payload = {
+            "id": item.bridge_interrupt_id,
+            "reason": "tool_call",
+            "message": item.value["action_requests"][0].get("description", "Tool approval required"),
+            "toolCallId": item.tool_call_id,
+            "responseSchema": INTERRUPT_RESPONSE_SCHEMA,
+        }
+        if item.tool_alias is not None:
+            payload.update({
+                "source": "mcp",
+                "serverId": item.server_id,
+                "serverName": item.server_name,
+                "toolName": item.original_tool_name,
+                "toolAlias": item.tool_alias,
+                "arguments": item.arguments or {},
+            })
+        payloads.append(payload)
+    return payloads
 
 
 def thread_revision_updated(thread_id: str, revision: int, persisted_at: str) -> CustomEvent:
@@ -61,12 +76,20 @@ def thread_revision_updated(thread_id: str, revision: int, persisted_at: str) ->
 
 @dataclass(frozen=True)
 class PendingInterrupt:
-    """桥接层自有 ID 的待审批中断；顺序独立于 LangGraph 内部 ID。"""
+    """桥接层自有 ID 的待审批中断；顺序独立于 LangGraph 内部 ID。
+
+    1C：MCP 中断附加已脱敏的无密钥元数据（camelCase 只在线格式出现）。
+    """
 
     bridge_interrupt_id: str
     order: int
     tool_call_id: str
     value: dict[str, Any]
+    server_id: str | None = None
+    server_name: str | None = None
+    original_tool_name: str | None = None
+    tool_alias: str | None = None
+    arguments: dict[str, Any] | None = None
 
 
 class AgentProtocolBridge:
@@ -165,6 +188,34 @@ class AgentProtocolBridge:
     def is_steer_away(self, entries: list[dict[str, Any]]) -> bool:
         ordered = self._ordered_entries(entries)
         return bool(ordered) and all(entry.get("status") == "cancelled" for entry in ordered)
+
+    def resume_value_with_allowances(
+        self, entries: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], list[tuple[str, str, str]]]:
+        """校验三合法组合；返回 (resume 值, 拟登记的 thread_session 许可)。
+
+        不 mutate 任何注册表——许可写入由 coordinator 在持久化成功后执行。
+        """
+        thread_id = self.thread_id
+        # _ordered_entries 已校验：完整、无重复、无未知 ID、按原始顺序排列
+        ordered = self._ordered_entries(entries)
+        decisions = []
+        allowances: list[tuple[str, str, str]] = []
+        for entry, item in zip(ordered, sorted(self.pending, key=lambda p: p.order)):
+            if entry.get("status") != "resolved":
+                raise ValueError("cancelled interrupts are transport-level steer-away, not HITL decisions")
+            payload = entry.get("payload") or {}
+            if payload == {"decision": "approve", "scope": "once"}:
+                decisions.append({"type": "approve"})
+            elif payload == {"decision": "approve", "scope": "thread_session"}:
+                decisions.append({"type": "approve"})
+                if item.server_id and item.original_tool_name:
+                    allowances.append((thread_id, item.server_id, item.original_tool_name))
+            elif payload == {"decision": "reject", "scope": "once"}:
+                decisions.append({"type": "reject", "message": "User rejected the tool call"})
+            else:
+                raise ValueError("unsupported approval payload")
+        return {"decisions": decisions}, allowances
 
     def resume_value(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
         ordered = self._ordered_entries(entries)

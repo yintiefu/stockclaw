@@ -414,6 +414,10 @@ class McpRegistry:
 
     # ---- 状态 ----
 
+    def secret_sets(self) -> dict[str, set[str]]:
+        """当前已解析 secret 集合（仅用于脱敏边界；关闭时清空）。"""
+        return {sid: set(values) for sid, values in self._secret_sets.items()}
+
     @property
     def process_count(self) -> int:
         return sum(1 for gen in self._sessions.values() if gen.state != "closed")

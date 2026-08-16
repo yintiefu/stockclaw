@@ -202,7 +202,7 @@ async def test_resume_appends_protocol_id_to_same_product_run(tmp_path):
         model_ref=MODEL_REF,
         secrets=SECRETS,
         model_builder=CountingBuilder(),
-        validate=lambda pending: {"int-1": {"accepted": True}},
+        validate=lambda pending: ({"int-1": {"accepted": True}}, []),
         client_revision=handle.thread_revision,
         protocol_run_id="protocol-2",
     )
@@ -987,7 +987,7 @@ async def test_approval_wait_accounted_and_active_excludes_it(tmp_path):
         model_ref=MODEL_REF,
         secrets=SECRETS,
         model_builder=CountingBuilder(),
-        validate=lambda pending: {"int-1": {"accepted": True}},
+        validate=lambda pending: ({"int-1": {"accepted": True}}, []),
         client_revision=handle.thread_revision,
         protocol_run_id="protocol-2",
     )

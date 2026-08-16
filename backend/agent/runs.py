@@ -11,7 +11,13 @@ from ag_ui.core.types import RunAgentInput
 
 from agent.models import AgentMessage, ModelRef, RunDocument, RunSecrets, RunSummary, RunUsage, ThreadDocument
 from agent.protocol import PendingInterrupt, interrupt_payloads
-from agent.capabilities import CapabilityLease, CapabilityPreview, CapabilityResolver, StaticCapabilityLease
+from agent.capabilities import (
+    AllowanceRegistry,
+    CapabilityLease,
+    CapabilityPreview,
+    CapabilityResolver,
+    StaticCapabilityLease,
+)
 from agent.runtime import AgentFactory, RuntimeHandle
 from agent.skills import SkillError
 from agent.stores import DocumentNotFound, RevisionConflict, utc_now
@@ -389,6 +395,7 @@ class RunCoordinator:
         runs: "RunStore | None" = None,
         resolver: CapabilityResolver | None = None,
         middleware_provider: Callable[[], tuple] | None = None,
+        allowances: "AllowanceRegistry | None" = None,
     ):
         self._factory = factory or AgentFactory()
         self._locks: dict[str, asyncio.Lock] = {}
@@ -400,6 +407,8 @@ class RunCoordinator:
         self._resolver = resolver
         # 1C：请求级附加中间件提供方（router 的 build_middleware 接缝）
         self._middleware_provider = middleware_provider
+        # 1C：thread_session 审批许可（内存；resume 持久化成功后写入）
+        self._allowances = allowances
 
     def _lock(self, thread_id: str) -> asyncio.Lock:
         if thread_id not in self._locks:
@@ -449,6 +458,16 @@ class RunCoordinator:
         if handle.capability_lease is not None:
             handle.capability_lease.release()
             handle.capability_lease = None
+
+    def mcp_server_in_use(self, server_id: str) -> bool:
+        for handle in self._handles.values():
+            if handle.phase not in ("running", "awaiting_approval"):
+                continue
+            lease = handle.capability_lease
+            if lease is not None and any(
+                    b.server_id == server_id for b in lease.mcp_bindings):
+                return True
+        return False
 
     def skill_in_use(self, name: str) -> bool:
         for handle in self._handles.values():
@@ -842,7 +861,8 @@ class RunCoordinator:
                     raise RevisionConflict(
                         f"线程 {thread_id} 期望 revision {expected}，实际 {thread.revision}"
                     )
-            resume_value = validate(handle.pending_interrupts)  # ValueError → 交给调用方 400
+            # validate 返回 (resume 值, 拟登记许可)；许可只在重建+持久化成功后写入
+            resume_value, proposed_allowances = validate(handle.pending_interrupts)
 
             def _rebuild_and_record() -> None:
                 self._factory.resume(
@@ -870,6 +890,9 @@ class RunCoordinator:
             await asyncio.to_thread(_rebuild_and_record)
             handle.phase = "running"
             handle.pending_interrupts = []
+            if self._allowances is not None:
+                for thread_id_, server_id, tool_name in proposed_allowances:
+                    self._allowances.grant(thread_id_, server_id, tool_name)
             return handle, resume_value
 
     async def acquire_steer_away(

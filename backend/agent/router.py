@@ -43,7 +43,7 @@ from agent.stores import (
     reconcile_agent_data,
     utc_now,
 )
-from agent.capabilities import CapabilityResolver
+from agent.capabilities import AllowanceRegistry, CapabilityResolver, McpUnavailable
 from agent.mcp import (
     McpError,
     McpRegistry,
@@ -78,14 +78,18 @@ def build_services(root: Path | None = None) -> AgentServices:
     importer = SkillImporter(paths.skills, skills)
     registry = McpRegistry.for_root(paths.root)
 
+    allowances = AllowanceRegistry()
+
     def _run_tools(skill_tools=()):
         # 测试接缝：1A/1B 通过 monkeypatch agent.router.build_builtin_tools 注入
         return [*build_builtin_tools(), *skill_tools]
 
     coordinator = RunCoordinator(
         factory=coordinator._factory, threads=threads, runs=runs,
-        resolver=CapabilityResolver(skills, tools_provider=_run_tools),
+        resolver=CapabilityResolver(skills, tools_provider=_run_tools,
+                                    registry=registry, allowances=allowances),
         middleware_provider=lambda: build_middleware(),
+        allowances=allowances,
     )
     return AgentServices(paths, threads, runs, coordinator, skills, importer, registry)
 
@@ -302,7 +306,7 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                 model_ref=model_ref,
                 secrets=secrets,
                 model_builder=model_builder,
-                validate=lambda pending: AgentProtocolBridge("", "", pending=pending).resume_value(resume_entries),
+                validate=lambda pending: AgentProtocolBridge("", "", pending=pending).resume_value_with_allowances(resume_entries),
                 protocol_run_id=run_id,
                 client_revision=runtime_props.thread_revision,
             )
@@ -322,6 +326,10 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
     except SkillError as exc:
         # 能力错误发生在任何 user/run 写入之前（400/404/409）
         return _skill_error_response(exc)
+    except McpUnavailable as exc:
+        # fail-closed：相关 MCP server 不可用（流开始前 503，不触发 409 reload）
+        return JSONResponse(status_code=503, content={
+            "code": "MCP_UNAVAILABLE", "detail": str(exc)})
     except ThreadBusy as exc:
         return _conflict_response(exc.code, str(exc), thread_id=thread_id)
     except ResumeRejected as exc:
@@ -861,8 +869,20 @@ async def add_mcp_server(payload: McpAdd):
     return doc.model_dump(mode="json")
 
 
+
+async def _reject_mcp_busy(server_id: str) -> JSONResponse | None:
+    if await asyncio.to_thread(services.coordinator.mcp_server_in_use, server_id):
+        return JSONResponse(status_code=409, content={
+            "code": "MCP_CONFIG_BUSY",
+            "detail": f"MCP server {server_id} 正被活跃运行引用，不能修改配置或重连"})
+    return None
+
+
 @router.patch("/mcp/{server_id}")
 async def patch_mcp_server(server_id: str, payload: McpPatch):
+    busy = await _reject_mcp_busy(server_id)
+    if busy is not None:
+        return busy
     from agent.mcp import StdioTransport, StreamableHttpTransport
 
     def mutate(server):
@@ -898,6 +918,9 @@ async def patch_mcp_server(server_id: str, payload: McpPatch):
 
 @router.delete("/mcp/{server_id}")
 async def delete_mcp_server(server_id: str, revision: int = Query(...)):
+    busy = await _reject_mcp_busy(server_id)
+    if busy is not None:
+        return busy
     try:
         warnings = await services.registry.delete(server_id, revision)
     except McpError as exc:
@@ -931,6 +954,9 @@ async def trust_mcp_server(server_id: str, payload: McpTrust):
 
 @router.post("/mcp/{server_id}/test")
 async def test_mcp_server(server_id: str, payload: McpAction):
+    busy = await _reject_mcp_busy(server_id)
+    if busy is not None:
+        return busy
     try:
         health = await services.registry.test(server_id)
     except McpError as exc:
@@ -943,6 +969,9 @@ async def test_mcp_server(server_id: str, payload: McpAction):
 
 @router.post("/mcp/{server_id}/refresh")
 async def refresh_mcp_server(server_id: str, payload: McpAction):
+    busy = await _reject_mcp_busy(server_id)
+    if busy is not None:
+        return busy
     try:
         await services.registry.refresh(server_id)
     except McpError as exc:
