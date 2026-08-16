@@ -1,7 +1,7 @@
 # 1C 端到端验证记录（2026-08-16）
 
-**结论：PARTIAL**（自动化门禁与 mootdx live 冒烟全部通过；浏览器审批提交闭环与真实
-provider 审批流两项未完成，见「未完成项」。）
+**结论：PARTIAL**（自动化门禁、mootdx live 冒烟、浏览器审批/steer-away/503 闭环全部通过；
+仅剩真实 provider 审批流一项未执行——本环境无可用 API key。）
 
 ## 提交范围
 
@@ -66,16 +66,27 @@ puppeteer-core 驱动本机 Chrome。截图存 `/tmp/vr-e2e-shots/`（14 张）�
 本环境没有可用的 OpenAI 兼容 function-calling key（密钥只存用户浏览器
 localStorage，后端/测试均无）。**未执行**，需用户提供 provider 后补验。
 
-## 浏览器审批提交闭环（approve/reject/steer-away）⚠️ PARTIAL
+## 浏览器审批提交闭环（approve/steer-away/503）✅ PASS（2026-08-16 二轮）
 
-- 后端链路完整且由 pytest 覆盖：三合法决策组合、许可写于持久化之后、
-  interrupt camelCase 元数据、`MCP_UNAVAILABLE` 503、allowance 清理。
-- 浏览器内：审批面板可恢复渲染、SteerAwayComposer 正确替换普通输入框；
-  但提交决定时锁定 runtime 以 start 形状重发请求（HTTP 400
-  `INVALID_REQUEST_SHAPE`），未携带 `forwardedProps.command.resume` 条目。
-  怀疑是 `useAgUiSubmitInterruptResponses` 对“从历史恢复（非活跃 run 注册）”
-  的 interrupts 不构造 resume 载荷；属 @assistant-ui/react-ag-ui 集成缺口，
-  需在活跃 run 内（不刷新页面）提交或进一步适配该 hook。
+根因定位并修复：`@ag-ui/client` 的 `prepareRunAgentInput` 把 resume 放在请求体
+顶层 `resume` 字段，而后端合同是 `forwardedProps.command.resume`（纯 resume 还要求
+messages 为空）。在 `AgentHttpAgent.requestInit` 做协议翻译后全链路打通：
+
+1. **中断+元数据**：stub 模型触发 `mcp__fixture__echo` 工具调用 → HITL 中断 →
+   审批面板 2 秒内出现，含 server 名/alias/脱敏参数/三选项（截图 e2e-01）。
+2. **approve once**：提交 → resume → 工具真实执行（thread JSON：
+   user→assistant(tool_call)→tool("你好")→assistant 完成）（截图 e2e-02）。
+3. **steer-away**：待审批中经 SteerAwayComposer 发新问题 → 旧 run 持久化为
+   `cancelled/STEERED_AWAY`、旧工具零执行、新 run 正常准入（截图 e2e-03）。
+4. **503 fail-closed**：把 fixture executable 改坏后发消息 → 预流 503 横幅 +
+   「管理 MCP」入口、无自动重试、user 消息与 revision 零写入（截图 e2e-04）。
+
+二轮中发现并修复的新缺陷：
+- **配置变更后缓存会话未失效**：transport 改动后准入仍复用旧配置的健康会话
+  （503 用例未触发）。已在 `McpRegistry.patch_server` 后把该 server 会话世代转
+  draining，并补回归测试。
+- 顺带验证了 Critical-2 修复：取消 awaiting run 后 MCP PATCH 不再报
+  `MCP_CONFIG_BUSY`（租约正确释放）。
 
 ## Step 5 mootdx live 冒烟 ✅ PASS
 
@@ -91,9 +102,8 @@ pytest tests/test_live.py -m live -k 'mootdx_kline_route_live or mootdx_finance_
 
 ## 后续待办（不阻塞 1C PARTIAL 结论）
 
-1. 适配 `useAgUiSubmitInterruptResponses` 的历史恢复 resume 路径（或活跃 run 内验证）。
-2. 用户提供真实 provider 后补 Step 4 记录。
-3. `SkillManager.test.tsx` 目前并入 `CapabilityManagerDialog.test.tsx`（计划单列）。
+1. 用户提供真实 provider 后补 Step 4 记录。
+2. `SkillManager.test.tsx` 目前并入 `CapabilityManagerDialog.test.tsx`（计划单列）。
 
 ## Review 修复（2026-08-16，代码评审后）
 

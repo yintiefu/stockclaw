@@ -132,10 +132,27 @@ export class AgentHttpAgent extends HttpAgent {
   }
 
   protected requestInit(input: RunAgentInput): RequestInit {
-    const forwardedProps = input.forwardedProps ?? {};
+    let forwardedProps = input.forwardedProps ?? {};
     const runtime = typeof forwardedProps.runtime === "object" && forwardedProps.runtime
       ? forwardedProps.runtime as Record<string, unknown>
       : {};
+    // @ag-ui/client 把 resume 放在顶层字段；后端合同是 forwardedProps.command.resume
+    // （纯 resume 还要求 messages 为空）。这里做协议翻译，不改后端形状。
+    const topLevelResume = (input as { resume?: unknown[] }).resume;
+    let messages = input.messages;
+    if (Array.isArray(topLevelResume) && topLevelResume.length > 0) {
+      const allCancelled = topLevelResume.every(
+        (entry) => typeof entry === "object" && entry !== null
+          && (entry as { status?: string }).status === "cancelled");
+      forwardedProps = {
+        ...forwardedProps,
+        command: { ...(forwardedProps as { command?: object }).command, resume: topLevelResume },
+      };
+      if (!allCancelled) {
+        messages = []; // 纯 resume：不得携带新消息
+      }
+      input = { ...input, resume: undefined };
+    }
     const retryOf = this.armedRetryOf;
     this.armedRetryOf = null;
     const nextRuntime: Record<string, unknown> = {
@@ -156,7 +173,7 @@ export class AgentHttpAgent extends HttpAgent {
       // assistant-ui 内部线程 ID 与服务端线程 ID 不同：一律以服务端为准
       threadId: serverThreadId ?? input.threadId,
       // retry 不携带新消息（messages=[]）；其余形状保持 runtime 生成的历史前缀
-      messages: retryOf ? [] : input.messages,
+      messages: retryOf ? [] : messages,
       forwardedProps: {
         ...forwardedProps,
         runtime: nextRuntime,

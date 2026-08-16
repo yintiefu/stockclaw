@@ -495,3 +495,23 @@ async def test_production_resolver_still_returns_no_mcp_alias(tmp_path):
         lease.release()
     finally:
         await registry.shutdown()
+
+
+async def test_transport_change_drains_cached_session(tmp_path):
+    """连接相关配置变化后，准入/调用不得复用旧配置的缓存会话。"""
+    registry = registry_for(tmp_path)
+    await registry.add(stdio_server())
+    fingerprint = (await registry.trust_preview("fixture")).fingerprint
+    await registry.trust("fixture", fingerprint, registry.store.load().revision)
+    await registry.refresh("fixture")
+    assert registry._sessions["fixture"].state == "accepting"
+    revision = registry.store.load().revision
+    await registry.patch_server("fixture", revision, lambda s: s.model_copy(update={
+        "transport": StdioTransport(executable="/nonexistent/mcp-bin", args=[], env={}),
+    }))
+    # 旧会话不再可用（drained/移除）；下次动作必须按新配置重新连接 → 失败
+    assert registry._sessions.get("fixture") is None \
+        or registry._sessions["fixture"].state != "accepting"
+    with pytest.raises(Exception):
+        await registry.test("fixture")
+    await registry.shutdown()

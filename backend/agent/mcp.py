@@ -448,6 +448,26 @@ class McpRegistry:
             servers = [updated if s.id == server_id else s for s in doc.servers]
             return doc.model_copy(update={"servers": servers})
 
+        def drain_stale_session() -> None:
+            # 连接相关配置（transport/trust/env）变化：当前世代进入 draining，
+            # 下次准入/管理动作按新配置建立 successor（规范 §10.1）
+            import asyncio as _asyncio
+
+            generation = self._sessions.get(server_id)
+            if generation is not None and generation.state == "accepting":
+                generation.state = "draining"
+                generation.stop_event.set()
+                self._sessions.pop(server_id, None)
+
+        result = await asyncio.to_thread(self.store.update, revision, change)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            drain_stale_session()
+        return result
+
         return await asyncio.to_thread(self.store.update, revision, change)
 
     async def delete(self, server_id: str, revision: int) -> list[str]:
