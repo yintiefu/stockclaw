@@ -85,6 +85,10 @@ describe("McpManager", () => {
     render(<McpManager onReload={vi.fn()} disabled={false} />);
     await screen.findByText("本地夹具");
     await user.click(screen.getByRole("button", { name: /信任/ }));
+    // 先显示完整命令与指纹，再由用户确认
+    const previewText = await screen.findByText(/fingerprint/);
+    expect(previewText).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /确认信任此命令/ }));
     await waitFor(() => expect(api.trustMcp).toHaveBeenCalled());
     const args = api.trustMcp.mock.calls[0];
     expect(args[0]).toBe("fixture");

@@ -44,15 +44,17 @@ export function McpManager({ onReload, disabled }: Props) {
     try {
       await fn();
     } catch (e) {
+      const preview = (e as { preview?: StdioTrustPreview }).preview;
+      if (preview) setTrustPreview(preview); // 先呈现完整命令供确认
       const status = (e as { status?: number }).status;
       if (status === 409) {
-        await reload(); // 丢弃本地状态，刷新一次，不自动重放
-        onReload();
+        if (!preview) {
+          await reload(); // 丢弃本地状态，刷新一次，不自动重放
+          onReload();
+        }
         return;
       }
       setError(e instanceof Error ? e.message : "操作失败");
-      const preview = (e as { preview?: StdioTrustPreview }).preview;
-      if (preview) setTrustPreview(preview);
     } finally {
       setBusy(false);
     }
@@ -68,15 +70,15 @@ export function McpManager({ onReload, disabled }: Props) {
 
   const trust = (server: McpServer) =>
     run(async () => {
-      try {
-        await agentApi.testMcp(server.id, doc.revision);
-        return;
-      } catch (e) {
-        const preview = (e as { preview?: StdioTrustPreview }).preview;
-        if (!preview) throw e;
-        setTrustPreview(preview);
-        await agentApi.trustMcp(server.id, doc.revision, preview.fingerprint);
-      }
+      // 触发信任预览；错误交给 run 统一呈现 preview
+      await agentApi.testMcp(server.id, doc.revision);
+    });
+
+  const confirmTrust = (server: McpServer) =>
+    run(async () => {
+      if (!trustPreview) return;
+      await agentApi.trustMcp(server.id, doc.revision, trustPreview.fingerprint);
+      setTrustPreview(null);
       await reload();
       onReload();
     });
@@ -189,6 +191,11 @@ export function McpManager({ onReload, disabled }: Props) {
                   `args:       ${trustPreview.args.join(" ")}`,
                   `fingerprint: ${trustPreview.fingerprint}`,
                 ].join("\n")}</pre>
+                <button type="button" className={`${BTN} mt-1`}
+                  onClick={() => confirmTrust(server)} disabled={disabled || busy}>
+                  <ShieldCheck className="size-3.5" aria-hidden />
+                  确认信任此命令
+                </button>
               </div>
             )}
 

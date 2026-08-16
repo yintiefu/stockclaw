@@ -156,7 +156,7 @@ describe("AgentHistoryController", () => {
   });
 });
 
-it("水合 pending interrupt 元数据到 metadata.custom['ag-ui'].interrupts", async () => {
+it("水合 pending interrupt 元数据到 metadata.custom.agui.interrupts", async () => {
   const doc: AgentThread = {
     ...threaded("th-4", 2, "2026-08-15T12:00:00Z"),
     last_run: { id: "r-1", status: "awaiting_approval", updated_at: "2026-08-15T12:00:00Z", retry_of: null },
@@ -171,6 +171,6 @@ it("水合 pending interrupt 元数据到 metadata.custom['ag-ui'].interrupts", 
   const pending = repo.messages[0].message;
   expect(pending.status).toEqual({ type: "requires-action", reason: "interrupt" });
   const custom = (pending.metadata as { custom?: Record<string, { interrupts?: unknown[] }> } | undefined)?.custom;
-  const interrupts = custom?.["ag-ui"]?.interrupts as Array<Record<string, unknown>>;
+  const interrupts = custom?.agui?.interrupts as Array<Record<string, unknown>>;
   expect(interrupts?.[0]).toMatchObject({ id: "int-1", reason: "tool_call", toolCallId: "call-1" });
 });

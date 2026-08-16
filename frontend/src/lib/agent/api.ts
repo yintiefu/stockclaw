@@ -18,8 +18,19 @@ export class AgentApiError extends Error {
   readonly threadId?: string | null;
   readonly productRunId?: string | null;
   readonly runStatus?: string | null;
+  readonly preview?: {
+    executable: string;
+    resolved_executable: string;
+    args: string[];
+    fingerprint: string;
+  };
 
-  constructor(status: number, payload: AgentConflict) {
+  constructor(status: number, payload: AgentConflict & { preview?: {
+    executable: string;
+    resolved_executable: string;
+    args: string[];
+    fingerprint: string;
+  } }) {
     super(payload.detail ?? payload.code ?? `Agent API 错误（${status}）`);
     this.name = "AgentApiError";
     this.status = status;
@@ -27,6 +38,7 @@ export class AgentApiError extends Error {
     this.threadId = payload.thread_id ?? null;
     this.productRunId = payload.product_run_id ?? null;
     this.runStatus = payload.status ?? null;
+    this.preview = payload.preview;
   }
 }
 
