@@ -676,6 +676,7 @@ class SkillImporter:
     def recover(self) -> list[str]:
         """只处理自有固定名称；归属不明的保留并返回相对名警告。"""
         warnings: list[str] = []
+        self._root.mkdir(parents=True, exist_ok=True)
         backups = {m.group(1): p for p in self._root.iterdir()
                    if p.name.startswith(".") and (m := _BACKUP_RE.fullmatch(p.name))}
         for suffix, backup in backups.items():
