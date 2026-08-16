@@ -6,6 +6,9 @@ import type {
   AgentRun,
   AgentThread,
   AgentThreadListResponse,
+  SkillDetail,
+  SkillImportResult,
+  SkillListResponse,
 } from "./types";
 
 export class AgentApiError extends Error {
@@ -54,10 +57,59 @@ export const agentApi = {
   createThread: (title = "新会话") =>
     agentRequest<AgentThread>("/api/agent/threads", "POST", { title }),
   getThread: (id: string) => agentRequest<AgentThread>(`/api/agent/threads/${encodeURIComponent(id)}`),
-  patchThread: (id: string, revision: number, title: string) =>
-    agentRequest<AgentThread>(`/api/agent/threads/${encodeURIComponent(id)}`, "PATCH", { revision, title }),
+  patchThread: (
+    id: string,
+    revision: number,
+    patch: { title?: string; selected_skills?: string[] },
+  ) =>
+    agentRequest<AgentThread>(`/api/agent/threads/${encodeURIComponent(id)}`, "PATCH", {
+      revision,
+      ...patch,
+    }),
   deleteThread: (id: string, revision: number) =>
     agentRequest<void>(`/api/agent/threads/${encodeURIComponent(id)}`, "DELETE", { revision }),
   cancelRun: (id: string) =>
     agentRequest<AgentRun>(`/api/agent/runs/${encodeURIComponent(id)}/cancel`, "POST"),
+  listSkills: () => agentRequest<SkillListResponse>("/api/agent/skills"),
+  getSkill: (name: string) =>
+    agentRequest<SkillDetail>(`/api/agent/skills/${encodeURIComponent(name)}`),
+  // multipart 上传：不手工设置 Content-Type，让浏览器提供 boundary
+  importSkill: (url: string, archive: File) => {
+    const form = new FormData();
+    form.append("archive", archive);
+    return fetch(url, { method: "POST", headers: authHeaders(), body: form })
+      .then(async (response) => {
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({})) as AgentConflict;
+          throw new AgentApiError(response.status, payload);
+        }
+        return await response.json() as SkillImportResult;
+      });
+  },
+  refreshSkills: () => agentRequest<{ generation: number }>("/api/agent/skills/refresh", "POST"),
+  deleteSkill: (name: string, expectedDigest: string) =>
+    fetch(`/api/agent/skills/${encodeURIComponent(name)}?expected_digest=${encodeURIComponent(expectedDigest)}`, {
+      method: "DELETE",
+      headers: authHeaders(),
+    }).then(async (response) => {
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({})) as AgentConflict;
+        throw new AgentApiError(response.status, payload);
+      }
+      return await response.json() as { deleted: string };
+    }),
+  fetchSkillFile: async (name: string, relativePath: string): Promise<Blob> => {
+    const response = await fetch(
+      `/api/agent/skills/${encodeURIComponent(name)}/files/${relativePath
+        .split("/")
+        .map(encodeURIComponent)
+        .join("/")}`,
+      { headers: authHeaders() },
+    );
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({})) as AgentConflict;
+      throw new AgentApiError(response.status, payload);
+    }
+    return await response.blob();
+  },
 };

@@ -26,6 +26,7 @@ const api = vi.hoisted(() => ({
   getThread: vi.fn(),
   patchThread: vi.fn(),
   deleteThread: vi.fn(),
+  listSkills: vi.fn(),
 }));
 vi.mock("@/lib/agent/api", () => ({ agentApi: api }));
 
@@ -56,6 +57,13 @@ describe("Agent 工作台页面", () => {
     api.getThread.mockImplementation(async (id: string) => threadDoc(id, 1));
     api.patchThread.mockResolvedValue(threadDoc("th-1", 2));
     api.deleteThread.mockResolvedValue(undefined);
+    api.listSkills.mockResolvedValue({
+      generation: 1,
+      skills: [
+        { directory: "quality", name: "quality", description: "质检", digest: "d1", valid: true,
+          error_code: null, error_detail: null },
+      ],
+    });
   });
 
   afterEach(() => {
@@ -149,7 +157,7 @@ describe("Agent 工作台页面", () => {
     await user.clear(screen.getByLabelText("新会话标题"));
     await user.type(screen.getByLabelText("新会话标题"), "改名后的会话");
     await user.click(screen.getByRole("button", { name: "确认" }));
-    await waitFor(() => expect(api.patchThread).toHaveBeenCalledWith("th-1", 3, "改名后的会话"));
+    await waitFor(() => expect(api.patchThread).toHaveBeenCalledWith("th-1", 3, { title: "改名后的会话" }));
     await user.click(screen.getByLabelText("删除会话"));
     await waitFor(() => expect(api.deleteThread).toHaveBeenCalledWith("th-1", expect.any(Number)));
   });
@@ -188,5 +196,35 @@ describe("Agent 工作台页面", () => {
     await completeForm(user);
     await waitFor(() => expect(screen.getByText(/run-9\.json\.corrupt-20260815/)).toBeInTheDocument());
     expect(document.body.textContent ?? "").not.toContain("/agent/runs/");
+  });
+
+  it("能力管理：应用 selected_skills 恰好一次 PATCH 并刷新", async () => {
+    const user = userEvent.setup();
+    render(<MemoryRouter><Agent /></MemoryRouter>);
+    await completeForm(user);
+    await waitFor(() => expect(screen.getByTestId("agent-runtime-stub")).toBeInTheDocument());
+    await user.click(screen.getByRole("button", { name: /能力管理/ }));
+    await user.click(screen.getByRole("checkbox", { name: "quality" }));
+    await user.click(screen.getByRole("button", { name: "应用到本会话" }));
+    await waitFor(() =>
+      expect(api.patchThread).toHaveBeenCalledWith("th-new", 0, { selected_skills: ["quality"] }));
+    expect(api.patchThread).toHaveBeenCalledTimes(1);
+  });
+
+  it("运行中禁用能力管理命令", async () => {
+    api.listThreads.mockResolvedValue({
+      threads: [
+        { id: "th-busy", title: "忙", updated_at: "2026-08-16T00:00:00Z", revision: 1,
+          last_run: { id: "r1", status: "running", updated_at: "t", retry_of: null } },
+      ],
+      warnings: [],
+    });
+    api.getThread.mockImplementation(async (id: string) => threadDoc(id, 1, {
+      last_run: { id: "r1", status: "running", updated_at: "t", retry_of: null },
+    }));
+    const user = userEvent.setup();
+    render(<MemoryRouter><Agent /></MemoryRouter>);
+    await completeForm(user);
+    await waitFor(() => expect(screen.getByRole("button", { name: /能力管理/ })).toBeDisabled());
   });
 });

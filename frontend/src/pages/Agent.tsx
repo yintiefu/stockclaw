@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { AgentThread } from "@/components/agent/AgentThread";
 import { AgentThreadList } from "@/components/agent/AgentThreadList";
+import { CapabilityBar } from "@/components/agent/CapabilityBar";
+import { CapabilityManagerDialog } from "@/components/agent/CapabilityManagerDialog";
 import {
   loadAgentModelConfig,
   saveAgentModelConfig,
@@ -9,7 +11,7 @@ import {
 } from "@/lib/agent/model-config";
 import { AgentHistoryController } from "@/lib/agent/history";
 import { AgentRuntimeProvider, type AgentHttpAgent } from "@/lib/agent/runtime";
-import type { AgentThreadSummary, AgentThread as AgentThreadDoc } from "@/lib/agent/types";
+import type { AgentThreadSummary, AgentThread as AgentThreadDoc, SkillSummary } from "@/lib/agent/types";
 import { agentApi } from "@/lib/agent/api";
 import { ApiError } from "@/lib/api";
 
@@ -39,6 +41,8 @@ export function Agent() {
   const bump = useCallback(() => forceRefresh((n) => n + 1), []);
 
   const [threads, setThreads] = useState<AgentThreadSummary[]>([]);
+  const [skills, setSkills] = useState<SkillSummary[]>([]);
+  const [managerOpen, setManagerOpen] = useState(false);
   const [warnings, setWarnings] = useState<Awaited<ReturnType<typeof agentApi.listThreads>>["warnings"]>([]);
   const [activeThread, setActiveThread] = useState<AgentThreadDoc | null>(null);
   const [loadingThread, setLoadingThread] = useState(true);
@@ -135,6 +139,37 @@ export function Agent() {
       }
     }
   };
+
+  const loadSkills = useCallback(async () => {
+    try {
+      const listed = await agentApi.listSkills();
+      setSkills(listed.skills);
+    } catch {
+      setSkills([]); // 只读降级
+    }
+  }, []);
+
+  useEffect(() => { void loadSkills(); }, [loadSkills]);
+
+  const applySkills = useCallback(async (updated: AgentThreadDoc) => {
+    try {
+      await controller.reload(updated.id);
+      await syncFromController();
+      setManagerOpen(false);
+    } catch {
+      setManagerOpen(false);
+    }
+  }, [controller, syncFromController]);
+
+  const handleSkillConflict = useCallback(async () => {
+    // 409：丢弃草稿并刷新一次（Skill 列表 + 权威线程）
+    await loadSkills();
+    const threadId = controller.getActiveThreadId();
+    if (threadId) {
+      await controller.reload(threadId).catch(() => undefined);
+      await syncFromController();
+    }
+  }, [controller, syncFromController, loadSkills]);
 
   const handleDelete = async (threadId: string) => {
     try {
@@ -264,6 +299,13 @@ export function Agent() {
           onRename={handleRename}
           onDelete={handleDelete}
         />
+        {!loadingThread && activeThread && (
+          <CapabilityBar
+            thread={activeThread}
+            onOpenManager={() => setManagerOpen(true)}
+            disabled={activeBusy || converging}
+          />
+        )}
         {complete && !loadingThread && activeThread ? (
           <AgentRuntimeProvider
             key={`${activeThread.id}-${sessionEpoch}`}
@@ -291,6 +333,17 @@ export function Agent() {
           </div>
         )}
       </section>
+      {!loadingThread && activeThread && (
+        <CapabilityManagerDialog
+          open={managerOpen}
+          thread={activeThread}
+          skills={skills}
+          onApplied={applySkills}
+          onConflict={handleSkillConflict}
+          onClose={() => setManagerOpen(false)}
+          disabled={activeBusy || converging}
+        />
+      )}
     </div>
   );
 }

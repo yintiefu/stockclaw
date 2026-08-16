@@ -97,3 +97,39 @@ export type AgentConflict = {
   product_run_id?: string | null;
   status?: string | null;
 };
+
+/** Task 1C：Skill 管理类型（与后端 /api/agent/skills 线格式一致）。 */
+export type SkillFile = {
+  relative_path: string;
+  category: "skill" | "reference" | "asset" | "script" | "other";
+  size: number;
+  mtime_ns: number;
+  sha256: string;
+  mime: string | null;
+  downloadable: boolean;
+};
+
+export type SkillSummary = {
+  directory: string;
+  name: string | null;
+  description: string | null;
+  digest: string | null;
+  valid: boolean;
+  error_code: string | null;
+  error_detail: string | null;
+};
+
+export type SkillDetail = SkillSummary & {
+  instructions: string | null;
+  files: SkillFile[];
+};
+
+export type SkillListResponse = {
+  generation: number;
+  skills: SkillSummary[];
+};
+
+export type SkillImportResult = {
+  record: SkillDetail;
+  created: boolean;
+};

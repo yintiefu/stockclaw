@@ -204,7 +204,7 @@ export class AgentHistoryController {
   }
 
   async rename(threadId: string, title: string): Promise<void> {
-    const updated = await agentApi.patchThread(threadId, this.getRevision(threadId), title);
+    const updated = await agentApi.patchThread(threadId, this.getRevision(threadId), { title });
     if (this.activeThread?.id === threadId) {
       this.activeThread = updated;
     }

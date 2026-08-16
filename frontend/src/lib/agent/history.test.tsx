@@ -146,7 +146,7 @@ describe("AgentHistoryController", () => {
     const controller = new AgentHistoryController();
     controller.applyRevision("th-1", 3);
     await controller.rename("th-1", "新标题");
-    expect(agentApi.patchThread).toHaveBeenCalledWith("th-1", 3, "新标题");
+    expect(agentApi.patchThread).toHaveBeenCalledWith("th-1", 3, { title: "新标题" });
     expect(controller.getRevision("th-1")).toBe(4);
 
     vi.mocked(agentApi.patchThread).mockRejectedValue(
