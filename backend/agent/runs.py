@@ -11,7 +11,9 @@ from ag_ui.core.types import RunAgentInput
 
 from agent.models import AgentMessage, ModelRef, RunDocument, RunSecrets, RunSummary, RunUsage, ThreadDocument
 from agent.protocol import PendingInterrupt, interrupt_payloads
+from agent.capabilities import CapabilityLease, CapabilityPreview, CapabilityResolver, StaticCapabilityLease
 from agent.runtime import AgentFactory, RuntimeHandle
+from agent.skills import SkillError
 from agent.stores import DocumentNotFound, RevisionConflict, utc_now
 
 if TYPE_CHECKING:
@@ -38,6 +40,8 @@ class ActiveRunHandle:
     history_snapshot: tuple[AgentMessage, ...] = ()
     # 语义边界持久化日志（不含密钥/闭包）
     journal: "RunJournal | None" = None
+    # 1C：本次 run 的能力租约（无密钥）；resume 复用同一 lease
+    capability_lease: CapabilityLease | None = None
 
 
 @dataclass
@@ -383,6 +387,8 @@ class RunCoordinator:
         factory: AgentFactory | None = None,
         threads: "ThreadStore | None" = None,
         runs: "RunStore | None" = None,
+        resolver: CapabilityResolver | None = None,
+        middleware_provider: Callable[[], tuple] | None = None,
     ):
         self._factory = factory or AgentFactory()
         self._locks: dict[str, asyncio.Lock] = {}
@@ -390,6 +396,10 @@ class RunCoordinator:
         # 1B：可选持久化引用；1A 测试仍可 RunCoordinator() 纯内存构造
         self._threads = threads
         self._runs = runs
+        # 1C：能力解析器（未注入时 acquire_* 必须显式传 tools）
+        self._resolver = resolver
+        # 1C：请求级附加中间件提供方（router 的 build_middleware 接缝）
+        self._middleware_provider = middleware_provider
 
     def _lock(self, thread_id: str) -> asyncio.Lock:
         if thread_id not in self._locks:
@@ -405,9 +415,84 @@ class RunCoordinator:
             model_ref=ModelRef(provider="fixture", base_url="https://example.com/v1", model="fixture-model"),
             checkpointer=MemorySaver(),
             tools=(),
-            middleware=(),
         )
         return ActiveRunHandle(runtime=placeholder, phase="running")
+
+
+    # ---- 1C：两阶段能力准入 ----
+
+    async def _acquire_lease(self, preview: CapabilityPreview, tools, middleware) -> CapabilityLease:
+        if tools is not None:
+            # 测试/静态路径：直接包装（不经 resolver，也不做 Skill I/O）
+            return StaticCapabilityLease(tools=tools, system_context="", middleware=tuple(middleware))
+        if self._resolver is None:
+            raise RuntimeError("RunCoordinator 未注入 CapabilityResolver 且未显式提供 tools")
+        lease = await self._resolver.acquire(preview)
+        extra = self._middleware_provider() if self._middleware_provider is not None else ()
+        if extra:
+            lease = StaticCapabilityLease(
+                tools=lease.tools, system_context=lease.system_context,
+                middleware=tuple(extra), skill_digests=lease.skill_digests,
+                on_release=lease.release,
+            )
+        return lease
+
+    def _preview_facts_match(self, thread: ThreadDocument, preview: CapabilityPreview) -> bool:
+        return (
+            thread.revision == preview.thread_revision
+            and tuple(thread.selected_skills) == tuple(preview.selected_skills)
+        )
+
+    def _release_handle(self, handle: ActiveRunHandle) -> None:
+        """句柄卸载时释放 Graph 与能力租约（lease 释放恰好一次）。"""
+        handle.runtime.release_graph()
+        if handle.capability_lease is not None:
+            handle.capability_lease.release()
+            handle.capability_lease = None
+
+    def skill_in_use(self, name: str) -> bool:
+        for handle in self._handles.values():
+            if handle.phase in ("running", "awaiting_approval") and \
+                    handle.capability_lease is not None and name in handle.capability_lease.skill_names:
+                return True
+        return False
+
+    async def _preview_locked(
+        self,
+        thread_id: str,
+        *,
+        protocol_run_id: str,
+        messages: Sequence[Any],
+        client_revision: int | None,
+    ) -> tuple[ThreadDocument, bool, CapabilityPreview]:
+        """第一阶段：重复/busy/revision/头部校验 + 采集能力 preview 事实。"""
+        await asyncio.to_thread(self._check_protocol_duplicate, protocol_run_id)
+        existing = self._handles.get(thread_id)
+        if existing is not None and existing.phase in ("running", "awaiting_approval"):
+            raise ThreadBusy(f"{ThreadBusy.code}: thread {thread_id} already has an active run")
+        thread, implicit = await asyncio.to_thread(
+            lambda: self._preflight_locked(
+                thread_id, protocol_run_id=protocol_run_id, messages=messages,
+                client_revision=client_revision,
+            )
+        )
+        preview = CapabilityPreview(
+            thread_id=thread_id,
+            thread_revision=thread.revision,
+            selected_skills=tuple(thread.selected_skills),
+        )
+        return thread, implicit, preview
+
+    def _verify_preview(self, thread: ThreadDocument, preview: CapabilityPreview) -> None:
+        existing = self._handles.get(preview.thread_id)
+        if existing is not None and existing.phase in ("running", "awaiting_approval"):
+            raise ThreadBusy(f"{ThreadBusy.code}: thread {preview.thread_id} already has an active run")
+        if not self._preview_facts_match(thread, preview):
+            raise RevisionConflict(
+                f"线程 {preview.thread_id} 在能力预览与最终准入之间发生了变化"
+                f"（revision {preview.thread_revision}→{thread.revision} 或 Skill 选择变化）"
+            )
+
 
     # ---- 1B：服务端权威准入 ----
 
@@ -563,15 +648,15 @@ class RunCoordinator:
         model_ref: ModelRef,
         secrets: RunSecrets,
         model_builder: Callable,
-        tools,
-        middleware,
+        lease: CapabilityLease,
         protocol_run_id: str,
         messages: Sequence[Any],
         client_revision: int | None,
     ) -> StartAdmission:
-        """持锁准入：重复检查 → revision/头部校验 → 持久化 → 建 Graph → 装句柄。
+        """持锁准入（第三阶段）：复验 → 持久化 → 建 Graph → 装句柄。
 
-        调用方必须已持有该线程的锁。模型密钥只在 model_builder 调用时被消费。
+        调用方必须已持有该线程的锁并完成 preview 事实比对。密钥只在
+        model_builder 调用时被消费；lease 绝不含密钥。
         """
         threads, runs = self._require_stores()
 
@@ -622,9 +707,10 @@ class RunCoordinator:
                 model_ref=model_ref,
                 secrets=secrets,
                 model_builder=model_builder,
-                tools=tools,
+                tools=lease.tools,
                 thread_id=thread_id,
-                middleware=middleware,
+                system_context=lease.system_context,
+                middleware_factory=lease.build_request_middleware,
             )
         except Exception:
             # 持久化已成功：run 终态 failed、线程摘要修复；用户消息保留
@@ -653,6 +739,7 @@ class RunCoordinator:
             protocol_run_ids=[protocol_run_id],
             trigger_message_id=new_message.id,
             history_snapshot=tuple(model_history),
+            capability_lease=lease,
         )
         # 7) 持久化成功后才安装句柄（并挂上语义边界日志）
         handle.journal = RunJournal(threads=threads, runs=runs, handle=handle)
@@ -684,7 +771,7 @@ class RunCoordinator:
         model_ref: ModelRef,
         secrets: RunSecrets,
         model_builder,
-        tools,
+        tools=None,
         thread_id: str,
         middleware=(),
         protocol_run_id: str = "protocol-1",
@@ -692,25 +779,39 @@ class RunCoordinator:
         client_revision: int | None = None,
     ) -> StartAdmission:
         self._require_stores()
+        # 阶段一：锁内做重复/busy/revision/头部校验并采集 preview 事实
         async with self._lock(thread_id):
-            # 重复检查先于 busy/revision（重放检测永远最优先）；目录扫描不阻塞事件循环
-            await asyncio.to_thread(self._check_protocol_duplicate, protocol_run_id)
-            existing = self._handles.get(thread_id)
-            if existing is not None and existing.phase in ("running", "awaiting_approval"):
-                raise ThreadBusy(f"{ThreadBusy.code}: thread {thread_id} already has an active run")
-            return await asyncio.to_thread(
-                lambda: self._admit_locked(
-                    thread_id,
-                    model_ref=model_ref,
-                    secrets=secrets,
-                    model_builder=model_builder,
-                    tools=tools,
-                    middleware=middleware,
-                    protocol_run_id=protocol_run_id,
-                    messages=messages,
-                    client_revision=client_revision,
-                )
+            _, _, preview = await self._preview_locked(
+                thread_id, protocol_run_id=protocol_run_id, messages=messages,
+                client_revision=client_revision,
             )
+        # 阶段二：锁外取得能力租约（Skill I/O 不阻塞线程锁）
+        lease = await self._acquire_lease(preview, tools, middleware)
+        # 阶段三：重新持锁复验 preview 事实，随后持久化与构建
+        try:
+            async with self._lock(thread_id):
+                thread, _ = await asyncio.to_thread(
+                    lambda: self._preflight_locked(
+                        thread_id, protocol_run_id=protocol_run_id, messages=messages,
+                        client_revision=client_revision,
+                    )
+                )
+                self._verify_preview(thread, preview)
+                return await asyncio.to_thread(
+                    lambda: self._admit_locked(
+                        thread_id,
+                        model_ref=model_ref,
+                        secrets=secrets,
+                        model_builder=model_builder,
+                        lease=lease,
+                        protocol_run_id=protocol_run_id,
+                        messages=messages,
+                        client_revision=client_revision,
+                    )
+                )
+        except BaseException:
+            lease.release()
+            raise
 
     async def acquire_resume(
         self,
@@ -780,7 +881,7 @@ class RunCoordinator:
         model_ref: ModelRef,
         secrets: RunSecrets,
         model_builder,
-        tools,
+        tools=None,
         middleware=(),
         messages: Sequence[Any] = (),
         client_revision: int | None = None,
@@ -788,8 +889,8 @@ class RunCoordinator:
     ) -> StartAdmission:
         """单锁完成：校验 steer-away 条目 → 无副作用 preflight → 旧 run 持久化为 cancelled → 新准入。
 
-        preflight（重复/revision/前缀）失败时旧运行原封不动——任何校验错误都
-        不得不可逆地取消有效的审批中运行；只有新 run **写入**失败才保持旧 run 已取消。
+        preflight（重复/revision/前缀）失败时旧运行原封不动；只有新 run **写入**
+        失败才保持旧 run 已取消。旧 lease 与新 lease 均恰好释放一次。
         """
         async with self._lock(thread_id):
             handle = self._handles.get(thread_id)
@@ -799,9 +900,9 @@ class RunCoordinator:
             threads, runs = self._require_stores()
             old_product_run_id = handle.product_run_id
 
-            def _preflight_and_cancel_old() -> None:
+            def _preflight_and_cancel_old() -> ThreadDocument:
                 # 先做无副作用 preflight：通过后才允许破坏旧运行
-                self._preflight_locked(
+                thread, _ = self._preflight_locked(
                     thread_id, protocol_run_id=protocol_run_id, messages=messages,
                     client_revision=client_revision,
                 )
@@ -815,24 +916,41 @@ class RunCoordinator:
                         "error_code": "STEERED_AWAY",
                         "error_message": "用户转向新问题，原运行取消",
                     }))
+                return thread
 
-            await asyncio.to_thread(_preflight_and_cancel_old)
-            handle.phase = "cancelled"
-            handle.runtime.release_graph()
-            self._handles.pop(thread_id, None)
-            return await asyncio.to_thread(
-                lambda: self._admit_locked(
-                    thread_id,
-                    model_ref=model_ref,
-                    secrets=secrets,
-                    model_builder=model_builder,
-                    tools=tools,
-                    middleware=middleware,
-                    protocol_run_id=protocol_run_id,
-                    messages=messages,
-                    client_revision=client_revision,
-                )
+            thread = await asyncio.to_thread(_preflight_and_cancel_old)
+            preview = CapabilityPreview(
+                thread_id=thread_id, thread_revision=thread.revision,
+                selected_skills=tuple(thread.selected_skills),
             )
+            handle.phase = "cancelled"
+            self._release_handle(handle)
+            self._handles.pop(thread_id, None)
+        lease = await self._acquire_lease(preview, tools, middleware)
+        try:
+            async with self._lock(thread_id):
+                thread, _ = await asyncio.to_thread(
+                    lambda: self._preflight_locked(
+                        thread_id, protocol_run_id=protocol_run_id, messages=messages,
+                        client_revision=client_revision,
+                    )
+                )
+                self._verify_preview(thread, preview)
+                return await asyncio.to_thread(
+                    lambda: self._admit_locked(
+                        thread_id,
+                        model_ref=model_ref,
+                        secrets=secrets,
+                        model_builder=model_builder,
+                        lease=lease,
+                        protocol_run_id=protocol_run_id,
+                        messages=messages,
+                        client_revision=client_revision,
+                    )
+                )
+        except BaseException:
+            lease.release()
+            raise
 
     async def acquire_retry(
         self,
@@ -840,7 +958,7 @@ class RunCoordinator:
         model_ref: ModelRef,
         secrets: RunSecrets,
         model_builder,
-        tools,
+        tools=None,
         thread_id: str,
         middleware=(),
         protocol_run_id: str,
@@ -849,7 +967,7 @@ class RunCoordinator:
     ) -> StartAdmission:
         """严格重试：校验目标/revision → 新产品 run + 新 MemorySaver → 服务端历史重建输入。
 
-        不追加用户消息、不改写/不重开目标 run。
+        不追加用户消息、不改写/不重开目标 run。与 start 相同的两阶段能力准入。
         """
         threads, runs = self._require_stores()
         async with self._lock(thread_id):
@@ -881,88 +999,112 @@ class RunCoordinator:
                 raise RevisionConflict(
                     f"线程 {thread_id} 期望 revision {client_revision}，实际 {thread.revision}"
                 )
-
-            # 重试输入必须回到目标 run 的触发边界：失败 run 自己落盘的输出不进入自身重试
-            history = thread.model_history()
-            history_ids = [m.id for m in history]
-            if target.trigger_message_id not in history_ids:
-                reject("目标 run 的触发消息不在完整历史中")
-            trigger_index = history_ids.index(target.trigger_message_id)
-            if any(m.role == "user" for m in history[trigger_index + 1:]):
-                reject("目标 run 之后完整历史已推进（出现了新的 user 消息）")
-            retry_history = history[: trigger_index + 1]
-
-            run_id = f"run-{uuid4().hex}"
-            now = utc_now()
-            run = RunDocument.start(
-                run_id=run_id,
-                thread_id=thread_id,
-                protocol_run_id=protocol_run_id,
-                model_ref=model_ref,
-                trigger_message_id=target.trigger_message_id,
-                history_head_id=retry_history[-1].id if retry_history else None,
-                now=now,
-                retry_of=retry_of,
-            )
-            await asyncio.to_thread(runs.replace, run)
-
-            def refresh_summary(doc: ThreadDocument) -> ThreadDocument:
-                return doc.model_copy(update={"last_run": RunSummary(
-                    id=run_id, status="running", updated_at=utc_now(), retry_of=retry_of,
-                )})
-
-            updated_thread = await asyncio.to_thread(
-                threads.update, thread_id, thread.revision, refresh_summary,
+            preview = CapabilityPreview(
+                thread_id=thread_id, thread_revision=thread.revision,
+                selected_skills=tuple(thread.selected_skills),
             )
 
-            def _build_retry_runtime():
-                return self._factory.create(
-                    model_ref=model_ref,
-                    secrets=secrets,
-                    model_builder=model_builder,
-                    tools=tools,
+        lease = await self._acquire_lease(preview, tools, middleware)
+        try:
+            async with self._lock(thread_id):
+                existing = self._handles.get(thread_id)
+                if existing is not None and existing.phase in ("running", "awaiting_approval"):
+                    raise ThreadBusy(f"{ThreadBusy.code}: thread {thread_id} already has an active run")
+                thread = await asyncio.to_thread(self._load_thread, thread_id)
+                if thread is None:
+                    raise RetryNotAllowed(f"{RetryNotAllowed.code}: 线程不存在")
+                if thread.revision != client_revision:
+                    raise RevisionConflict(
+                        f"线程 {thread_id} 期望 revision {client_revision}，实际 {thread.revision}"
+                    )
+                self._verify_preview(thread, preview)
+
+                # 重试输入必须回到目标 run 的触发边界：失败 run 自己落盘的输出不进入自身重试
+                history = thread.model_history()
+                history_ids = [m.id for m in history]
+                if target.trigger_message_id not in history_ids:
+                    raise RetryNotAllowed(f"{RetryNotAllowed.code}: 目标 run 的触发消息不在完整历史中")
+                trigger_index = history_ids.index(target.trigger_message_id)
+                if any(m.role == "user" for m in history[trigger_index + 1:]):
+                    raise RetryNotAllowed(f"{RetryNotAllowed.code}: 目标 run 之后完整历史已推进（出现了新的 user 消息）")
+                retry_history = history[: trigger_index + 1]
+
+                run_id = f"run-{uuid4().hex}"
+                now = utc_now()
+                run = RunDocument.start(
+                    run_id=run_id,
                     thread_id=thread_id,
-                    middleware=middleware,
+                    protocol_run_id=protocol_run_id,
+                    model_ref=model_ref,
+                    trigger_message_id=target.trigger_message_id,
+                    history_head_id=retry_history[-1].id if retry_history else None,
+                    now=now,
+                    retry_of=retry_of,
+                )
+                await asyncio.to_thread(runs.replace, run)
+
+                def refresh_summary(doc: ThreadDocument) -> ThreadDocument:
+                    return doc.model_copy(update={"last_run": RunSummary(
+                        id=run_id, status="running", updated_at=utc_now(), retry_of=retry_of,
+                    )})
+
+                updated_thread = await asyncio.to_thread(
+                    threads.update, thread_id, thread.revision, refresh_summary,
                 )
 
-            try:
-                runtime = await asyncio.to_thread(_build_retry_runtime)
-            except Exception:
-                def _mark_retry_build_failed() -> None:
-                    runs.replace(run.model_copy(update={
-                        "status": "failed",
-                        "updated_at": utc_now(),
-                        "ended_at": utc_now(),
-                        "error_code": "GRAPH_BUILD_FAILED",
-                        "error_message": "Graph 构建失败",
-                    }))
-                    threads.update(
-                        thread_id,
-                        updated_thread.revision,
-                        lambda doc: doc.model_copy(update={"last_run": RunSummary(
-                            id=run_id, status="failed", updated_at=utc_now(), retry_of=retry_of,
-                        )}),
+                def _build_retry_runtime():
+                    return self._factory.create(
+                        model_ref=model_ref,
+                        secrets=secrets,
+                        model_builder=model_builder,
+                        tools=lease.tools,
+                        thread_id=thread_id,
+                        system_context=lease.system_context,
+                        middleware_factory=lease.build_request_middleware,
                     )
-                await asyncio.to_thread(_mark_retry_build_failed)
-                raise
 
-            handle = ActiveRunHandle(
-                runtime=runtime,
-                phase="running",
-                thread_revision=updated_thread.revision,
-                product_run_id=run_id,
-                protocol_run_ids=[protocol_run_id],
-                trigger_message_id=target.trigger_message_id,
-                history_snapshot=tuple(retry_history),
-            )
-            handle.journal = RunJournal(threads=threads, runs=runs, handle=handle)
-            self._handles[thread_id] = handle
-            return StartAdmission(
-                handle=handle,
-                run=runs.get(run_id),
-                input=runtime.run_input(protocol_run_id=protocol_run_id, messages=retry_history),
-                revisions=[updated_thread.revision],
-            )
+                try:
+                    runtime = await asyncio.to_thread(_build_retry_runtime)
+                except Exception:
+                    def _mark_retry_build_failed() -> None:
+                        runs.replace(run.model_copy(update={
+                            "status": "failed",
+                            "updated_at": utc_now(),
+                            "ended_at": utc_now(),
+                            "error_code": "GRAPH_BUILD_FAILED",
+                            "error_message": "Graph 构建失败",
+                        }))
+                        threads.update(
+                            thread_id,
+                            updated_thread.revision,
+                            lambda doc: doc.model_copy(update={"last_run": RunSummary(
+                                id=run_id, status="failed", updated_at=utc_now(), retry_of=retry_of,
+                            )}),
+                        )
+                    await asyncio.to_thread(_mark_retry_build_failed)
+                    raise
+
+                handle = ActiveRunHandle(
+                    runtime=runtime,
+                    phase="running",
+                    thread_revision=updated_thread.revision,
+                    product_run_id=run_id,
+                    protocol_run_ids=[protocol_run_id],
+                    trigger_message_id=target.trigger_message_id,
+                    history_snapshot=tuple(retry_history),
+                    capability_lease=lease,
+                )
+                handle.journal = RunJournal(threads=threads, runs=runs, handle=handle)
+                self._handles[thread_id] = handle
+                return StartAdmission(
+                    handle=handle,
+                    run=runs.get(run_id),
+                    input=runtime.run_input(protocol_run_id=protocol_run_id, messages=retry_history),
+                    revisions=[updated_thread.revision],
+                )
+        except BaseException:
+            lease.release()
+            raise
 
     async def mark_awaiting_approval(self, thread_id: str) -> None:
         async with self._lock(thread_id):
@@ -982,7 +1124,7 @@ class RunCoordinator:
         if handle is None:
             return
         handle.phase = "cancelled"
-        handle.runtime.release_graph()
+        self._release_handle(handle)
         self._handles.pop(thread_id, None)
 
     async def finish_if_terminal(self, thread_id: str, phase: Phase) -> None:
@@ -994,7 +1136,7 @@ class RunCoordinator:
             if phase in ("completed", "failed", "cancelled"):
                 if handle.journal is not None and not handle.journal.closed:
                     await asyncio.to_thread(handle.journal.persist_terminal, phase)
-                handle.runtime.release_graph()
+                self._release_handle(handle)
                 self._handles.pop(thread_id, None)
                 if handle.journal is None:
                     await asyncio.to_thread(self._persist_run_terminal, handle, phase)
@@ -1115,6 +1257,8 @@ class RunCoordinator:
             handle = self._handles.get(thread_id)
             if handle is not None and handle.phase in ("running", "awaiting_approval"):
                 raise ThreadBusy(f"{ThreadBusy.code}: thread {thread_id} has an active run")
+            if handle is not None:
+                self._release_handle(handle)
             thread_runs = await asyncio.to_thread(runs.runs_for_thread, thread_id)
             for run in thread_runs:
                 await asyncio.to_thread(runs.delete, run.id)

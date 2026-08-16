@@ -70,7 +70,9 @@ class RuntimeHandle:
     model_ref: ModelRef
     checkpointer: MemorySaver
     tools: tuple[BaseTool, ...]
-    middleware: tuple[Any, ...]
+    # 请求级中间件工厂：resume 时用新 RunSecrets 重建（本句柄绝不保存已构建中间件或密钥）
+    middleware_factory: Callable[[RunSecrets], tuple[Any, ...]] | None = None
+    system_context: str = ""
     graph: Any | None = None
     # 注意：不保存 model 引用。运行期间 Graph 内部持有模型（spec 允许），
     # 但 handle/coordinator 上不得保留独立的密钥载体（spec：原始 key 不得进入 ActiveRunHandle）。
@@ -142,14 +144,19 @@ class AgentFactory:
         thread_id: str,
         checkpointer: MemorySaver | None = None,
         middleware: Sequence[Any] = (),
+        system_context: str = "",
+        middleware_factory: Callable[[RunSecrets], tuple[Any, ...]] | None = None,
     ) -> RuntimeHandle:
         model = model_builder(model_ref, secrets)
         saver = checkpointer or MemorySaver()
+        if middleware_factory is None:
+            static_middleware = tuple(middleware)
+            middleware_factory = lambda secrets: static_middleware  # noqa: E731
         graph = create_agent(
             model,
             tools=list(tools),
-            system_prompt=chat.SYSTEM_PROMPT.format(context="Agent 工作台"),
-            middleware=list(middleware),
+            system_prompt=chat.SYSTEM_PROMPT.format(context="Agent 工作台") + system_context,
+            middleware=list(middleware_factory(secrets)),
             checkpointer=saver,
         )
         return RuntimeHandle(
@@ -157,7 +164,8 @@ class AgentFactory:
             model_ref=model_ref,
             checkpointer=saver,
             tools=tuple(tools),
-            middleware=tuple(middleware),
+            middleware_factory=middleware_factory,
+            system_context=system_context,
             graph=graph,
         )
 
@@ -175,11 +183,13 @@ class AgentFactory:
                 f"{RunConfigMismatch.code}: resume model config differs from the active thread"
             )
         model = model_builder(model_ref, secrets)
+        # 从当前请求的密钥重建请求级中间件（新 guard / HITL 实例，不复用旧对象）
+        factory = handle.middleware_factory or (lambda secrets: ())
         handle.graph = create_agent(
             model,
             tools=list(handle.tools),
-            system_prompt=chat.SYSTEM_PROMPT.format(context="Agent 工作台"),
-            middleware=list(handle.middleware),
+            system_prompt=chat.SYSTEM_PROMPT.format(context="Agent 工作台") + handle.system_context,
+            middleware=list(factory(secrets)),
             checkpointer=handle.checkpointer,
         )
 

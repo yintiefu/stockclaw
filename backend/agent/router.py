@@ -43,6 +43,7 @@ from agent.stores import (
     reconcile_agent_data,
     utc_now,
 )
+from agent.capabilities import CapabilityResolver
 from agent.skills import SkillError, SkillImporter, SkillRegistry, SkillResourceForbidden, SkillUnavailable
 from agent.tool_registry import build_builtin_tools
 
@@ -66,6 +67,15 @@ def build_services(root: Path | None = None) -> AgentServices:
     coordinator = RunCoordinator(factory=AgentFactory(), threads=threads, runs=runs)
     skills = SkillRegistry(paths.skills)
     importer = SkillImporter(paths.skills, skills)
+    def _run_tools(skill_tools=()):
+        # 测试接缝：1A/1B 通过 monkeypatch agent.router.build_builtin_tools 注入
+        return [*build_builtin_tools(), *skill_tools]
+
+    coordinator = RunCoordinator(
+        factory=coordinator._factory, threads=threads, runs=runs,
+        resolver=CapabilityResolver(skills, tools_provider=_run_tools),
+        middleware_provider=lambda: build_middleware(),
+    )
     return AgentServices(paths, threads, runs, coordinator, skills, importer)
 
 
@@ -247,8 +257,6 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
     run_id = input_data.run_id
 
     model_builder: Callable[[ModelRef, RunSecrets], BaseChatModel] = build_chat_model
-    tools: list[BaseTool] = build_builtin_tools()
-    middleware = build_middleware()
 
     try:
         if mode == "retry":
@@ -256,9 +264,7 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                 model_ref=model_ref,
                 secrets=secrets,
                 model_builder=model_builder,
-                tools=tools,
                 thread_id=thread_id,
-                middleware=middleware,
                 protocol_run_id=run_id,
                 retry_of=runtime_props.retry_of or "",
                 client_revision=runtime_props.thread_revision or 0,
@@ -273,8 +279,6 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                 model_ref=model_ref,
                 secrets=secrets,
                 model_builder=model_builder,
-                tools=tools,
-                middleware=middleware,
                 messages=input_data.messages,
                 client_revision=runtime_props.thread_revision,
                 protocol_run_id=run_id,
@@ -297,15 +301,16 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                 model_ref=model_ref,
                 secrets=secrets,
                 model_builder=model_builder,
-                tools=tools,
                 thread_id=thread_id,
-                middleware=middleware,
                 protocol_run_id=run_id,
                 messages=input_data.messages,
                 client_revision=runtime_props.thread_revision,
             )
             handle = admission.handle
             adapter_input = admission.input
+    except SkillError as exc:
+        # 能力错误发生在任何 user/run 写入之前（400/404/409）
+        return _skill_error_response(exc)
     except ThreadBusy as exc:
         return _conflict_response(exc.code, str(exc), thread_id=thread_id)
     except ResumeRejected as exc:
@@ -719,8 +724,10 @@ async def import_skill(
     try:
         staged = await services.importer.receive(archive)
         result = await asyncio.to_thread(
-            services.importer.install, staged, overwrite=overwrite,
-            expected_digest=expected_digest,
+            lambda: services.importer.install(
+                staged, overwrite=overwrite, expected_digest=expected_digest,
+                in_use_check=services.coordinator.skill_in_use,
+            )
         )
     except SkillError as exc:
         return _skill_error_response(exc)
@@ -736,6 +743,9 @@ async def refresh_skills():
 
 @router.delete("/skills/{skill_name}")
 async def delete_skill(skill_name: str, expected_digest: str = Query(...)):
+    if await asyncio.to_thread(services.coordinator.skill_in_use, skill_name):
+        return JSONResponse(status_code=409, content={
+            "code": "SKILL_IN_USE", "detail": f"Skill {skill_name} 正在被活跃运行引用"})
     try:
         record = await asyncio.to_thread(services.importer.delete, skill_name, expected_digest)
     except SkillError as exc:

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, Sequence
 
-from langchain_core.tools import StructuredTool
+from langchain_core.tools import BaseTool, StructuredTool
 
 import tools as legacy_tools
 
@@ -41,3 +41,8 @@ def build_builtin_tools() -> list[StructuredTool]:
     """把 tools.py 的 24 个既有 schema 一比一转换为 LangChain 工具。"""
     execution_lock = asyncio.Lock()
     return [_build_one(schema, execution_lock) for schema in legacy_tools.TOOLS]
+
+
+def compose_run_tools(skill_tools: Sequence[BaseTool] = ()) -> list[BaseTool]:
+    """1C 组合点：内置工具 + Skill 快照工具（切片 3 起再追加 MCP 绑定包装）。"""
+    return [*build_builtin_tools(), *skill_tools]

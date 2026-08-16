@@ -216,3 +216,40 @@ def test_title_only_patch_still_works(api):
     assert response.status_code == 200
     assert response.json()["title"] == "改名"
     assert response.json()["selected_skills"] == []
+
+
+# ---------------------------------------------------------------------------
+# 活跃 lease 保护（Task 5）
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_active_skill_blocks_overwrite_and_delete(api):
+    import asyncio as aio
+    from agent.capabilities import CapabilityPreview, CapabilityResolver
+
+    client, services = api
+    import_skill(client)
+    # 模拟一个持有该 Skill 的活跃 lease
+    resolver = CapabilityResolver(services.skills)
+    lease = await resolver.acquire(CapabilityPreview(
+        thread_id="th-x", thread_revision=0, selected_skills=("quality",)))
+    services.coordinator._handles["th-x"] = type(
+        "H", (), {"phase": "running", "capability_lease": lease})()
+    try:
+        digest = client.get("/api/agent/skills/quality").json()["digest"]
+        overwrite = client.post(
+            "/api/agent/skills/import",
+            files={"archive": ("quality.zip", skill_zip(body="new"), "application/zip")},
+            data={"overwrite": "true", "expected_digest": digest},
+        )
+        assert overwrite.status_code == 409
+        assert overwrite.json()["code"] == "SKILL_IN_USE"
+        deleted = client.delete("/api/agent/skills/quality", params={"expected_digest": digest})
+        assert deleted.status_code == 409
+        assert deleted.json()["code"] == "SKILL_IN_USE"
+    finally:
+        lease.release()
+        services.coordinator._handles.pop("th-x", None)
+    # 释放后可删除
+    ok = client.delete("/api/agent/skills/quality", params={"expected_digest": digest})
+    assert ok.status_code == 200

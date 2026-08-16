@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import stat
@@ -578,7 +579,8 @@ class SkillImporter:
 
     # ---- 安装 ----
 
-    def install(self, upload_path: Path, *, overwrite: bool, expected_digest: str | None) -> SkillInstallResult:
+    def install(self, upload_path: Path, *, overwrite: bool, expected_digest: str | None,
+                in_use_check=None) -> SkillInstallResult:
         import uuid
 
         self._root.mkdir(parents=True, exist_ok=True)
@@ -616,6 +618,8 @@ class SkillImporter:
                     current = self._registry.refresh()
                     existing_record = next(
                         (r for r in current.skills if r.directory == staged_record.name and r.valid), None)
+                    if overwrite and in_use_check is not None and in_use_check(staged_record.name):
+                        raise SkillInUse(f"Skill {staged_record.name} 正在被活跃运行引用")
                     if not overwrite:
                         raise SkillConflict(f"Skill 已存在: {staged_record.name}")
                     if expected_digest is None or existing_record is None \
@@ -779,3 +783,113 @@ class SkillImporter:
         if len(dirs) == 1 and not files and (dirs[0] / "SKILL.md").is_file():
             return dirs[0]
         raise SkillArchiveRejected("zip 必须根级或唯一顶层目录内包含 SKILL.md")
+
+
+# ---------------------------------------------------------------------------
+# 渐进加载：run 快照 + 两个只读工具
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SkillRuntimeItem:
+    name: str
+    description: str
+    digest: str
+    instructions: str
+    files: tuple[SkillFile, ...]
+
+
+@dataclass(frozen=True)
+class SkillRuntimeSnapshot:
+    """一次 run 持有的不可变 Skill 快照；闭包只捕获快照与注册表路径解析器。"""
+
+    generation: int
+    items: tuple[SkillRuntimeItem, ...]
+
+    @classmethod
+    def from_records(cls, generation: int, items: tuple[SkillRuntimeItem, ...]) -> "SkillRuntimeSnapshot":
+        return cls(generation=generation, items=items)
+
+    def by_name(self, name: str) -> SkillRuntimeItem | None:
+        return next((i for i in self.items if i.name == name), None)
+
+    def render_catalog(self) -> str:
+        """系统上下文目录：只含 name/description，明确是用户选择的外部能力。"""
+        if not self.items:
+            return ""
+        lines = ["\n\n## 用户已启用的 Skill（外部能力，仅提供客观资料与框架，不构成投资建议）"]
+        for item in self.items:
+            lines.append(f"- {item.name}: {item.description}")
+        lines.append("调用 load_skill 工具按需获取。")
+        return "\n".join(lines)
+
+    def build_tools(self, registry: SkillRegistry) -> tuple:
+        """恰好两个工具：load_skill / read_skill_resource。"""
+        from langchain_core.tools import StructuredTool
+
+        snapshot = self
+
+        async def load_skill(name: str) -> str:
+            item = snapshot.by_name(name)
+            if item is None:
+                return json.dumps({"error": "SKILL_UNAVAILABLE", "detail": f"Skill 不在本次运行中: {name}"},
+                                  ensure_ascii=False)
+            resource_index = [
+                {"relative_path": f.relative_path, "category": f.category, "size": f.size}
+                for f in item.files if f.category in ("reference", "asset")
+            ]
+            return json.dumps({
+                "name": item.name, "digest": item.digest,
+                "instructions": item.instructions, "resources": resource_index,
+            }, ensure_ascii=False)
+
+        async def read_skill_resource(name: str, relative_path: str) -> str:
+            item = snapshot.by_name(name)
+            if item is None:
+                return json.dumps({"error": "SKILL_UNAVAILABLE", "detail": f"Skill 不在本次运行中: {name}"},
+                                  ensure_ascii=False)
+            entry = next((f for f in item.files
+                          if f.relative_path == relative_path and f.category == "reference"), None)
+            if entry is None:
+                return json.dumps({"error": "SKILL_RESOURCE_FORBIDDEN",
+                                   "detail": "路径不在快照 manifest 的 references/ 中"}, ensure_ascii=False)
+            try:
+                _, manifest_entry, path = registry.resolve_file(name, relative_path)
+            except SkillError as exc:
+                return json.dumps({"error": exc.code, "detail": str(exc)}, ensure_ascii=False)
+            try:
+                payload = path.read_bytes()
+            except OSError as exc:
+                return json.dumps({"error": "SKILL_UNAVAILABLE", "detail": f"读取失败: {exc}"},
+                                  ensure_ascii=False)
+            if hashlib.sha256(payload).hexdigest() != manifest_entry.sha256:
+                return json.dumps({"error": "SKILL_CHANGED",
+                                   "detail": "文件内容已变化，请刷新 Skill 后重试"}, ensure_ascii=False)
+            try:
+                text = payload.decode("utf-8")
+            except UnicodeDecodeError:
+                return json.dumps({"error": "SKILL_RESOURCE_FORBIDDEN", "detail": "非 UTF-8 文本"},
+                                  ensure_ascii=False)
+            if len(text) > RESOURCE_CHAR_LIMIT:
+                return json.dumps({
+                    "content": text[:RESOURCE_CHAR_LIMIT], "truncated": True,
+                    "original_chars": len(text),
+                }, ensure_ascii=False)
+            return json.dumps({"content": text, "truncated": False}, ensure_ascii=False)
+
+        return (
+            StructuredTool.from_function(
+                coroutine=load_skill, name="load_skill",
+                description="加载当前会话已选择 Skill 的完整指令与资源索引（只接受本次运行中的 Skill 名）",
+                args_schema={"type": "object", "properties": {
+                    "name": {"type": "string", "description": "Skill 名称"}},
+                    "required": ["name"]},
+            ),
+            StructuredTool.from_function(
+                coroutine=read_skill_resource, name="read_skill_resource",
+                description="读取当前快照 manifest 中 references/ 文本资源；文件变化时返回 SKILL_CHANGED",
+                args_schema={"type": "object", "properties": {
+                    "name": {"type": "string"}, "relative_path": {"type": "string"}},
+                    "required": ["name", "relative_path"]},
+            ),
+        )
