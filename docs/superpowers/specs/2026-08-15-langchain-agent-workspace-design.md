@@ -50,7 +50,7 @@
 | MCP 能力 | 只接 Tools；不接 OAuth、Resources、Prompts |
 | 工具审批 | 内置只读工具自动执行；MCP 工具默认逐次审批，可放行到当前会话结束 |
 | Artifact | Markdown、表格、JSON 快照、来源清单 |
-| 预算 | 对步骤、工具、时长和上下文做硬限制；token 只记录，货币费用只估算 |
+| 预算 | 对模型/工具调用、时长和上下文做硬限制；token 仅记录 Provider 实报值，不显示货币费用 |
 | 页面布局 | 左侧会话、中间对话、右侧 Inspector 的三栏工作台 |
 | 崩溃恢复 | 从最后完整历史重试；第一期不做运行栈原位续跑 |
 | 运行约束 | 第一期间 Agent 子系统只支持单 FastAPI 进程/worker |
@@ -211,10 +211,11 @@
 - `artifact.created`
 - `sources.updated`
 - `budget.updated`
-- `mcp.health_changed`
 - `thread.revision.updated`
 
-`thread.revision.updated` 只在 thread JSON 原子提交成功后由 `AgentProtocolBridge` 发出，payload 固定为 `thread_id`、`revision` 和 `persisted_at`。Runtime 按 `thread_id` 截获并更新对应 thread 的本地 revision，不渲染到聊天正文，也不把 revision 写入 LangGraph state 或 checkpoint。来自 AG-UI 事件和 REST PATCH response 的 revision 都只在大于该 thread 本地值时应用，避免跨通道乱序使 revision 倒退。终态 revision 事件必须先于对应 `RUN_FINISHED` 发出。若事件因断连丢失，下一次提交会收到 `409 THREAD_REVISION_CONFLICT`，前端再通过 REST 重载权威历史。
+`thread.revision.updated` 只在 thread JSON 原子提交成功后由 router 直接编码，payload 固定为 `threadId`、`revision` 和 `persistedAt`；它不进入只处理 Graph event 的 `AgentProtocolBridge.convert`。Runtime 按 `threadId` 截获并更新对应 thread 的本地 revision，不渲染到聊天正文，也不把 revision 写入 LangGraph state 或 checkpoint。来自 AG-UI 事件和 REST PATCH response 的 revision 都只在大于该 thread 本地值时应用，避免跨通道乱序使 revision 倒退。终态 revision 事件必须先于对应 `RUN_FINISHED` 发出。若事件因断连丢失，下一次提交会收到 `409 THREAD_REVISION_CONFLICT`，前端再通过 REST 重载权威历史。
+
+`mcp.health_changed` 明确延期：第一期没有后台 MCP 健康监控，不新增轮询或常驻探测器。MCP 设置界面在 test、refresh 和配置 mutation 后通过 REST 重载健康状态；未来只有在引入真实后台健康状态源时才新增该事件合同。
 
 第一期生成的标准 interrupt outcome 不设置 `expiresAt`，后端 pending interrupt 也不实现基于时间的过期；它只在提交有效 resume、steer-away、run 取消或进程结束时失效。
 
@@ -592,7 +593,7 @@ Artifact 不可原地覆盖。修订生成新 ID并指向 parent。
 
 旧轮次只从当前模型请求中省略，仍保留在 thread 文件。UI 显示本次发生过 context truncation。
 
-Provider 返回 token usage 时才记录；未返回就标记 unavailable。费用只允许显示为估算值，第一期不据此终止运行。
+Provider 返回 token usage 时才记录；未返回就标记 unavailable。第一期不自行 tokenization，也不显示或推导货币费用。
 
 ## 14. 运行数据流
 
@@ -685,11 +686,13 @@ POST   /api/agent/mcp/{server_id}/refresh
 
 GET    /api/agent/policy
 PATCH  /api/agent/policy
+POST   /api/agent/policy/reset
 
+GET    /api/agent/threads/{thread_id}/runs
 GET    /api/agent/threads/{thread_id}/artifacts
-GET    /api/agent/artifacts/{artifact_id}
-GET    /api/agent/artifacts/{artifact_id}/download
-DELETE /api/agent/artifacts/{artifact_id}
+GET    /api/agent/threads/{thread_id}/artifacts/{artifact_id}
+GET    /api/agent/threads/{thread_id}/artifacts/{artifact_id}/download
+DELETE /api/agent/threads/{thread_id}/artifacts/{artifact_id}
 ```
 
 所有接口继续使用项目现有可选 `VR_API_KEY` middleware。
