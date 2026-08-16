@@ -76,9 +76,8 @@ def build_services(root: Path | None = None) -> AgentServices:
     coordinator = RunCoordinator(factory=AgentFactory(), threads=threads, runs=runs)
     skills = SkillRegistry(paths.skills)
     importer = SkillImporter(paths.skills, skills)
-    registry = McpRegistry.for_root(paths.root)
-
     allowances = AllowanceRegistry()
+    registry = McpRegistry.for_root(paths.root, allowances)
 
     def _run_tools(skill_tools=()):
         # 测试接缝：1A/1B 通过 monkeypatch agent.router.build_builtin_tools 注入
@@ -572,7 +571,10 @@ async def get_thread(thread_id: str):
         return _store_error_response(exc, 404)
     except DocumentCorrupt as exc:
         return _store_error_response(exc, 500)
-    return doc.model_dump(mode="json")
+    # resume_available 是计算字段，不进持久化 schema
+    payload = doc.model_dump(mode="json")
+    payload["resume_available"] = services.coordinator.resume_available(doc.id)
+    return payload
 
 
 @router.patch("/threads/{thread_id}")
@@ -618,6 +620,12 @@ async def delete_thread(thread_id: str, payload: ThreadDelete):
     except DocumentCorrupt as exc:
         return _store_error_response(exc, 500)
     return Response(status_code=204)
+
+
+@router.delete("/threads/{thread_id}/allowances")
+async def clear_thread_allowances(thread_id: str):
+    cleared = services.coordinator.clear_allowances(thread_id)
+    return {"cleared": cleared}
 
 
 @router.post("/runs/{run_id}/cancel")

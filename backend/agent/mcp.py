@@ -397,8 +397,10 @@ class McpRegistry:
     secret set 只在实例内用于脱敏，关闭时清空。
     """
 
-    def __init__(self, store: McpConfigStore, work_root: Path):
+    def __init__(self, store: McpConfigStore, work_root: Path, allowances=None):
         self.store = store
+        # 1C：许可注册表（server/tool 配置变化时清理对应许可）
+        self._allowances = allowances
         self._work_root = Path(work_root)
         self._sessions: dict[str, _SessionGeneration] = {}
         self._server_locks: dict[str, asyncio.Lock] = {}
@@ -408,9 +410,9 @@ class McpRegistry:
         self._shutting_down = False
 
     @classmethod
-    def for_root(cls, root: Path) -> "McpRegistry":
+    def for_root(cls, root: Path, allowances=None) -> "McpRegistry":
         root = Path(root)
-        return cls(McpConfigStore(root / "mcp.json"), root / "mcp-work")
+        return cls(McpConfigStore(root / "mcp.json"), root / "mcp-work", allowances)
 
     # ---- 状态 ----
 
@@ -457,6 +459,8 @@ class McpRegistry:
             )
             if fingerprint_cleared:
                 updated = updated.model_copy(update={"trust_fingerprint": None, "trusted_at": None})
+            if self._allowances is not None:
+                self._allowances.clear_server(server_id)
             servers = [updated if s.id == server_id else s for s in doc.servers]
             return doc.model_copy(update={"servers": servers})
 
@@ -472,6 +476,8 @@ class McpRegistry:
             return doc.model_copy(update={"servers": servers})
 
         await asyncio.to_thread(self.store.update, revision, change)
+        if self._allowances is not None:
+            self._allowances.clear_server(server_id)
         work = self._work_root / server_id
         if work.is_dir():
             try:

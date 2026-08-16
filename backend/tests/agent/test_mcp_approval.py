@@ -317,3 +317,92 @@ async def test_all_disabled_server_is_not_relevant(tmp_path):
         thread_id="th-1", thread_revision=0, selected_skills=()))
     assert lease.mcp_bindings == ()
     lease.release()
+
+
+# ---------------------------------------------------------------------------
+# Task 13：许可清理 / resume_available / 取消 / steer-away
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def api_client_with_allowances(tmp_path, monkeypatch):
+    from agent.router import build_services
+
+    services = build_services(tmp_path / "agent")
+    services.coordinator._allowances = services.coordinator._allowances or AllowanceRegistry()
+    monkeypatch.setattr("agent.router.services", services)
+    client = __import__("fastapi.testclient", fromlist=["TestClient"]).TestClient(
+        __import__("app").app, client=("127.0.0.1", 50001))
+    return client, services
+
+
+async def test_allowance_clear_helpers():
+    allowances = AllowanceRegistry()
+    allowances.grant("th-1", "fixture", "echo")
+    allowances.grant("th-1", "other", "tool")
+    allowances.grant("th-2", "fixture", "echo")
+    assert allowances.clear_server("fixture") == 2
+    assert allowances.clear_thread("th-1") == 1
+    allowances.grant("th-3", "fixture", "echo")
+    assert allowances.clear_tool("fixture", "echo") == 1
+    assert allowances.clear_all() == 0
+
+
+async def test_allowance_clear_endpoint_and_thread_delete(api_client_with_allowances):
+    client, services = api_client_with_allowances
+    services.coordinator._allowances.grant("th-1", "fixture", "echo")
+    thread = client.post("/api/agent/threads", json={"title": "t"}).json()
+    revision_before = client.get(f"/api/agent/threads/{thread['id']}").json()["revision"]
+    resp = client.delete(f"/api/agent/threads/{thread['id']}/allowances")
+    assert resp.status_code == 200
+    assert resp.json() == {"cleared": 0}
+    resp2 = client.delete("/api/agent/threads/th-1/allowances")
+    assert resp2.json() == {"cleared": 1}
+    assert resp2.json() == {"cleared": 1}  # 幂等清零
+    revision_after = client.get(f"/api/agent/threads/{thread['id']}").json()["revision"]
+    assert revision_after == revision_before  # 不改 thread revision
+
+
+async def test_thread_resume_available_computed_field(api_client_with_allowances):
+    client, services = api_client_with_allowances
+    thread = client.post("/api/agent/threads", json={"title": "t"}).json()
+    detail = client.get(f"/api/agent/threads/{thread['id']}").json()
+    assert detail["resume_available"] is False  # 无活动句柄
+
+
+async def test_thread_delete_clears_allowances(api_client_with_allowances):
+    client, services = api_client_with_allowances
+    thread = client.post("/api/agent/threads", json={"title": "t"}).json()
+    services.coordinator._allowances.grant(thread["id"], "fixture", "echo")
+    resp = client.request("DELETE", f"/api/agent/threads/{thread['id']}",
+                          json={"revision": thread["revision"]})
+    assert resp.status_code == 204
+    assert not services.coordinator._allowances.has(thread["id"], "fixture", "echo")
+
+
+async def test_mcp_server_change_clears_allowances(api_client_with_allowances):
+    import sys as _sys
+    from agent.mcp import StdioTransport
+
+    client, services = api_client_with_allowances
+    fixture = Path(__file__).parent / "fake_mcp_server.py"
+    from agent.mcp import McpServer
+
+    await services.registry.add(McpServer.model_validate({
+        "id": "fixture", "display_name": "夹具", "enabled": True,
+        "transport": {"type": "stdio", "executable": _sys.executable,
+                      "args": [str(fixture)], "env": {}},
+    }))
+    services.coordinator._allowances.grant("th-1", "fixture", "echo")
+    doc = services.registry.store.load()
+    updated = await services.registry.patch_server("fixture", doc.revision, lambda s: s.model_copy(
+        update={"transport": StdioTransport(executable=_sys.executable,
+                                            args=[str(fixture), "--flag"], env={})}))
+    assert updated.revision == doc.revision + 1
+    assert not services.coordinator._allowances.has("th-1", "fixture", "echo")
+
+
+async def test_shutdown_clears_allowances(api_client_with_allowances):
+    client, services = api_client_with_allowances
+    services.coordinator._allowances.grant("th-1", "fixture", "echo")
+    await services.coordinator.shutdown()
+    assert not services.coordinator._allowances.has("th-1", "fixture", "echo")

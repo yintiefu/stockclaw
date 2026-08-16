@@ -1193,6 +1193,17 @@ class RunCoordinator:
         )
         handle.thread_revision = updated.revision
 
+    def clear_allowances(self, thread_id: str) -> int:
+        """清空线程的 thread_session 许可；不改 thread revision。"""
+        if self._allowances is None:
+            return 0
+        return self._allowances.clear_thread(thread_id)
+
+    def resume_available(self, thread_id: str) -> bool:
+        """计算字段：存在 awaiting_approval 的活动句柄才可恢复审批。"""
+        handle = self._handles.get(thread_id)
+        return handle is not None and handle.phase == "awaiting_approval"
+
     def active(self, thread_id: str) -> ActiveRunHandle | None:
         return self._handles.get(thread_id)
 
@@ -1282,6 +1293,8 @@ class RunCoordinator:
                 raise ThreadBusy(f"{ThreadBusy.code}: thread {thread_id} has an active run")
             if handle is not None:
                 self._release_handle(handle)
+            if self._allowances is not None:
+                self._allowances.clear_thread(thread_id)
             thread_runs = await asyncio.to_thread(runs.runs_for_thread, thread_id)
             for run in thread_runs:
                 await asyncio.to_thread(runs.delete, run.id)
@@ -1291,3 +1304,5 @@ class RunCoordinator:
         """进程退出：每个活动 run 走统一的持久化取消迁移（partial 落盘 + run 终态）。"""
         for thread_id in list(self._handles):
             await self.cancel_run(thread_id)
+        if self._allowances is not None:
+            self._allowances.clear_all()
