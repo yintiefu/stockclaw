@@ -35,3 +35,6 @@ frontend/tsconfig.tsbuildinfo
 *.log
 .vscode/
 .idea/
+
+# 本地 vendored mootdx 安装时的构建残留
+backend/vendor/mootdx_compat/src/*.egg-info/
