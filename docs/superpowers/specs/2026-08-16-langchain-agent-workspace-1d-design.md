@@ -248,7 +248,7 @@ terminal_error | null
 
 ### 8.3 Middleware 装配顺序
 
-模型与上下文治理可以作为外层 middleware；工具执行治理必须位于 MCP guard 和 HITL 的实际执行之后。
+模型与上下文治理可以作为外层 middleware；工具执行治理只在通过所有适用守卫和审批后的真实 handler 入口 reservation。无需审批的内置/Skill 工具在 schema 校验通过后直接到达该入口。
 
 请求级装配的逻辑顺序为：
 
@@ -259,7 +259,9 @@ HumanInTheLoopMiddleware      # 仅存在于有 MCP binding 的 run
 ToolExecutionGovernance       # tool wrapper 中最内层
 ```
 
-锁定 LangChain 版本中，tool wrapper 的第一个 middleware 是最外层。`HumanInTheLoopMiddleware` 在 `after_model` 阶段阻止进入 tool node；审批恢复后，请求才经过 `McpArgumentGuard` 并最终到达最内层 `ToolExecutionGovernance` reservation。实施测试必须直接验证 reject、pending 和 approve 三条路径的计数，不能只断言 tuple 顺序。
+锁定 LangChain 版本中，`McpArgumentGuard` 是 `awrap_model_call` middleware：它在原步骤的模型响应返回后、Graph state 写入和 HITL `after_model` 之前校验 MCP 参数。`HumanInTheLoopMiddleware` 只通过 `after_model/aafter_model` interrupt 阻止进入 tool node，不实现 tool wrapper。审批 resume 不重新调用模型，也不重新运行 guard；批准的调用直接进入 tool node，在真实 handler 入口经过 `ToolExecutionGovernance` reservation。guard 会在工具完成后的下一次模型调用中随请求级 middleware 重新参与。
+
+tool wrapper 的第一个 middleware 是最外层；因此 `ToolExecutionGovernance` 在当前锁定版本中只需位于其他自定义 tool wrapper 的最内层，不能把 HITL 或 guard 错当成 tool wrapper 来推导顺序。实施测试必须直接验证 guard 拒绝、HITL pending/reject、approve 和 allowance 四条路径的计数，不能只断言 tuple 顺序。
 
 如果 1C 的附加 middleware 也实现 tool wrapper，它必须明确归类为“执行前守卫”或“执行治理”，不得不经审查插入 `ToolExecutionGovernance` 之后。
 
@@ -267,14 +269,19 @@ ToolExecutionGovernance       # tool wrapper 中最内层
 
 start/retry/steer-away 的治理准入顺序：
 
-1. 在任何 user/run 写入前加载并校验最新 Policy；损坏时 fail-closed。
-2. 完成既有 duplicate、revision、head、busy 和两阶段 Capability lease 校验。
-3. 创建 `PolicySnapshot`、`RunControl` 和 `ActiveRunHandle`；thread 被原子占用时立即开启第一个 active segment，并把完整 `budget_snapshot` 放入新 RunDocument。
-4. 持久化 user message/run，持久化等待计入 active elapsed。
-5. 每次模型/工具 reservation 在真实调用前同步到 run JSON；持久化失败则不发起对应外部调用并终止 run。
-6. usage、context telemetry、segment 关闭和终态在既有 run/thread 锁下持久化，再发送相应事件。
+1. 先完成既有 duplicate、revision、head、busy 检查和 Capability preview；duplicate/conflict 语义继续优先于 Policy/Capability 错误。
+2. 在任何 user/run 写入前加载并校验最新 Policy，固定 `PolicySnapshot`；损坏时新产品 run fail-closed。
+3. 完成既有两阶段 Capability lease 获取和最终 thread 事实重校验；Policy 在此期间发生修改不改变已取得的 snapshot。
+4. 创建 `RunControl` 和 `ActiveRunHandle`；thread 被原子占用时立即开启第一个 active segment，并把完整 `budget_snapshot` 放入新 RunDocument。
+5. 持久化 user message/run，持久化等待计入 active elapsed。
+6. 每次模型/工具 reservation 在真实调用前同步到 run JSON；持久化失败则不发起对应外部调用并终止 run。
+7. usage、context telemetry、segment 关闭和终态在既有 run/thread 锁下持久化，再发送相应事件。
 
-resume 不执行步骤 1 或创建新 control，只复用 handle 中的 snapshot/control 并重开 active segment。Policy UI 修改、文件变化或默认值变化都不能改变正在 resume 的 run。retry 和 steer-away 是新产品 run，完整执行以上六步。
+resume 只执行既有 duplicate/revision/busy/resume-shape 校验，不读取当前 Policy 或创建新 control；它复用 handle 中的 snapshot/control 并重开 active segment。因此当前 `policy.json` 损坏也不能阻断一个持有合法 snapshot 的 resume。Policy UI 修改、文件变化或默认值变化都不能改变正在 resume 的 run。retry 和 steer-away 是新产品 run，完整执行以上七步。
+
+steer-away 只有在新 Policy snapshot 和 Capability lease 都成功取得、最终事实重校验通过后，才在原子 thread transition 中取消旧 run 并接受新 user message。Policy/Capability 失败必须保留旧 run 的 `awaiting_approval`、pending interrupts 和 allowance 状态，不消费前端提交的 cancelled entries。
+
+reservation 同步继续使用完整 RunDocument 的原子替换，不引入增量 journal。最坏每个 run 有 32 次模型和 64 次工具 reservation，SourceRecord 又固定为最多 200 条，因此写放大有明确上界；1D 选择可审计的一致性而不是新增第二套持久化格式。
 
 cancel 首先在 `RunControl` 中设置 terminal/cancel 标志，阻止新的 reservation，再停止当前等待并进入既有终态持久化。已经 reservation 的同步调用遵守迟到结果丢弃规则。
 
@@ -314,7 +321,9 @@ capacity_wait_seconds=1
 5. 等待者以 `min(tool deadline, active deadline)` 等待结果。
 6. 超时后尝试 `future.cancel()`；若已经运行，停止等待并丢弃迟到结果，但 token 继续占用到 future 实际退出。
 
-这保证 executor 中最多四个已提交但未退出的调用，没有无界排队。服务关闭时停止接受新任务并以有界方式 shutdown；不能因第三方永久阻塞而无限卡住 FastAPI shutdown。
+这保证 executor 中最多四个已提交但未退出的调用，没有无界排队。服务关闭时先停止接受新任务、取消尚未开始的 future，并以 `shutdown(wait=False, cancel_futures=True)` 等等价策略保证 FastAPI lifespan shutdown hook 在固定时间内返回。
+
+标准 `ThreadPoolExecutor` 无法杀死运行中的 Python 线程，且解释器退出时可能等待永久阻塞的 worker。因此 1D 只保证“不无限阻塞 FastAPI lifespan shutdown”，不保证在第三方永久阻塞时优雅退出整个 OS 进程；运维仍可在外层进程管理器的退出期限后强制终止。1D 不为此引入自定义 daemon thread pool 或进程隔离。
 
 ### 10.2 工具类型
 
@@ -322,7 +331,9 @@ capacity_wait_seconds=1
 - 同一产品 run 继续使用现有 `asyncio.Lock` 串行执行内置工具，尤其不能并行 Eastmoney throttled fetch。
 - Skill 工具是受控本地异步读取，不占同步 worker，但仍受工具次数、tool deadline 和 active deadline 限制。
 - MCP 工具不占同步 worker；外层 Governance 以 Policy deadline 等待它。MCP Registry 既有 60 秒连接/调用生命周期限制继续存在，实际截止取更早者。
-- Artifact 的序列化与临时文件准备使用同一有界 executor，但 worker 只能写固定命名的 staging file，不能修改 thread/run 或把文件落到最终 ID；权威提交遵循第 15 节。持久化错误不能转为普通可纠正工具结果。
+- Artifact 的序列化与临时文件准备使用同一有界 executor，但 worker 只能写符合 `<artifact-id>.<nonce>.artifact.tmp` 的 staging file，不能修改 thread/run 或把文件落到最终 ID；权威提交遵循第 15 节。不同 thread/run 的 staging 名称不得碰撞。
+- Artifact staging 一秒内无法取得共享 worker 时，同样以 `TOOL_CAPACITY_EXHAUSTED` 终止 run。该选择是有意的：共享同步容量已经耗尽时不让模型自动重试并扩大拥塞。
+- Artifact 持久化错误不能转为普通可纠正工具结果。
 
 `TOOL_TIMEOUT` 表示单工具 Policy deadline；`RUN_ACTIVE_TIMEOUT` 优先表示产品 run active 总期限先耗尽。
 
@@ -453,7 +464,7 @@ Artifact 路径保持：
 }
 ```
 
-- 1-50 列，column key 唯一且非空，label 长度 1-100。
+- 1-50 列，column key 唯一并匹配 `^[A-Za-z_][A-Za-z0-9_]{0,63}$`；面向用户的中文或其他 Unicode 名称放在 label，label 长度 1-100。
 - 最多 5,000 行。
 - 每个 row 只能包含已声明 key。
 - cell 只能是 string、number、boolean 或 null；拒绝 NaN 和 Infinity。
@@ -529,6 +540,8 @@ Artifact 路径保持：
 - `tool_call` 只能引用当前产品 run 已完成并已持久化的工具调用，不能引用 pending、rejected、其他 run 或不存在的 ID。
 - `url` 只接受绝对 HTTP/HTTPS URL；只规范化和记录，不发网络请求。
 - 对 `sources` 类型 Artifact，`source_index` 必须在本次 `sources` 数组范围内且唯一；解析后持久化为对应 `source_id`，输入中的索引不落盘。
+- 所有 URL 描述符使用第 16.2 节同一个规范化 key 与 run 内既有 `model_url` 去重；命中已有记录时复用其 ID，不修改已持久化 label。
+- 当 run 已有 200 条 SourceRecord 时，只允许描述符复用既有记录。需要新增 URL、或引用了已完成但因上限未生成 SourceRecord 的 tool call 时，整个 `create_artifact` 以 `ARTIFACT_SOURCE_INVALID` 结构化失败；不得静默省略描述符、缩短 `source_ids` 或创建部分 Artifact。
 
 可纠正错误作为结构化 tool result 返回，Agent 可以修改输入后重试：类型/schema、大小、父链、来源引用和业务冲突错误。
 
@@ -586,11 +599,12 @@ Artifact 路径保持：
 
 - 每个完成并成功持久化的工具调用自动产生一条 `tool_execution` source，包括返回结构化业务 error 的调用。
 - pending、参数拒绝、HITL reject、steer-away 和未完成调用不产生 source。
-- 完整 assistant message 持久化后，从文本 content 中提取 HTTP/HTTPS URL，记录为 `model_url`。
+- 完整 assistant message 持久化后，从文本 content 中提取 HTTP/HTTPS URL，记录为 `model_url`。提取器识别 Markdown inline link destination、Markdown autolink 和裸 URL，忽略 fenced code block 与 inline code；候选 URL 最长 2,048 字符。
 - partial 和 pending-interrupt assistant message 不提取 URL。
 - 工具来源按 `tool_call_id` 去重。
-- URL 去重 key：scheme/host 小写、移除 fragment、移除默认端口、空 path 规范为 `/`；不改 query 顺序，不跟随 redirect。
-- 达到 200 条后停止新增，设置 `sources_truncated=true`；已有来源顺序不变，不做评分或优先级替换。
+- URL 候选先移除 ASCII/中文句末标点 `.,;:!?，。；：！？`，并只移除没有匹配左括号的尾部 `) ] }`，再用结构化 URL parser 校验：必须是绝对 HTTP/HTTPS、具有 hostname 且不含 userinfo。自动提取中的无效候选忽略；`create_artifact` 中的无效描述符返回 `ARTIFACT_SOURCE_INVALID`。
+- URL 去重 key：scheme/host 小写、移除 fragment、移除默认端口、空 path 规范为 `/`；不改 query 顺序，不跟随 redirect。Artifact URL 描述符和 assistant 自动提取共享同一去重表。
+- 达到 200 条后停止自动新增并设置 `sources_truncated=true`；已有来源顺序不变，不做评分或优先级替换。`create_artifact` 在截断态的行为遵循第 15 节：可复用已有记录，但不能静默丢弃新描述符。
 
 Artifact 的 `source_ids` 只引用同一 run 的 SourceRecord。下载 Artifact 时保留 ID，不把 run 中的 summary 复制进 Artifact 文件。
 
@@ -614,7 +628,7 @@ download：
 - Markdown 使用 `.md`，table 使用 `.json`，JSON 使用 `.json`，sources 使用 `.json`。
 - attachment filename 只由服务端 Artifact ID 和固定扩展名构造，不使用用户 title。
 - 设置 `Content-Disposition: attachment`、`X-Content-Type-Options: nosniff` 和限制性 CSP。
-- JSON/Markdown 均以 UTF-8 返回；不返回 `text/html` 或 `image/svg+xml`。
+- Markdown 固定返回 `Content-Type: text/markdown; charset=utf-8`；table、JSON 和 sources 固定返回 `Content-Type: application/json; charset=utf-8`。不根据用户内容猜测 MIME，不返回 `text/html` 或 `image/svg+xml`。
 
 删除步骤：
 
@@ -815,6 +829,8 @@ Settings 是独立抽屉，包含四个 tab：
 
 当任何前端已知 thread 为 `running` 或 `awaiting_approval` 时，Model reference 不可改变，避免 resume 产生 `RUN_CONFIG_MISMATCH`。Policy 可以修改，因为 active run 使用快照。Skill selection 继续受当前 thread busy/revision 规则约束。
 
+当 `max_context_chars <= 60000` 时，Policy tab 显示非阻断 warning：单个合法 Skill 指令即可达到 60,000 字符，加载后加上 System 与当前 turn 可能产生 `CONTEXT_LIMIT_EXCEEDED`。warning 只说明当前配置冲突，不自动抬高数值或修改 active run。
+
 ## 24. 响应式与可访问性
 
 小于 Tailwind `xl` breakpoint：
@@ -867,6 +883,7 @@ Settings 是独立抽屉，包含四个 tab：
 - token `available/partial/unavailable` 聚合。
 - context canonical 计数、完整 user turn、tool pair 原子、Skill 指令保留、强制内容超限。
 - reject/pending MCP 不计工具调用，approve/allowance/业务 error 计数。
+- duplicate/conflict 检查先于 Policy/Capability 错误；新产品 run 才读取 Policy snapshot。
 
 ### 27.2 Executor 测试
 
@@ -874,6 +891,7 @@ Settings 是独立抽屉，包含四个 tab：
 - submit 前取得 token，executor queue 永不超过容量。
 - timeout/cancel 后，运行中 future 仍占容量，迟到结果被丢弃。
 - 全部 future 实际退出后容量恢复。
+- 用测试控制的阻塞 worker 验证 lifespan shutdown hook 在 worker 释放前已于固定期限内返回并拒绝新 submit，断言后释放 worker 以免测试进程在解释器退出时被 join；测试不声称永久阻塞时整个 Python 解释器可优雅退出。
 - 同一 run 的内置工具保持串行；Eastmoney 分类的调用绝不并发。
 - MCP 60 秒生命周期限制仍存在，Policy 以更短 deadline 外包裹。
 
@@ -882,21 +900,30 @@ Settings 是独立抽屉，包含四个 tab：
 - 四种 schema 的合法/非法边界、UTF-8 1 MB、table 50/5000、JSON depth/node、sources 200。
 - ID/path traversal、symlink、跨 thread/run、跨类型 parent、分叉、cycle 和非叶删除。
 - 只允许当前 run completed tool call 来源；URL scheme/规范化/去重。
+- Markdown link/autolink/裸 URL 提取、code span/fence 忽略、2,048 字符上限、userinfo 拒绝和句末标点处理。
+- Sources 已满 200 条时，已有 tool/URL 描述符仍可复用；任何需要新 SourceRecord 的描述符返回 `ARTIFACT_SOURCE_INVALID`，不创建部分 Artifact 或虚假事件。
 - partial assistant 不提取 URL；模型 URL 标记 unverified。
 - arguments/result 脱敏先于 1,000 字符裁剪。
 - Artifact 文件、thread reference、run source 的提交顺序和失败补偿。
+- 不同 thread 并发 staging 文件互不碰撞；timeout/cancel 后迟到 future 只产生并清理合法 `.artifact.tmp`，不提交权威状态。
+- Artifact staging 无 worker 容量时以 `TOOL_CAPACITY_EXHAUSTED` 终止 run，不触发模型自动重试。
 - persistence failure 不发送 `artifact.created`。
 - Artifact 在之后的 run failure/cancel 后仍存在。
 - 删除 revision/busy/leaf、thread cascade、orphan/corrupt 启动对账。
-- attachment filename、MIME、CSP 和 `nosniff`。
+- table column key pattern、attachment filename、固定 MIME、CSP 和 `nosniff`。
 
 ### 27.4 集成与协议测试
 
 - 第 9 次模型调用被阻断，Provider 没有收到第 9 个请求。
 - 第 17 次实际工具调用被阻断，handler 没有执行第 17 次。
+- 模型 reservation 写 run JSON 失败时 run 终止，Provider 零调用且不发送声称该 reservation 已持久化的 `budget.updated`。
+- 工具 reservation 写 run JSON 失败时 run 终止，handler 零调用且不产生 tool provenance。
 - active 5 分钟用 fake clock 到期后失败，审批等待不推进 active time。
 - 四 worker 饱和，第五个 run 明确失败，释放后新 run 恢复。
 - resume 保持之前的次数和原 Policy；运行中 PATCH Policy 不漂移。
+- active run 期间 Policy 文件损坏时，持有原 snapshot 的 resume 和终态持久化继续成功；新 start/retry/steer-away 返回 `503 POLICY_CORRUPT`。
+- steer-away 的新 Policy/Capability 准入失败时，旧 run 仍为 `awaiting_approval`，pending interrupts/cancelled entries/new user message 均未消费或写入。
+- Policy 损坏窗口内的重复提交仍先返回既有 `DUPLICATE_RUN_ACTIVE/TERMINAL` 409，不被 503 覆盖。
 - context 裁剪不改 thread JSON，Inspector telemetry 与实际输入一致。
 - Artifact 创建事件只在提交后出现，Artifact 可在 REST 重载后恢复。
 - source/run 持久化先于 `sources.updated`。
@@ -908,18 +935,20 @@ Settings 是独立抽屉，包含四个 tab：
 
 - Inspector 四 tab、Settings 四 tab 和事件 stale revision 丢弃。
 - Policy CAS/corrupt reset 交互。
+- `max_context_chars <= 60000` 显示非阻断配置 warning，保存语义不变。
 - 四类 Artifact viewer、200 行预览、下载/删除和版本链。
 - 来源两种 verification label，不出现评分或推荐措辞。
 - running/awaiting approval Composer 行为。
 - 抽屉互斥、Escape、backdrop、focus trap、focus return 和 ARIA。
 - Playwright 覆盖 1440x900 与 390x844、light/dark screenshot。
+- Playwright 使用仓库内固定 devDependency、config 和 Chromium，不依赖全局安装。
 - 无 console error、横向 overflow、元素重叠和文字溢出。
 
 ## 28. 实施切片与退出条件
 
 ### 28.1 切片一：治理运行时
 
-交付 Policy、RunControl、middleware、有界 executor、上下文和 usage。退出条件：硬限制集成测试通过，1A-1C 全部回归绿色，Inspector 尚未完成时也能从 run REST 验证权威状态。
+交付 Policy、RunControl、middleware、有界 executor、上下文和 usage；第 20 节的 RunDocument 治理字段、Policy REST 与 `budget.updated` 同属切片一。退出条件：硬限制集成测试通过，1A-1C 全部回归绿色，Inspector 尚未完成时也能从 run REST 验证权威状态。
 
 ### 28.2 切片二：Artifact 与来源
 
@@ -927,7 +956,7 @@ Artifact schema/store/tool/REST/reconciliation 和 provenance 必须同一切片
 
 ### 28.3 切片三：最终工作台
 
-完成桌面/移动布局、Inspector、Settings、事件和 Playwright。退出条件：可视化确认稿对应的桌面和移动交互落地，所有自动化、截图、无 overlap 检查通过。
+完成桌面/移动布局、Inspector、Settings、事件和 Playwright。前端直接加入固定版本的 `@playwright/test` devDependency、提交 `package-lock.json` 和 Playwright config，并安装 Chromium 测试浏览器；不得依赖开发机全局包。退出条件：可视化确认稿对应的桌面和移动交互落地，所有自动化、截图、无 overlap 检查通过。
 
 ### 28.4 最终门禁
 
