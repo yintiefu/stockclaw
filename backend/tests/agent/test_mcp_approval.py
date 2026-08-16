@@ -45,18 +45,16 @@ class FakeHandler:
 
 
 async def guard_response(guard, arguments: dict, tool_name="mcp__fixture__echo"):
-    from langchain_core.messages import AIMessage, HumanMessage
+    """按 langchain 中间件协议调用：awrap_model_call(request, handler)。"""
+    from langchain_core.messages import AIMessage
 
-    state = {"messages": [HumanMessage(content="hi")]}
     response = AIMessage(content="", tool_calls=[{
         "id": "call-1", "name": tool_name, "args": arguments}])
 
-    async def call_llm(**kwargs):
+    async def call_llm(request):
         return response
 
-    result = await guard.awrap_model_call(
-        state, None, call_llm)
-    return result
+    return await guard.awrap_model_call(object(), call_llm)
 
 
 async def test_argument_guard_boundary_and_zero_execution():
