@@ -48,6 +48,10 @@ class AgentPaths:
     def runs(self) -> Path:
         return self.root / "runs"
 
+    @property
+    def skills(self) -> Path:
+        return self.root / "skills"
+
 
 class StoreError(RuntimeError):
     code = "AGENT_STORE_ERROR"
