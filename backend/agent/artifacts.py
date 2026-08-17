@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -209,16 +208,6 @@ class ArtifactPersistenceFailed(ArtifactError):
     """终局性持久化失败：绝不能作为可纠正工具结果返回。"""
 
     code = "ARTIFACT_PERSISTENCE_FAILED"
-
-
-async def _emit_persisted_event(name: str, payload: dict) -> None:
-    """提交完成后经 Graph CustomEvent 通道通知；发送失败不影响权威状态。"""
-    try:
-        from langchain_core.callbacks import adispatch_custom_event
-
-        await adispatch_custom_event(name, payload)
-    except Exception as exc:
-        print(f"artifact persisted event emit failed: {exc!r}", file=sys.stderr)
 
 
 @dataclass(frozen=True)
@@ -437,9 +426,10 @@ class ArtifactService:
                             "updated_at": utc_now_stamp(),
                         })
                         self._runs.replace(updated_run)
-                        await _emit_persisted_event("sources.updated", {
+                        control.record_persisted_event_fact("sources.updated", {
                             "threadId": thread_id,
                             "runId": run_id,
+                            "controlRevision": view.control_revision,
                             "sourceCount": len(updated_run.sources),
                             "sourcesTruncated": updated_run.sources_truncated,
                         })
@@ -462,12 +452,12 @@ class ArtifactService:
                             pass
                         raise ArtifactPersistenceFailed(
                             f"thread 引用提交失败: {exc}") from exc
-                    await _emit_persisted_event("artifact.created", {
+                    control.record_persisted_event_fact("artifact.created", {
                         "threadId": thread_id,
                         "runId": run_id,
                         "artifactId": plan.artifact.id,
-                        "artifactType": plan.artifact.type,
-                        "parentArtifactId": plan.artifact.parent_artifact_id,
+                        "type": plan.artifact.type,
+                        "title": plan.artifact.title,
                         "threadRevision": updated_thread.revision,
                     })
                 except ArtifactPersistenceFailed:

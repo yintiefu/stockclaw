@@ -335,8 +335,10 @@ def test_final_sources_event_follows_terminal_commit_and_budget(services, client
                       if event.get("type") == "CUSTOM" and event.get("name") == "sources.updated"]
     assert len(source_indexes) == 1
     payload = json.loads(events[source_indexes[0]]["value"])
+    run = services.runs.list_documents()[0]
     assert payload == {
-        "threadId": "thread-1d", "runId": services.runs.list_documents()[0].id,
+        "threadId": "thread-1d", "runId": run.id,
+        "controlRevision": run.control_revision,
         "sourceCount": 2, "sourcesTruncated": False,
     }
     final_thread = max(i for i, event in enumerate(events)
@@ -346,6 +348,34 @@ def test_final_sources_event_follows_terminal_commit_and_budget(services, client
     terminal = next(i for i, event in enumerate(events)
                     if event["type"] in ("RUN_FINISHED", "RUN_ERROR"))
     assert final_thread < final_budget < source_indexes[0] < terminal
+
+
+def test_malformed_graph_custom_event_fails_the_persisted_run(services, client, monkeypatch):
+    from ag_ui.core.events import CustomEvent, EventType
+
+    monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: ScriptedChatModel([
+        AIMessage(content="答")]))
+    original_convert = router_module.AgentProtocolBridge.convert
+    emitted = False
+
+    def malformed_once(self, event):
+        nonlocal emitted
+        if not emitted:
+            emitted = True
+            return original_convert(self, CustomEvent(
+                type=EventType.CUSTOM, name="sources.updated", value="{"))
+        return original_convert(self, event)
+
+    monkeypatch.setattr(router_module.AgentProtocolBridge, "convert", malformed_once)
+    response = client.post("/api/agent/run", json=start_payload(), headers=HEADERS)
+    assert response.status_code == 200
+    run = services.runs.list_documents()[0]
+    assert run.status == "failed"
+    assert run.error_code == "INVALID_CUSTOM_EVENT"
+    events = parse_sse(response.text)
+    assert [event["code"] for event in events if event["type"] == "RUN_ERROR"] == [
+        "INVALID_CUSTOM_EVENT"]
+    assert not [event for event in events if event["type"] == "RUN_FINISHED"]
 
 
 def test_usage_counts_come_from_persisted_reservations_not_events(services, client, monkeypatch):

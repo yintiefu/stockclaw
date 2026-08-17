@@ -192,12 +192,12 @@ def test_budget_updated_non_object_payload_fails_closed():
 
 @pytest.mark.parametrize(("name", "payload"), [
     ("sources.updated", {
-        "threadId": "thread-1", "runId": "run-1", "sourceCount": 7,
-        "sourcesTruncated": False,
+        "threadId": "thread-1", "runId": "run-1", "controlRevision": 13,
+        "sourceCount": 7, "sourcesTruncated": False,
     }),
     ("artifact.created", {
         "threadId": "thread-1", "runId": "run-1", "artifactId": "artifact-1",
-        "artifactType": "markdown", "parentArtifactId": "artifact-parent", "threadRevision": 3,
+        "type": "markdown", "title": "财务快照", "threadRevision": 3,
     }),
 ])
 def test_persisted_custom_events_accept_only_camel_case_metadata(name, payload):
@@ -209,25 +209,37 @@ def test_persisted_custom_events_accept_only_camel_case_metadata(name, payload):
 
 @pytest.mark.parametrize(("name", "payload"), [
     ("sources.updated", {
-        "threadId": "thread-1", "runId": "run-1", "sourceCount": 7,
-        "sourcesTruncated": False, "sources": [{"url": "https://example.com"}],
+        "threadId": "thread-1", "runId": "run-1", "controlRevision": 13,
+        "sourceCount": 7, "sourcesTruncated": False, "sources": [{"url": "https://example.com"}],
     }),
     ("artifact.created", {
         "threadId": "thread-1", "runId": "run-1", "artifactId": "artifact-1",
-        "artifactType": "markdown", "threadRevision": 3, "content": "not allowed",
+        "type": "markdown", "title": "财务快照", "threadRevision": 3, "content": "not allowed",
     }),
     ("sources.updated", {
-        "thread_id": "thread-1", "runId": "run-1", "sourceCount": 7,
-        "sourcesTruncated": False,
+        "thread_id": "thread-1", "runId": "run-1", "controlRevision": 13,
+        "sourceCount": 7, "sourcesTruncated": False,
     }),
     ("artifact.created", {
         "threadId": "thread-1", "run_id": "run-1", "artifactId": "artifact-1",
-        "artifactType": "markdown", "threadRevision": 3,
+        "type": "markdown", "title": "财务快照", "threadRevision": 3,
     }),
 ])
 def test_persisted_custom_events_reject_summaries_and_unknown_fields(name, payload):
     out = AgentProtocolBridge("thread-1", "run-1").convert(CustomEvent(
         type=EventType.CUSTOM, name=name, value=json.dumps(payload)))
+    assert out[0].code == "INVALID_CUSTOM_EVENT"
+
+
+def test_malformed_custom_event_json_fails_closed():
+    out = AgentProtocolBridge("thread-1", "run-1").convert(CustomEvent(
+        type=EventType.CUSTOM, name="sources.updated", value="{"))
+    assert out[0].code == "INVALID_CUSTOM_EVENT"
+
+
+def test_malformed_legacy_interrupt_json_fails_closed():
+    out = AgentProtocolBridge("thread-1", "run-1").convert(CustomEvent(
+        type=EventType.CUSTOM, name="on_interrupt", value="{"))
     assert out[0].code == "INVALID_CUSTOM_EVENT"
 
 

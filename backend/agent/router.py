@@ -264,6 +264,14 @@ class _PersistenceFailure(RuntimeError):
     """JSON 提交失败：必须显式告知客户端状态未持久化。"""
 
 
+class _BridgeProtocolFailure(RuntimeError):
+    """Graph 自定义事件未通过协议校验，当前产品 run 必须失败关闭。"""
+
+    def __init__(self, event: RunErrorEvent):
+        super().__init__(event.message)
+        self.code = event.code
+
+
 def _classify(input_data: RunAgentInput) -> str:
     """按 spec 的合法形状分类（start/resume/steer-away）；混合/畸形形状一律失败关闭。"""
     forwarded_props = input_data.forwarded_props or {}
@@ -454,6 +462,34 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
         terminal: str = "completed"
         sources_changed = False
 
+        def drain_persisted_fact_events() -> list[CustomEvent]:
+            nonlocal sources_changed
+            events = []
+            for fact in handle.control.drain_persisted_event_facts():
+                if fact["name"] == "sources.updated":
+                    sources_changed = True
+                    continue
+                payload = fact["payload"]
+                handle.thread_revision = payload["threadRevision"]
+                events.append(CustomEvent(name=fact["name"], value=payload))
+            return events
+
+        def encode_persisted_fact_events() -> list[str]:
+            frames = []
+            for fact_event in drain_persisted_fact_events():
+                converted = bridge.convert(fact_event)
+                bridge_error = next(
+                    (event for event in converted
+                     if isinstance(event, RunErrorEvent)
+                     and event.code in ("INVALID_CUSTOM_EVENT", "UNSUPPORTED_CUSTOM_EVENT")),
+                    None,
+                )
+                if bridge_error is not None:
+                    raise _BridgeProtocolFailure(bridge_error)
+                frames.extend(_redact_frame(encoder.encode(redact_event(event, model_key)), model_key)
+                              for event in converted)
+            return frames
+
         async def final_sources_frame() -> str | None:
             if not sources_changed or handle.product_run_id is None:
                 return None
@@ -463,6 +499,7 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                 value={
                     "threadId": thread_id,
                     "runId": run.id,
+                    "controlRevision": run.control_revision,
                     "sourceCount": len(run.sources),
                     "sourcesTruncated": run.sources_truncated,
                 },
@@ -474,7 +511,7 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
         pending_initial = [
             encoder.encode(thread_revision_updated(thread_id, revision, utc_now()))
             for revision in initial_revisions
-        ]
+            ]
         try:
             async for event in adapter.run(adapter_input):
                 if await request.is_disconnected():
@@ -483,8 +520,19 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                 if handle.phase == "cancelled" or (handle.journal is not None and handle.journal.closed):
                     # REST 取消/其他路径已终结本 run：丢弃所有迟到事件
                     return
+                persisted_fact_frames = encode_persisted_fact_events()
                 converted_events = bridge.convert(event)
+                bridge_error = next(
+                    (converted for converted in converted_events
+                     if isinstance(converted, RunErrorEvent)
+                     and converted.code in ("INVALID_CUSTOM_EVENT", "UNSUPPORTED_CUSTOM_EVENT")),
+                    None,
+                )
+                if bridge_error is not None:
+                    raise _BridgeProtocolFailure(bridge_error)
                 if isinstance(event, RunFinishedEvent):
+                    for frame in persisted_fact_frames:
+                        yield frame
                     if bridge.pending:
                         # 中断：先富集 MCP 元数据（camelCase + 脱敏参数）再持久化
                         bridge.pending = enrich_pending_interrupts(
@@ -527,6 +575,8 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                         yield frame
                     pending_initial = []
                     continue
+                for frame in persisted_fact_frames:
+                    yield frame
                 for converted in converted_events:
                     safe_event = redact_event(converted, model_key)
                     if isinstance(safe_event, CustomEvent) and safe_event.name == "sources.updated":
@@ -590,6 +640,8 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
             message = str(exc).replace(model_key, "[redacted]")[:1000]
             error_code = getattr(exc, "code", None) or "AGENT_RUN_FAILED"
             try:
+                for frame in encode_persisted_fact_events():
+                    yield frame
                 commits = await _commit_or_fail(
                     lambda: services.coordinator.journal_terminal(thread_id, "failed", error_code, message)
                 )

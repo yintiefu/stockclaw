@@ -166,10 +166,11 @@ def test_graph_artifact_event_is_validated_and_metadata_only(services, client, m
     assert len(artifacts) == 1
     payload = json.loads(artifacts[0]["value"])
     assert set(payload) == {
-        "threadId", "runId", "artifactId", "artifactType", "threadRevision"}
+        "threadId", "runId", "artifactId", "type", "title", "threadRevision"}
     assert payload["threadId"] == "thread-graph-art"
     assert payload["runId"] == services.runs.list_documents()[0].id
-    assert payload["artifactType"] == "markdown"
+    assert payload["type"] == "markdown"
+    assert payload["title"] == "研究摘录"
     assert "content" not in payload
 
 
@@ -205,7 +206,7 @@ def test_artifact_publish_failure_emits_sources_after_terminal_commit(services, 
 
 
 @pytest.mark.asyncio
-async def test_create_artifact_dispatches_events_only_after_durable_facts(services, client, monkeypatch):
+async def test_create_artifact_records_events_only_after_durable_facts(services, client, monkeypatch):
     monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: ScriptedChatModel([
         AIMessage(content="完成")]))
     response = client.post("/api/agent/run", json={
@@ -224,35 +225,24 @@ async def test_create_artifact_dispatches_events_only_after_durable_facts(servic
         execution_lock=asyncio.Lock(), builtin_serial_lock=asyncio.Lock(),
         executor=services.executor, tool_deadline=__import__("time").monotonic() + 30,
         control=RunControl(DEFAULT_POLICY_SNAPSHOT), artifact_service=services.artifacts_service)
-    observed = []
-
-    async def capture(name, payload):
-        observed.append((name, payload))
-        persisted_run = services.runs.get(run.id)
-        if name == "sources.updated":
-            assert len(persisted_run.sources) == payload["sourceCount"]
-        else:
-            assert services.artifacts_service.store.get("thread-events", payload["artifactId"])
-            assert payload["artifactId"] in services.threads.get("thread-events").artifact_ids
-
-    monkeypatch.setattr("langchain_core.callbacks.adispatch_custom_event", capture)
     result = await _run_create(services, context, create_args(
         sources=[{"kind": "url", "url": "https://new.example/report"}]))
     assert result["ok"] is True
-    assert [name for name, _ in observed] == ["sources.updated", "artifact.created"]
-    assert observed[0][1] == {
+    facts = context.control.drain_persisted_event_facts()
+    assert [fact["name"] for fact in facts] == ["sources.updated", "artifact.created"]
+    assert facts[0]["payload"] == {
         "threadId": "thread-events", "runId": run.id,
-        "sourceCount": 1, "sourcesTruncated": False,
+        "controlRevision": 1, "sourceCount": 1, "sourcesTruncated": False,
     }
-    assert observed[1][1] == {
+    assert facts[1]["payload"] == {
         "threadId": "thread-events", "runId": run.id,
-        "artifactId": result["artifact"]["id"], "artifactType": "markdown",
-        "parentArtifactId": None, "threadRevision": result["thread_revision"],
+        "artifactId": result["artifact"]["id"], "type": "markdown",
+        "title": "研究摘录", "threadRevision": result["thread_revision"],
     }
 
 
 @pytest.mark.asyncio
-async def test_publish_failure_after_source_commit_dispatches_sources_only(services, client, monkeypatch):
+async def test_publish_failure_after_source_commit_records_sources_only(services, client, monkeypatch):
     monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: ScriptedChatModel([
         AIMessage(content="完成")]))
     response = client.post("/api/agent/run", json={
@@ -271,21 +261,16 @@ async def test_publish_failure_after_source_commit_dispatches_sources_only(servi
         execution_lock=asyncio.Lock(), builtin_serial_lock=asyncio.Lock(),
         executor=services.executor, tool_deadline=__import__("time").monotonic() + 30,
         control=RunControl(DEFAULT_POLICY_SNAPSHOT), artifact_service=services.artifacts_service)
-    observed = []
-
-    async def capture(name, payload):
-        observed.append((name, payload))
-
     def fail_publish(staged):
         raise OSError("disk full")
 
-    monkeypatch.setattr("langchain_core.callbacks.adispatch_custom_event", capture)
     monkeypatch.setattr(services.artifacts_service.store, "publish", fail_publish)
     with pytest.raises(ArtifactPersistenceFailed):
         await _run_create(services, context, create_args(
             sources=[{"kind": "url", "url": "https://new.example/fail"}]))
-    assert [name for name, _ in observed] == ["sources.updated"]
-    assert observed[0][1]["sourceCount"] == 1
+    facts = context.control.drain_persisted_event_facts()
+    assert [fact["name"] for fact in facts] == ["sources.updated"]
+    assert facts[0]["payload"]["sourceCount"] == 1
     assert services.threads.get("thread-event-fail").artifact_ids == []
 
 

@@ -90,10 +90,8 @@ class ArtifactCreatedEventValue(ConfiguredBaseModel):
     thread_id: str = Field(validation_alias="threadId", serialization_alias="threadId", min_length=1)
     run_id: str = Field(validation_alias="runId", serialization_alias="runId", min_length=1)
     artifact_id: str = Field(validation_alias="artifactId", serialization_alias="artifactId", min_length=1)
-    artifact_type: Literal["markdown", "table", "json", "sources"] = Field(
-        validation_alias="artifactType", serialization_alias="artifactType")
-    parent_artifact_id: str | None = Field(
-        default=None, validation_alias="parentArtifactId", serialization_alias="parentArtifactId", min_length=1)
+    type: Literal["markdown", "table", "json", "sources"]
+    title: str = Field(min_length=1, max_length=200)
     thread_revision: int = Field(
         validation_alias="threadRevision", serialization_alias="threadRevision", ge=0)
 
@@ -107,6 +105,8 @@ class SourcesUpdatedEventValue(ConfiguredBaseModel):
 
     thread_id: str = Field(validation_alias="threadId", serialization_alias="threadId", min_length=1)
     run_id: str = Field(validation_alias="runId", serialization_alias="runId", min_length=1)
+    control_revision: int = Field(
+        validation_alias="controlRevision", serialization_alias="controlRevision", ge=0)
     source_count: int = Field(validation_alias="sourceCount", serialization_alias="sourceCount", ge=0)
     sources_truncated: bool = Field(
         validation_alias="sourcesTruncated", serialization_alias="sourcesTruncated")
@@ -198,18 +198,25 @@ class AgentProtocolBridge:
         if isinstance(event, CustomEvent):
             if event.name == "on_interrupt":
                 # 本锁定版本里 CustomEvent.value 是 JSON 字符串而非 dict，统一解析。
-                raw = event.value
-                value = json.loads(raw) if isinstance(raw, str) else raw
-                self._capture(value)
+                try:
+                    raw = event.value
+                    value = json.loads(raw) if isinstance(raw, str) else raw
+                    if not isinstance(value, dict):
+                        raise ValueError("legacy interrupt payload must be an object")
+                    self._capture(value)
+                except (json.JSONDecodeError, ValueError):
+                    return [RunErrorEvent(
+                        message="Malformed custom event payload: on_interrupt",
+                        code="INVALID_CUSTOM_EVENT")]
                 return []
             payload_model = CUSTOM_EVENT_MODELS.get(event.name)
             if payload_model is None:
                 return [RunErrorEvent(message=f"Unsupported custom event: {event.name}", code="UNSUPPORTED_CUSTOM_EVENT")]
             raw = event.value
-            value = json.loads(raw) if isinstance(raw, str) else raw
             try:
+                value = json.loads(raw) if isinstance(raw, str) else raw
                 parsed = payload_model.model_validate(value)
-            except ValidationError:
+            except (json.JSONDecodeError, ValidationError):
                 return [RunErrorEvent(message=f"Malformed custom event payload: {event.name}", code="INVALID_CUSTOM_EVENT")]
             # 规范化重编码（省略 null 字段）后按原 CustomEvent 类型放行
             canonical = CustomEvent(

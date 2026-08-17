@@ -136,6 +136,7 @@ class RunControl:
         self._closed_segments_ms: list[int] = []
         self._open_since: float | None = None
         self.terminal_error: TerminalFact | None = None
+        self._persisted_event_facts: list[dict] = []
 
     # ---- 预留事务 ----
 
@@ -275,6 +276,17 @@ class RunControl:
             if count > 0:
                 self._control_revision += count
             return self._view_locked()
+
+    def record_persisted_event_fact(self, name: str, payload: dict) -> None:
+        """仅记录已提交的 Artifact/Source 事实，供 router 在协议出口编码。"""
+        with self._counter_lock:
+            self._persisted_event_facts.append({"name": name, "payload": payload})
+
+    def drain_persisted_event_facts(self) -> list[dict]:
+        with self._counter_lock:
+            facts = self._persisted_event_facts
+            self._persisted_event_facts = []
+            return facts
 
     # ---- 终态 ----
 
