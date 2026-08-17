@@ -1153,7 +1153,10 @@ async def list_thread_artifacts(thread_id: str):
     ]
     recovery_warnings = [
         warning for warning in services.recovery_warnings
-        if warning.document_type == "artifact"
+        if warning.document_type == "artifact" and (
+            warning.filename.startswith(f"{thread_id}/")
+            or warning.filename.startswith(f"{thread_id}.deleting-")
+        )
     ]
     return ArtifactListResponse(
         artifacts=enriched,

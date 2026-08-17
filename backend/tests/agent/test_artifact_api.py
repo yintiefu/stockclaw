@@ -21,6 +21,7 @@ from agent.models import (
     TableContent,
     TableColumn,
 )
+from agent.stores import RecoveryWarning
 from tests.agent.conftest import enter_single_loop_client
 
 
@@ -113,6 +114,25 @@ def test_list_artifacts_serializes_artifact_recovery_warnings(seeded):
     assert response.status_code == 200, response.text
     assert {warning["code"] for warning in response.json()["warnings"]} == {"ARTIFACT_ORPHAN"}
     assert response.json()["warnings"][0]["document_type"] == "artifact"
+
+
+def test_list_artifacts_filters_startup_warnings_to_requested_thread(seeded, client):
+    seeded.recovery_warnings = [
+        RecoveryWarning("ARTIFACT_CHAIN_INVALID", "artifact", "thread-a/artifact-a.json"),
+        RecoveryWarning("ARTIFACT_CHAIN_INVALID", "artifact", "thread-other/artifact-b.json"),
+        RecoveryWarning("DELETE_TOMBSTONE_LEFTOVER", "artifact",
+                        "thread-a.deleting-20260817T120000000000"),
+        RecoveryWarning("DELETE_TOMBSTONE_LEFTOVER", "artifact",
+                        "thread-other.deleting-20260817T120000000000"),
+    ]
+
+    response = client.get("/api/agent/threads/thread-a/artifacts")
+
+    assert response.status_code == 200
+    assert [warning["filename"] for warning in response.json()["warnings"]] == [
+        "thread-a/artifact-a.json",
+        "thread-a.deleting-20260817T120000000000",
+    ]
 
 
 def test_startup_retains_tombstone_cleanup_warning_for_thread_list(tmp_path, monkeypatch):

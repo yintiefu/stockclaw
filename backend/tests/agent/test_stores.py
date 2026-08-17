@@ -398,6 +398,31 @@ def test_reconcile_artifacts_keeps_referenced_files_and_quarantines_identity_and
     assert list(artifact_dir.glob("artifact-chain.json.corrupt-*"))
 
 
+def test_reconcile_warns_and_keeps_diagnostic_when_artifact_quarantine_fails(tmp_path, monkeypatch):
+    paths = make_paths(tmp_path)
+    threads = ThreadStore(paths)
+    threads.create(ThreadDocument.new("thread-1", "研究", now=NOW))
+    store = ArtifactStore(paths.root)
+    store.publish(store.stage(make_artifact("artifact-payload")))
+    artifact_dir = paths.artifacts_dir / "thread-1"
+    invalid = artifact_dir / "artifact-identity.json"
+    (artifact_dir / "artifact-payload.json").replace(invalid)
+    real_replace = __import__("os").replace
+
+    def fail_quarantine(src, dst):
+        if src == invalid:
+            raise OSError("quarantine blocked")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("agent.stores.os.replace", fail_quarantine)
+
+    warnings = reconcile_artifacts(paths, threads, store)
+
+    assert invalid.exists()
+    assert any(w.code == "ARTIFACT_CHAIN_INVALID" and w.filename.endswith("artifact-identity.json")
+               for w in warnings)
+
+
 def test_latest_runs_by_thread_prefers_max_updated_at_then_id():
     early = make_run(run_id="run-a", status="completed", updated_at="2026-08-15T10:00:00Z")
     late = make_run(run_id="run-b", status="completed", updated_at="2026-08-15T11:00:00Z")

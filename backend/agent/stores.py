@@ -601,5 +601,8 @@ def _quarantine_invalid_chains(directory: Path, thread_id: str, artifact_store,
 
 def _quarantine_artifact(path: Path) -> str:
     quarantined = path.with_name(f"{path.name}.corrupt-{utc_stamp()}")
-    os.replace(path, quarantined)
+    try:
+        os.replace(path, quarantined)
+    except OSError:
+        return path.name
     return quarantined.name
