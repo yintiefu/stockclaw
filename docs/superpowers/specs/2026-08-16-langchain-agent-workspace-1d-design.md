@@ -314,7 +314,7 @@ active execution 按产品 run 累计：
 
 `time.monotonic()` 用于强制 deadline，UTC 时间只用于持久化展示。`RunDocument.active_elapsed_ms` 是已关闭 segment 加当前 segment 的快照。
 
-在每个模型/工具调用边界检查剩余 active 时间，并以剩余 active 时间包裹等待。工具的 `tool_timeout_seconds` 从 schema 预校验成功后开始，覆盖同 run 串行锁等待、executor capacity、执行和结果返回；实际截止始终取 tool deadline 与 active deadline 的较早者。到期后停止等待、禁止任何后续步骤并以对应的 `TOOL_TIMEOUT` 或 `RUN_ACTIVE_TIMEOUT` 失败。对于不能被 Python 强杀的同步调用，遵循第 10 节的迟到结果规则。
+在每个模型/工具调用边界检查剩余 active 时间，并以剩余 active 时间包裹等待。工具的 `tool_timeout_seconds` 从 schema 预校验成功后开始，覆盖同 run execution lock、进程级 legacy built-in serial lock、executor capacity、执行和结果返回；实际截止始终取 tool deadline 与 active deadline 的较早者。到期后停止等待、禁止任何后续步骤并以对应的 `TOOL_TIMEOUT` 或 `RUN_ACTIVE_TIMEOUT` 失败。对于不能被 Python 强杀的同步调用，遵循第 10 节的迟到结果规则。
 
 ## 10. 有界同步工具执行器
 
@@ -428,6 +428,7 @@ Provider 响应包含 usage 时，按模型调用累加 `input_tokens`、`output
 | `RUN_ACTIVE_TIMEOUT` | 产品 run active 总期限到期 |
 | `TOOL_CAPACITY_EXHAUSTED` | 一秒内无法取得同步 worker token |
 | `CONTEXT_LIMIT_EXCEEDED` | 强制上下文本身超限 |
+| `PERSISTENCE_FAILED` | 治理 reservation/telemetry 无法持久化，外部 Provider/handler 不得继续调用 |
 
 错误写入 `RunDocument.error_code/error_message`，message 必须脱敏且面向用户。治理异常到上述 code 的映射与既有 `GRAPH_BUILD_FAILED` 补偿统一进入现有终态持久化路径；不得被硬编码的 `AGENT_RUN_FAILED` 覆盖。最终 `budget.updated` 和 `thread.revision.updated` 先于 AG-UI terminal event。
 
@@ -635,7 +636,7 @@ coordinator lock 可以像现有 journal 路径一样在短提交期间等待 `a
 }
 ```
 
-`arguments_summary` 和 `result_summary` 使用现有递归脱敏，再 canonical JSON 编码并各限制 1,000 字符。它们是执行记录摘要，不是数据真实性认证。
+`arguments_summary` 和 `result_summary` 使用现有递归脱敏，再 canonical JSON 编码并各限制 1,000 字符。请求级脱敏池必须同时包含当前模型 API key 与当前 Capability lease/Registry 中的全部 MCP secret；密钥池本身不得持久化。它们是执行记录摘要，不是数据真实性认证。
 
 ### 16.2 自动收集与去重
 
@@ -711,7 +712,7 @@ download：
 
 REST 使用 snake_case；自定义 AG-UI event name 和 payload 字段使用 camelCase。
 
-`AgentProtocolBridge.convert` 对 Graph 内产生的 CustomEvent 使用显式白名单：`budget.updated`、`artifact.created`、`sources.updated`。每个事件先解析 JSON 并按本节 schema 校验，再作为 AG-UI `CUSTOM` 原样输出；未知名称继续转换为 `UNSUPPORTED_CUSTOM_EVENT`，不能把任意 Graph event 透传到浏览器。`thread.revision.updated` 继续由 router 在权威提交后直接编码，不进入 bridge。
+`AgentProtocolBridge.convert` 对 Graph 内产生的 CustomEvent 使用显式白名单：`budget.updated`、`artifact.created`、`sources.updated`。每个事件先解析 JSON 并按本节 schema 校验，再作为 AG-UI `CUSTOM` 原样输出；已知名称但 payload 非法时转换为 `INVALID_CUSTOM_EVENT` 并令 run fail-closed，未知名称继续转换为 `UNSUPPORTED_CUSTOM_EVENT`，不能把任意 Graph event 透传到浏览器。`thread.revision.updated` 继续由 router 在权威提交后直接编码，不进入 bridge。
 
 前端 `runtime.tsx::scanStream` tee 扫描这三类事件并写入 thread-scoped workspace store。store 按事件种类和 run 保存最高 revision，只接受更大的值；流结束、重连或发现 revision 缺口时，以 run/Artifact REST 覆盖为权威状态。
 
@@ -760,7 +761,7 @@ REST 使用 snake_case；自定义 AG-UI event name 和 payload 字段使用 cam
 }
 ```
 
-只有 run JSON 已持久化后发送；Source 变化同时递增 `RunControl.control_revision`。payload 不重复发送 source 原文，Inspector 只用事件标记失效并通过 REST 读取权威数据。
+只有 run JSON 已持久化后发送；Source 变化同时递增 `RunControl.control_revision`。Source 的短协调锁提交使用 RunControl 的同步 revision 路径，持有 coordinator thread lock 时不得再取得 `reservation_lock`。payload 不重复发送 source 原文，Inspector 只用事件标记失效并通过 REST 读取权威数据。
 
 ### 19.4 终态顺序
 

@@ -23,7 +23,7 @@ Keep these invariants green after every task:
 - Tool argument rejection, MCP guard rejection, pending approval, reject, and steer-away consume no tool reservation. Approved/allowed calls, `create_artifact`, Skill calls, and handlers returning structured business errors do consume one reservation.
 - All legacy built-in dispatch is process-serial across runs, because several handlers can enter an Eastmoney `em_get` path only after fallback; this preserves the repository's IP rate-limit rule without a brittle name classification. The process-wide executor still has four admitted calls for independent work such as Artifact staging, with no unbounded queue; a timed-out running future retains capacity until it actually exits.
 - Reservation persistence precedes every real Provider/handler invocation. `RunDocument.usage.model_calls/tool_calls` comes only from persisted reservations, never AG-UI event inference.
-- Lock order is fixed: local execution lock -> process-wide legacy-built-in serial lock when applicable -> executor capacity -> reservation lock -> short coordinator thread-lock persistence; Artifact mutation lock -> short coordinator thread lock. Code holding the coordinator thread lock must never await the reservation lock, execution/serial lock, capacity, network, or staging work.
+- Lock order is fixed: local execution lock -> process-wide legacy-built-in serial lock when applicable -> executor capacity -> reservation lock -> short coordinator thread-lock persistence; Artifact mutation lock -> short coordinator thread lock. Code holding the coordinator thread lock must never await the reservation lock, execution/serial lock, capacity, network, or staging work; the only permitted await in that short section is the existing `asyncio.to_thread` bridge for local atomic JSON write/fsync.
 - Artifact staging never mutates run/thread state. Only the coordinator commit section may add Sources, publish the final Artifact file, and add the thread reference, in that order.
 - URL provenance is normalization and recording only. It performs no DNS, HTTP, redirect, preview, health, scoring, ranking, or truth verification.
 - Tests set a temporary `VR_DATA_DIR` before importing the production app/router. Playwright uses fake model/MCP/local-tool seams and never touches the user's data or external services.
@@ -116,7 +116,7 @@ At each slice boundary run both gates plus `git diff --check`. Stage only the ex
 
 - [ ] **Step 1: Write failing model and old-document tests**
 
-Add tests that validate exact defaults for a pre-1D run, strict 1D inputs, token status derivation fields, Source unions, and that `budget_snapshot={}` remains distinguishable from a current default Policy.
+Add tests that validate exact defaults for a pre-1D run, strict governance inputs, token status derivation fields, and that `budget_snapshot={}` remains distinguishable from a current default Policy. Source models and Source defaults are introduced in Task 9 so they remain wholly inside slice 2.
 
 ```python
 def test_pre_1d_run_loads_without_inventing_governance_data():
@@ -125,20 +125,11 @@ def test_pre_1d_run_loads_without_inventing_governance_data():
     assert run.control_revision == 0
     assert run.usage.token_status == "unavailable"
     assert run.context_truncation == ContextTruncation(occurred=False)
-    assert run.sources == []
-    assert run.sources_truncated is False
-
-
-def test_source_record_verification_is_fixed_by_kind():
-    tool = ToolExecutionSource.model_validate(tool_source_payload())
-    url = ModelUrlSource.model_validate(url_source_payload())
-    assert tool.verification == "executed_record"
-    assert url.verification == "model_provided_unverified"
 ```
 
 - [ ] **Step 2: Run the focused test and verify it fails**
 
-Run: `cd backend && .venv/bin/pytest tests/agent/test_models.py tests/agent/test_run_persistence.py -q -k 'pre_1d or source_record or token_status or context_truncation'`
+Run: `cd backend && .venv/bin/pytest tests/agent/test_models.py tests/agent/test_run_persistence.py -q -k 'pre_1d or policy_snapshot or token_status or context_truncation'`
 
 Expected: FAIL because the typed fields and defaults do not exist.
 
@@ -178,7 +169,7 @@ class RunUsage(BaseModel):
     token_status: TokenStatus = "unavailable"
 ```
 
-Add discriminated `ToolExecutionSource` and `ModelUrlSource` models with the exact fields, limits, and fixed verification literals from the specification, plus a lightweight `ArtifactMetadata` wire model used by events/list responses. Keep `RunDocument.budget_snapshot` typed as `PolicySnapshot | dict[str, Any]` and add a field validator that accepts a dictionary only when it is exactly `{}`; add `control_revision`, `context_truncation`, `sources`, and `sources_truncated`. Keep the existing `RunSummary` shape unchanged; historical pagination uses the separate `RunListItem` response model introduced in Task 8.
+Keep `RunDocument.budget_snapshot` typed as `PolicySnapshot | dict[str, Any]` and add a field validator that accepts a dictionary only when it is exactly `{}`; add `control_revision` and `context_truncation`. Keep the existing `RunSummary` shape unchanged; historical pagination uses the separate `RunListItem` response model introduced in Task 8. Artifact wire models remain in slice 2.
 
 - [ ] **Step 4: Run focused and full backend tests**
 
@@ -340,7 +331,7 @@ Back it with `ThreadPoolExecutor(max_workers=4)` plus `BoundedSemaphore(4)`. Acq
 
 - [ ] **Step 4: Route built-in handlers through the explicit executor**
 
-Replace the `asyncio.to_thread(lambda: tools.dispatch(tool_name, kwargs))` closure with a call that requires a governance-provided `ToolExecutionContext`/capacity lease. Attach immutable metadata to each tool:
+Replace the current `async with execution_lock: await asyncio.to_thread(legacy_tools.exec_tool, name, kwargs)` path in `_build_one` with a call that requires a governance-provided `ToolExecutionContext`/capacity lease. Move ownership of the execution lock that `build_builtin_tools()` currently creates per registry to the product-run `RunControl`. Attach immutable metadata to each tool:
 
 ```python
 metadata={
@@ -453,13 +444,15 @@ git commit -m "feat(agent): track product run governance"
 **Files:**
 - Modify: `backend/agent/governance.py`
 - Modify: `backend/agent/runtime.py`
+- Modify: `backend/agent/protocol.py`
 - Create: `backend/tests/agent/test_context_governance.py`
 - Modify: `backend/tests/agent/test_model_factory.py`
 - Modify: `backend/tests/agent/test_resume_contract.py`
+- Modify: `backend/tests/agent/test_protocol_bridge.py`
 
 - [ ] **Step 1: Write failing canonical-render and model-wrapper tests**
 
-Cover strings, structured blocks, roles/names/call IDs/separators, stable sorted compact JSON, complete user-turn grouping, assistant/tool-call/result atomicity, newest-first optional retention restored to chronological order, current turn, the latest complete `load_skill` turn for every loaded Skill, forced-content overflow before reservation, no thread JSON mutation, resume rebuilding the same wrapper, Provider error/cancel still counted, and available/partial/unavailable token usage.
+Cover strings, structured blocks, roles/names/call IDs/separators, stable sorted compact JSON, complete user-turn grouping, assistant/tool-call/result atomicity, newest-first optional retention restored to chronological order, current turn, the latest complete `load_skill` turn for every loaded Skill, forced-content overflow before reservation, no thread JSON mutation, resume rebuilding the same wrapper, Provider error/cancel still counted, available/partial/unavailable token usage, and strict `budget.updated` bridge acceptance before any governed stream emits that event.
 
 ```python
 async def test_forced_context_overflow_prevents_provider_and_reservation():
@@ -475,9 +468,9 @@ async def test_forced_context_overflow_prevents_provider_and_reservation():
 
 - [ ] **Step 2: Run focused tests and verify they fail**
 
-Run: `cd backend && .venv/bin/pytest tests/agent/test_context_governance.py tests/agent/test_model_factory.py tests/agent/test_resume_contract.py -q`
+Run: `cd backend && .venv/bin/pytest tests/agent/test_context_governance.py tests/agent/test_model_factory.py tests/agent/test_resume_contract.py tests/agent/test_protocol_bridge.py -q`
 
-Expected: FAIL because `ModelRequest` is not governed.
+Expected: FAIL because `ModelRequest` is not governed and `budget.updated` is not registered.
 
 - [ ] **Step 3: Implement one canonical renderer and complete-turn trimmer**
 
@@ -487,7 +480,9 @@ The same rendered string length drives both admission and telemetry. Structured 
 
 - [ ] **Step 4: Implement `ContextAndModelGovernance.awrap_model_call`**
 
-Perform trim/telemetry persistence first. Check the active deadline, reserve/persist one model call, emit `budget.updated` only after successful persistence, then call `handler(request.override(messages=trimmed))` under the remaining active deadline. In `finally`, record either complete `usage_metadata.input_tokens/output_tokens` from the returned AI message or a missing-usage completion for Provider error/cancel. Persist and emit the updated token view without replacing the original exception. Segment open/close, context telemetry, every reservation, and every token-usage change each emits `budget.updated` only after the matching run replacement succeeds.
+Before adding the emitter, register only `budget.updated` in `protocol.py` and test the bridge fail-closed contract. Its strict `extra="forbid"` payload model uses the exact seven camelCase fields from specification section 19.1: `threadId`, `runId`, `controlRevision`, `budgetSnapshot`, `usage`, `activeElapsedMs`, and `contextTruncation`. Parse string/dict values, re-encode canonical JSON, return the same `CustomEvent` type, map malformed known payloads to `INVALID_CUSTOM_EVENT`, and keep unknown names as `UNSUPPORTED_CUSTOM_EVENT`.
+
+Then perform trim/telemetry persistence first. Check the active deadline, reserve/persist one model call, emit `budget.updated` only after successful persistence, then call `handler(request.override(messages=trimmed))` under the remaining active deadline. In `finally`, record either complete `usage_metadata.input_tokens/output_tokens` from the returned AI message or a missing-usage completion for Provider error/cancel. Persist and emit the updated token view without replacing the original exception. Segment open/close, context telemetry, every reservation, and every token-usage change each emits `budget.updated` only after the matching run replacement succeeds.
 
 - [ ] **Step 5: Rebuild the wrapper on start and resume**
 
@@ -495,14 +490,14 @@ Change `AgentFactory.create/resume` to receive a request-middleware factory that
 
 - [ ] **Step 6: Run focused and full backend tests**
 
-Run: `cd backend && .venv/bin/pytest tests/agent/test_context_governance.py tests/agent/test_model_factory.py tests/agent/test_resume_contract.py -q && .venv/bin/pytest -m "not live"`
+Run: `cd backend && .venv/bin/pytest tests/agent/test_context_governance.py tests/agent/test_model_factory.py tests/agent/test_resume_contract.py tests/agent/test_protocol_bridge.py -q && .venv/bin/pytest -m "not live"`
 
 Expected: PASS; resume uses the same counters/snapshot and a newly constructed wrapper.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add backend/agent/governance.py backend/agent/runtime.py backend/tests/agent/test_context_governance.py backend/tests/agent/test_model_factory.py backend/tests/agent/test_resume_contract.py
+git add backend/agent/governance.py backend/agent/runtime.py backend/agent/protocol.py backend/tests/agent/test_context_governance.py backend/tests/agent/test_model_factory.py backend/tests/agent/test_resume_contract.py backend/tests/agent/test_protocol_bridge.py
 git commit -m "feat(agent): govern model context and usage"
 ```
 
@@ -521,7 +516,7 @@ git commit -m "feat(agent): govern model context and usage"
 
 - [ ] **Step 1: Write failing middleware-order and exact-count tests**
 
-Test schema rejection, MCP argument guard rejection, HITL pending, once reject, and steer-away as zero reservations/zero handler calls; approve once, thread-session allowance, Skill, built-in, `create_artifact`, and structured business error as one reservation. Test execution-lock and capacity timeout before reservation, persistence failure releasing both with zero submit, parallel calls hitting the exact limit, MCP's existing 60-second lifecycle under a shorter Policy deadline, and one run's built-in/Skill/Artifact handlers never overlapping.
+Test schema rejection, MCP argument guard rejection, HITL pending, once reject, and steer-away as zero reservations/zero handler calls; approve once, thread-session allowance, Skill, built-in, `create_artifact`, and structured business error as one reservation. Test execution-lock, process-wide built-in serial-lock, and capacity timeout before reservation, persistence failure releasing all prerequisites with zero submit, parallel calls hitting the exact limit, MCP's existing 60-second lifecycle under a shorter Policy deadline, and one run's built-in/Skill/Artifact handlers never overlapping. In the cross-run serial-lock case, hold the first run in legacy dispatch until the second run's earlier tool/active deadline expires, then assert the second handler was never called and received the correct timeout code.
 
 ```python
 @pytest.mark.parametrize("path", ["schema", "guard", "pending", "reject", "steer"])
@@ -550,7 +545,7 @@ Use tool metadata (`vr_origin`, `vr_execution_lock`, `vr_capacity`) rather than 
 
 - [ ] **Step 4: Implement `ToolExecutionGovernance.awrap_tool_call`**
 
-The wrapper starts the tool deadline immediately after successful schema prevalidation. For local/Skill/Artifact tools acquire the product-run execution lock within `min(tool, active)`; a legacy built-in then acquires the shared process serial lock; capacity tools next acquire a `CapacityLease`. Only after all applicable prerequisites succeed call `RunControl.reserve_tool(persist)`. Install a request-only `ContextVar[ToolExecutionContext]` containing validated thread/product-run identity, the `RunControl`, Artifact service reference, optional capacity lease, and absolute deadlines; invoke the inner handler, then reset the context and release locks in reverse order. The context contains no secret. MCP skips local/serial locks and capacity but uses the same reservation immediately before its real handler.
+The wrapper starts the tool deadline immediately after successful schema prevalidation. For local/Skill/Artifact tools acquire the product-run execution lock within `min(tool, active)`; a legacy built-in then acquires the shared process serial lock under that same earlier deadline; capacity tools next acquire a `CapacityLease`. Every lock/capacity wait, handler execution, and result wait is bounded by `min(tool, active)`. Only after all applicable prerequisites succeed call `RunControl.reserve_tool(persist)`. Install a request-only `ContextVar[ToolExecutionContext]` containing validated thread/product-run identity, the `RunControl`, Artifact service reference, optional capacity lease, and absolute deadlines; invoke the inner handler, then reset the context and release locks in reverse order. The context contains no secret. MCP skips local/serial locks and capacity but uses the same reservation immediately before its real handler.
 
 Map the earlier exhausted deadline to `RUN_ACTIVE_TIMEOUT`; otherwise map it to `TOOL_TIMEOUT`. Capacity's one-second admission failure is `TOOL_CAPACITY_EXHAUSTED`. A running sync future retains its lease through the future callback, not wrapper cleanup.
 
@@ -571,7 +566,7 @@ Have the runtime produce this logical tuple for each request:
 )
 ```
 
-Do not assert correctness from tuple order alone. The integration tests must execute guard/pending/reject/approve/allowance paths because guard is an `awrap_model_call` hook and HITL is `after_model`, not a tool wrapper. Audit any future/custom middleware with `awrap_tool_call` before placing it after governance.
+Do not assert correctness from tuple order alone. Preserve `capabilities.py`'s `McpArgumentGuard` model hook and HITL construction while passing their lease-derived bindings/secrets through this composition point; do not turn either into a tool wrapper. The integration tests must execute guard/pending/reject/approve/allowance paths because guard is an `awrap_model_call` hook and HITL is `after_model`, not a tool wrapper. Audit any future/custom middleware with `awrap_tool_call` before placing it after governance.
 
 - [ ] **Step 6: Run focused and full backend tests**
 
@@ -598,7 +593,7 @@ git commit -m "feat(agent): enforce tool run policy"
 
 - [ ] **Step 1: Write failing lifecycle and hard-limit vertical tests**
 
-Cover the ninth Provider request and seventeenth actual handler blocked at defaults; parallel tool calls at the boundary; reservation JSON failure causing zero Provider/handler/provenance; start/resume count reuse; retry/steer new snapshots; Policy mutation during a run; corrupt Policy during resume; duplicate precedence during corruption; active clock across approval; cancel blocking new reservations; Graph-build compensation; and steer-away Policy/Capability failure leaving the old pending run and submitted entries untouched.
+Cover the ninth Provider request and seventeenth actual handler blocked at defaults; parallel tool calls at the boundary; model reservation JSON failure causing zero Provider calls and no false `budget.updated`; tool reservation JSON failure causing zero handler/provenance; four product runs occupying all synchronous workers, a fifth product run failing with `TOOL_CAPACITY_EXHAUSTED`, and a new run succeeding after release; capacity wait advancing active elapsed; start/resume count reuse; retry/steer new snapshots; Policy mutation during a run; corrupt Policy during resume; duplicate precedence during corruption; active clock across approval; cancel blocking new reservations; Graph-build compensation; and steer-away Policy/Capability failure leaving the old pending run and submitted entries untouched.
 
 ```python
 async def test_steer_admission_failure_preserves_old_pending_run(services):
@@ -631,17 +626,13 @@ Resume performs only its existing duplicate/revision/busy/shape/config checks, r
 
 Delete `RunJournal.model_calls/tool_calls` inference and change `_usage_update` to merge only the latest `RunControl` view. Keep event observation solely for message boundaries, tool summaries, Provider usage handoff, and provenance hooks. Provider error and tool timeout/cancel must therefore display the already persisted reservation.
 
-- [ ] **Step 6: Add the accepted write-amplification benchmark**
-
-Build a maximum legal run fixture with 20 x 6,000-character tool summaries and 200 Sources whose two summaries are 1,000 characters. Assert canonical full-document replacement stays within the specification's conservative approximately 3 MB bound and completes through `RunStore.replace`; do not lower the limit by silently trimming valid data.
-
-- [ ] **Step 7: Run focused and full backend tests**
+- [ ] **Step 6: Run focused and full backend tests**
 
 Run: `cd backend && .venv/bin/pytest tests/agent/test_agent_1d_integration.py tests/agent/test_run_persistence.py tests/agent/test_resume_contract.py tests/agent/test_router.py -q && .venv/bin/pytest -m "not live"`
 
 Expected: PASS; all start/resume/retry/steer/cancel/approval regressions remain green.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add backend/agent/runs.py backend/agent/router.py backend/tests/agent/test_run_persistence.py backend/tests/agent/test_resume_contract.py backend/tests/agent/test_router.py backend/tests/agent/test_agent_1d_integration.py
@@ -652,40 +643,28 @@ git commit -m "feat(agent): govern every run lifecycle"
 
 **Files:**
 - Modify: `backend/agent/stores.py`
-- Modify: `backend/agent/protocol.py`
 - Modify: `backend/agent/router.py`
 - Modify: `backend/tests/agent/test_stores.py`
-- Modify: `backend/tests/agent/test_protocol_bridge.py`
 - Modify: `backend/tests/agent/test_router.py`
 - Modify: `backend/tests/agent/test_agent_1d_integration.py`
 
 - [ ] **Step 1: Write failing run-list, error-code, payload, and order tests**
 
-Cover `(started_at,id)` descending order, 1/100 range and default 50, same-thread `before`, cross-thread rejection, next cursor, corrupt filename-only warnings, light summaries with no messages/Sources/secrets, all governance error codes preserved instead of `AGENT_RUN_FAILED`, `budget.updated` schema validation, unknown CustomEvent failure, and final thread/budget event before terminal.
-
-```python
-def test_bridge_allows_only_valid_budget_event():
-    bridge = AgentProtocolBridge("th-1", "protocol-1")
-    event = custom("budget.updated", valid_budget_event())
-    assert bridge.convert(event) == [event]
-    invalid = custom("budget.updated", {"runId": "run-1"})
-    assert bridge.convert(invalid)[0].code == "INVALID_CUSTOM_EVENT"
-    assert bridge.convert(custom("surprise", {}))[0].code == "UNSUPPORTED_CUSTOM_EVENT"
-```
+Cover `(started_at,id)` descending order, 1/100 range and default 50, same-thread `before`, cross-thread rejection, next cursor, corrupt filename-only warnings, light summaries with no messages/Sources/secrets, all governance error codes preserved instead of `AGENT_RUN_FAILED`, regression of the Task 5 `budget.updated` schema/unknown-event contract, and final thread -> budget -> optional sources -> terminal order.
 
 - [ ] **Step 2: Run focused tests and verify they fail**
 
 Run: `cd backend && .venv/bin/pytest tests/agent/test_stores.py tests/agent/test_protocol_bridge.py tests/agent/test_router.py tests/agent/test_agent_1d_integration.py -q -k 'run_list or pagination or budget or custom_event or terminal_order or governance_error'`
 
-Expected: FAIL because pagination and allowlisted governance events do not exist.
+Expected: FAIL because pagination and lifecycle-level governance error/order mapping do not exist; the focused Task 5 bridge cases remain green.
 
 - [ ] **Step 3: Add paginated historical run reads**
 
 Implement `RunStore.page_for_thread(thread_id, limit, before)` from one scan result so warnings and documents describe the same filesystem observation. Validate `before` belongs to the requested thread, sort by `(started_at,id)` descending, return only exact lightweight `RunListItem` fields, and emit `{runs,next_before,warnings}` from `GET /api/agent/threads/{thread_id}/runs`.
 
-- [ ] **Step 4: Add typed custom-event validators**
+- [ ] **Step 4: Preserve the strict governance-event validator**
 
-In `protocol.py`, map exactly these names to strict Pydantic payload models:
+Keep the Task 5 bridge contract unchanged while wiring lifecycle streams:
 
 ```python
 CUSTOM_EVENT_MODELS = {
@@ -694,11 +673,11 @@ CUSTOM_EVENT_MODELS = {
 }
 ```
 
-Parse string/dict values, validate camelCase aliases, and re-encode canonical JSON before returning the same `CustomEvent` type. Preserve `on_interrupt` suppression and router-owned `thread.revision.updated`. Unknown names remain `UNSUPPORTED_CUSTOM_EVENT`; known invalid payloads become `INVALID_CUSTOM_EVENT` and fail the run.
+Regression-test string/dict parsing, canonical re-encoding, `on_interrupt` suppression, and router-owned `thread.revision.updated`. Do not emit `artifact.created` or `sources.updated` in slice 1; Task 13 adds those two models and producers together.
 
 - [ ] **Step 5: Preserve governance error identity and terminal order**
 
-Map `GovernanceError.code` to `RunDocument.error_code` and the terminal `RUN_ERROR.code`; do not route it through `_error_event()`'s hard-coded code. Every terminal branch persists final run/thread state, emits final thread revision, then final budget event, then `RUN_FINISHED`/`RUN_ERROR`. Stream encoding/disconnect failure never rolls back committed JSON.
+Map `GovernanceError.code` to `RunDocument.error_code` and the terminal `RUN_ERROR.code`; do not route it through `_error_event()`'s hard-coded code. Every terminal branch persists final run/thread state, emits final thread revision, then final budget event, then any committed source event when that producer exists, then `RUN_FINISHED`/`RUN_ERROR`. Stream encoding/disconnect failure never rolls back committed JSON.
 
 - [ ] **Step 6: Run the slice-1 gate**
 
@@ -715,7 +694,7 @@ Expected: all PASS. A run's hard limits, usage, context telemetry, and history a
 - [ ] **Step 7: Commit**
 
 ```bash
-git add backend/agent/stores.py backend/agent/protocol.py backend/agent/router.py backend/tests/agent/test_stores.py backend/tests/agent/test_protocol_bridge.py backend/tests/agent/test_router.py backend/tests/agent/test_agent_1d_integration.py
+git add backend/agent/stores.py backend/agent/router.py backend/tests/agent/test_stores.py backend/tests/agent/test_router.py backend/tests/agent/test_agent_1d_integration.py
 git commit -m "feat(agent): expose governed run state"
 ```
 
@@ -725,14 +704,16 @@ git commit -m "feat(agent): expose governed run state"
 
 **Files:**
 - Modify: `backend/requirements.txt`
+- Modify: `backend/agent/models.py`
 - Create: `backend/agent/provenance.py`
 - Modify: `backend/agent/runs.py`
+- Modify: `backend/tests/agent/test_models.py`
 - Create: `backend/tests/agent/test_provenance.py`
 - Modify: `backend/tests/agent/test_run_persistence.py`
 
 - [ ] **Step 1: Write failing CommonMark, normalization, redaction, and capacity tests**
 
-Create a table-driven golden corpus covering Markdown link/autolink destinations, bare URLs in text nodes, link text, inline/fenced/indented code exclusions, iterative sentence punctuation, balanced and unmatched ASCII/CJK closers, 2,048-character boundary, absolute HTTP/HTTPS only, hostname required, userinfo rejection, lowercased scheme/host, default-port/fragment removal, empty path `/`, unchanged query order/percent encoding, and no network calls. Also cover tool-call ID dedupe, URL-key dedupe, redact-before-1,000-character truncation, automatic fill-to-200 with `sources_truncated=true`, and explicit capacity simulation with zero partial writes.
+Create a table-driven golden corpus covering Markdown link/autolink destinations, bare URLs in text nodes, link text, inline/fenced/indented code exclusions, iterative sentence punctuation, balanced and unmatched ASCII/CJK closers, 2,048-character boundary, absolute HTTP/HTTPS only, hostname required, userinfo rejection, lowercased scheme/host, default-port/fragment removal, empty path `/`, unchanged query order/percent encoding, and no network calls. Add the discriminated Source model tests deferred from Task 1: pre-1D defaults are `sources=[]`/`sources_truncated=false`, and fixed verification literals distinguish executed tool records from model-provided unverified URLs. Also cover tool-call ID dedupe, URL-key dedupe, redact-before-1,000-character truncation with both model and MCP secrets, automatic fill-to-200 with `sources_truncated=true`, and explicit capacity simulation with zero partial writes.
 
 ```python
 @pytest.mark.parametrize(("markdown", "expected"), URL_GOLDEN_CORPUS)
@@ -744,6 +725,13 @@ def test_tool_summaries_are_redacted_before_truncation():
     source = tool_execution_source(args={"token": SECRET + "x" * 2000}, result={})
     assert SECRET not in source.arguments_summary
     assert len(source.arguments_summary) <= 1000
+
+
+def test_source_record_verification_is_fixed_by_kind():
+    tool = ToolExecutionSource.model_validate(tool_source_payload())
+    url = ModelUrlSource.model_validate(url_source_payload())
+    assert tool.verification == "executed_record"
+    assert url.verification == "model_provided_unverified"
 ```
 
 - [ ] **Step 2: Add the direct parser dependency and verify the red test**
@@ -751,45 +739,53 @@ def test_tool_summaries_are_redacted_before_truncation():
 Add `commonmark==0.9.1` to `backend/requirements.txt`, install it in the existing venv, then run:
 
 ```bash
-cd backend && .venv/bin/pip install -r requirements.txt
-.venv/bin/pytest tests/agent/test_provenance.py -q
+cd backend
+PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
+  .venv/bin/pip install -r requirements.txt
+.venv/bin/pytest tests/agent/test_models.py tests/agent/test_provenance.py tests/agent/test_run_persistence.py -q -k 'source or provenance or commonmark'
 ```
 
-Expected: dependency installation succeeds; tests FAIL because the provenance module does not exist.
+On this development host, set `PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple` for the install because `pypi.org` is unreachable. Expected: dependency installation succeeds; tests FAIL because the Source fields/models and provenance module do not exist.
 
 - [ ] **Step 3: Implement structured URL parsing and the CommonMark walker**
 
-Use `commonmark.Parser().parse(text).walker()` to collect link destinations and text nodes. Never scan code nodes or link labels for bare URLs. A small URL-token recognizer may locate candidates only inside eligible text nodes; all acceptance/normalization uses `urllib.parse.urlsplit/urlunsplit`, rejects userinfo, and applies the exact punctuation/paired-closer algorithm before structured validation.
+Add discriminated `ToolExecutionSource` and `ModelUrlSource` models with the exact fields, limits, and fixed verification literals from the specification, then add backward-compatible `RunDocument.sources` and `sources_truncated` defaults. Use `commonmark.Parser().parse(text).walker()` to collect link destinations and text nodes. Never scan code nodes or link labels for bare URLs. A small URL-token recognizer may locate candidates only inside eligible text nodes; all acceptance/normalization uses `urllib.parse.urlsplit/urlunsplit`, rejects userinfo, and applies the exact punctuation/paired-closer algorithm before structured validation.
 
-Expose four focused functions: `normalize_source_url(candidate) -> NormalizedUrl`, `extract_model_urls(markdown) -> list[NormalizedUrl]`, `summarize_tool_source(call, secrets) -> ToolExecutionSource`, and `plan_source_admission(existing, descriptors) -> SourcePlan`.
+Expose four focused functions: `normalize_source_url(candidate) -> NormalizedUrl`, `extract_model_urls(markdown) -> list[NormalizedUrl]`, `summarize_tool_source(call, secrets) -> ToolExecutionSource`, and `plan_source_admission(existing, descriptors) -> SourcePlan`. The request-only `secrets` set must be the union of the current model API key and every MCP secret in the current Capability lease/registry secret sets; redact recursively before truncation, and never persist the set itself.
 
 - [ ] **Step 4: Integrate automatic Sources behind `artifact_mutation_lock`**
 
-After a completed tool result and tool summary are durably written, append one `tool_execution` Source under the product run's `artifact_mutation_lock`, keyed by `tool_call_id`; structured business errors count. After a complete non-pending assistant message is durable, extract URLs in text order and append only missing normalized keys until capacity. Partial/pending messages add none. Each successful Source persistence increments `control_revision`; automatic overflow sets `sources_truncated=true` without reordering existing records.
+After a completed tool result and tool summary are durably written, append one `tool_execution` Source under the product run's `artifact_mutation_lock`, keyed by `tool_call_id`; structured business errors count. After a complete non-pending assistant message is durable, extract URLs in text order and append only missing normalized keys until capacity. Partial/pending messages add none. Each successful Source persistence increments `control_revision`; automatic overflow sets `sources_truncated=true` without reordering existing records. Source commits use the synchronous RunControl/thread-lock revision path inside the short coordinator section and must never acquire `reservation_lock` while holding the coordinator thread lock.
 
-- [ ] **Step 5: Run focused and full backend tests**
+- [ ] **Step 5: Add the accepted write-amplification benchmark**
 
-Run: `cd backend && .venv/bin/pytest tests/agent/test_provenance.py tests/agent/test_run_persistence.py -q && .venv/bin/pytest -m "not live"`
+Build a maximum legal run fixture with 20 x 6,000-character tool summaries and 200 Sources whose two summaries are 1,000 characters. Assert canonical full-document replacement stays within the specification's conservative approximately 3 MB bound and completes through `RunStore.replace`; do not lower the limit by silently trimming valid data.
+
+- [ ] **Step 6: Run focused and full backend tests**
+
+Run: `cd backend && .venv/bin/pytest tests/agent/test_models.py tests/agent/test_provenance.py tests/agent/test_run_persistence.py -q && .venv/bin/pytest -m "not live"`
 
 Expected: PASS; no test opens a socket or records a secret.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add backend/requirements.txt backend/agent/provenance.py backend/agent/runs.py backend/tests/agent/test_provenance.py backend/tests/agent/test_run_persistence.py
+git add backend/requirements.txt backend/agent/models.py backend/agent/provenance.py backend/agent/runs.py backend/tests/agent/test_models.py backend/tests/agent/test_provenance.py backend/tests/agent/test_run_persistence.py
 git commit -m "feat(agent): record run provenance"
 ```
 
 ### Task 10: Add Typed Immutable Artifact Validation And Storage
 
 **Files:**
+- Modify: `backend/agent/models.py`
 - Create: `backend/agent/artifacts.py`
 - Modify: `backend/agent/stores.py`
+- Modify: `backend/tests/agent/test_models.py`
 - Create: `backend/tests/agent/test_artifacts.py`
 
 - [ ] **Step 1: Write failing schema, canonical-size, path, and chain tests**
 
-Cover title trim/1/200; four legal content types; table 1/50 columns, key regex/uniqueness, label 1/100, 5,000 rows, exact keys, explicit null, scalar-only and finite numbers; JSON root depth 1/max 32, 50,000-node accounting, finite values; sources 200, unique IDs, subset of public `source_ids`, note 2,000; canonical UTF-8 bytes including newline at 1,048,576/1,048,577; service UUID/path traversal/symlink rejection; parent same thread/type, leaf-only extension, cycle/fork detection; and immutable no-update behavior.
+Cover the lightweight `ArtifactMetadata` wire model deferred from Task 1; title trim/1/200; four legal content types; table 1/50 columns, key regex/uniqueness, label 1/100, 5,000 rows, exact keys, explicit null, scalar-only and finite numbers; JSON root depth 1/max 32, 50,000-node accounting, finite values; sources 200, unique IDs, subset of public `source_ids`, note 2,000; canonical UTF-8 bytes including newline at 1,048,576/1,048,577; service UUID/path traversal/symlink rejection; parent same thread/type, leaf-only extension, cycle/fork detection; and immutable no-update behavior.
 
 ```python
 def test_canonical_size_counts_exact_staged_bytes(tmp_path):
@@ -804,13 +800,13 @@ def test_canonical_size_counts_exact_staged_bytes(tmp_path):
 
 - [ ] **Step 2: Run focused tests and verify they fail**
 
-Run: `cd backend && .venv/bin/pytest tests/agent/test_artifacts.py -q -k 'schema or size or path or parent or chain'`
+Run: `cd backend && .venv/bin/pytest tests/agent/test_models.py tests/agent/test_artifacts.py -q -k 'artifact or schema or size or path or parent or chain'`
 
-Expected: FAIL because Artifact validation/storage do not exist.
+Expected: FAIL because the Artifact wire model and validation/storage do not exist.
 
 - [ ] **Step 3: Implement strict typed content and canonical encoding**
 
-Use discriminated Pydantic models for `markdown`, `table`, `json`, and `sources`, with explicit validators for finite numbers, row shape, node/depth counts, and source relations. `encode_artifact()` must be exactly:
+Add the lightweight `ArtifactMetadata` model for events/list responses. Use discriminated Pydantic models for `markdown`, `table`, `json`, and `sources`, with explicit validators for finite numbers, row shape, node/depth counts, and source relations. `encode_artifact()` must be exactly:
 
 ```python
 payload = artifact.model_dump(mode="json")
@@ -828,14 +824,14 @@ Add `AgentPaths.artifacts`. Validate IDs before constructing `<root>/artifacts/<
 
 - [ ] **Step 5: Run focused and full backend tests**
 
-Run: `cd backend && .venv/bin/pytest tests/agent/test_artifacts.py -q && .venv/bin/pytest -m "not live"`
+Run: `cd backend && .venv/bin/pytest tests/agent/test_models.py tests/agent/test_artifacts.py -q && .venv/bin/pytest -m "not live"`
 
 Expected: PASS; no Artifact is yet exposed to a Graph or REST create endpoint.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add backend/agent/artifacts.py backend/agent/stores.py backend/tests/agent/test_artifacts.py
+git add backend/agent/models.py backend/agent/artifacts.py backend/agent/stores.py backend/tests/agent/test_models.py backend/tests/agent/test_artifacts.py
 git commit -m "feat(agent): store typed immutable artifacts"
 ```
 
@@ -905,7 +901,7 @@ Before any write, reacquire the coordinator thread lock and revalidate active co
 
 - [ ] **Step 6: Register the tool for every run without weakening leases**
 
-Register one generic `create_artifact` StructuredTool in the production tool provider before Graph creation. The tool schema contains no thread/run IDs; at execution it obtains the already-validated thread ID, product run ID, `RunControl`, `ArtifactService`, capacity lease, and deadlines from the `ToolExecutionContext` installed by governance. Omit this tool when low-level tests construct a registry without an Artifact service. Count it through governance and keep MCP guard/HITL scope unchanged. No REST POST route is added.
+Register one generic `create_artifact` StructuredTool in the production tool provider before Graph creation. Wire `ArtifactService` through `router.py`'s `AgentServices` production composition so the registry receives the same service used by REST/recovery. The tool schema contains no thread/run IDs; at execution it obtains the already-validated thread ID, product run ID, `RunControl`, `ArtifactService`, capacity lease, and deadlines from the `ToolExecutionContext` installed by governance. Omit this tool when low-level tests construct a registry without an Artifact service. Count it through governance and keep MCP guard/HITL scope unchanged. No REST POST route is added.
 
 - [ ] **Step 7: Run focused and full backend tests**
 
@@ -973,7 +969,7 @@ Under the coordinator thread lock, verify revision/not busy, then rename the thr
 
 - [ ] **Step 5: Extend startup reconciliation after interrupted-run recovery**
 
-Recursively scan only controlled Artifact roots without following symlinks. Delete only strict `<artifact-id>.<nonce>.artifact.tmp` staging files whose incomplete provenance is provable. Keep ordinary orphan JSON for diagnosis, quarantine identity/chain corruption, retain missing references with warnings, and recover/clean delete tombstones based on whether the thread commit point exists. Extend `RecoveryWarning.document_type` with `artifact` and do not rewrite healthy legacy JSON.
+Recursively scan only controlled Artifact roots without following symlinks. Delete only strict `<artifact-id>.<nonce>.artifact.tmp` staging files whose incomplete provenance is provable. Keep ordinary orphan JSON for diagnosis, quarantine identity/chain corruption, retain missing references with warnings, and recover/clean delete tombstones based on whether the thread commit point exists. Explicitly restart the service around a healthy historical Artifact fixture and assert the Artifact bytes, thread reference, and accessibility remain unchanged. Extend `RecoveryWarning.document_type` with `artifact` and do not rewrite healthy legacy JSON.
 
 - [ ] **Step 6: Run focused and full backend tests**
 
@@ -1111,13 +1107,14 @@ git commit -m "feat(agent): converge workspace event state"
 - Modify: `frontend/src/components/agent/AgentThread.tsx`
 - Modify: `frontend/src/components/agent/AgentThread.test.tsx`
 - Modify: `frontend/src/components/layout/Layout.tsx`
+- Create: `frontend/src/components/layout/Layout.test.tsx`
 - Modify: `frontend/src/pages/Agent.tsx`
 - Modify: `frontend/src/pages/Agent.test.tsx`
 - Modify: `frontend/src/index.css`
 
 - [ ] **Step 1: Write failing workspace/thread/chat interaction tests**
 
-Cover fixed desktop columns, independent scroll regions, no outer body/main scroll chain, local title search, status/warning rows, stable selected highlight, title tooltip, icon create/rename/delete with accessible names, revision conflict reload, compact header labels, settings/inspector commands, model gating without runtime mount, running Stop-only Composer, awaiting steer Composer, stable error area, and successful `create_artifact` result opening Inspector.
+Cover fixed desktop columns, independent scroll regions, no outer body/main scroll chain, local title search, status/warning rows, stable selected highlight, title tooltip, icon create/rename/delete with accessible names, revision conflict reload, compact header labels, settings/inspector commands, model gating without runtime mount, running Stop-only Composer, awaiting steer Composer, stable error area, and successful `create_artifact` result opening Inspector. At 1280px, assert the forced navigation rail does not write a new value to the persisted `vr-sidebar` preference and that the saved preference is restored after leaving `/agent` or widening the viewport.
 
 ```tsx
 it("opens the artifact tab from a successful tool result", async () => {
@@ -1130,13 +1127,13 @@ it("opens the artifact tab from a successful tool result", async () => {
 
 - [ ] **Step 2: Run focused tests and verify they fail**
 
-Run: `cd frontend && npx vitest run src/components/agent/AgentWorkspace.test.tsx src/components/agent/AgentThreadList.test.tsx src/components/agent/AgentThread.test.tsx src/pages/Agent.test.tsx`
+Run: `cd frontend && npx vitest run src/components/agent/AgentWorkspace.test.tsx src/components/agent/AgentThreadList.test.tsx src/components/agent/AgentThread.test.tsx src/components/layout/Layout.test.tsx src/pages/Agent.test.tsx`
 
 Expected: FAIL because the current page is one max-width card with an inline model form.
 
 - [ ] **Step 3: Add the full-height workspace shell**
 
-On `/agent`, make `Layout` render the outlet in a `min-w-0 flex-1 overflow-hidden` main area without the normal `max-w-6xl px-6 py-6` wrapper. `AgentWorkspace` uses `h-full min-h-0` and desktop grid tracks `240px minmax(480px,1fr) 320px`; columns are unframed full-height regions separated by borders and each owns its scroll. At the exact 1280px desktop threshold, force the existing global navigation into its 56px collapsed rail so the 1040px minimum workspace plus margins cannot overflow; preserve the user's saved expanded/collapsed preference and restore it outside that constrained Agent viewport. At 1440px, allow the saved navigation state when it fits. Keep the existing global navigation and color tokens; do not nest glass cards, use viewport-scaled font sizes, or introduce non-zero letter spacing in the new workspace.
+On `/agent`, make `Layout` render the outlet in a `min-w-0 flex-1 overflow-hidden` main area without the normal `max-w-6xl px-6 py-6` wrapper, and remove `Agent.tsx`'s own `mx-auto max-w-6xl space-y-4 p-4` wrapper so there is no second width/padding constraint. `AgentWorkspace` uses `h-full min-h-0` and desktop grid tracks `240px minmax(480px,1fr) 320px`; columns are unframed full-height regions separated by borders and each owns its scroll. At the exact 1280px desktop threshold, derive an effective forced-collapsed state for the existing global navigation's 56px rail so the 1040px minimum workspace plus margins cannot overflow; do not feed that effective state into the `vr-sidebar` persistence effect. Preserve the user's saved expanded/collapsed preference and restore it outside that constrained Agent viewport. At 1440px, allow the saved navigation state when it fits. Keep the existing global navigation and color tokens; do not nest glass cards, use viewport-scaled font sizes, or introduce non-zero letter spacing in the new workspace.
 
 - [ ] **Step 4: Convert `AgentThreadList` into the left column**
 
@@ -1148,14 +1145,14 @@ Move the model form out of `Agent.tsx`. The header shows thread title, model lab
 
 - [ ] **Step 6: Run focused and full frontend tests**
 
-Run: `cd frontend && npx vitest run src/components/agent/AgentWorkspace.test.tsx src/components/agent/AgentThreadList.test.tsx src/components/agent/AgentThread.test.tsx src/pages/Agent.test.tsx && npm test && npm run test:unit && npm run build`
+Run: `cd frontend && npx vitest run src/components/agent/AgentWorkspace.test.tsx src/components/agent/AgentThreadList.test.tsx src/components/agent/AgentThread.test.tsx src/components/layout/Layout.test.tsx src/pages/Agent.test.tsx && npm test && npm run test:unit && npm run build`
 
 Expected: PASS; no non-Agent page layout changes visually or behaviorally.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add frontend/src/components/agent/AgentWorkspace.tsx frontend/src/components/agent/AgentWorkspace.test.tsx frontend/src/components/agent/AgentThreadList.tsx frontend/src/components/agent/AgentThreadList.test.tsx frontend/src/components/agent/AgentThread.tsx frontend/src/components/agent/AgentThread.test.tsx frontend/src/components/layout/Layout.tsx frontend/src/pages/Agent.tsx frontend/src/pages/Agent.test.tsx frontend/src/index.css
+git add frontend/src/components/agent/AgentWorkspace.tsx frontend/src/components/agent/AgentWorkspace.test.tsx frontend/src/components/agent/AgentThreadList.tsx frontend/src/components/agent/AgentThreadList.test.tsx frontend/src/components/agent/AgentThread.tsx frontend/src/components/agent/AgentThread.test.tsx frontend/src/components/layout/Layout.tsx frontend/src/components/layout/Layout.test.tsx frontend/src/pages/Agent.tsx frontend/src/pages/Agent.test.tsx frontend/src/index.css
 git commit -m "feat(agent): build final workspace shell"
 ```
 
@@ -1368,7 +1365,7 @@ Install a fixed `@playwright/test` version as a dev dependency and commit the lo
 }
 ```
 
-`playwright.config.ts` owns fixed isolated backend/frontend ports, `baseURL`, both `webServer` commands, `reuseExistingServer:false`, trace/screenshot-on-failure, and teardown. The backend command creates/uses a temporary Agent root and local fake services; it never points at port 8900's normal app. Document `PLAYWRIGHT_DOWNLOAD_HOST` without embedding a mirror URL that may become stale.
+`playwright.config.ts` owns fixed isolated backend/frontend ports, `baseURL`, both `webServer` commands, `reuseExistingServer:false`, trace/screenshot-on-failure, and teardown. The backend command creates/uses a temporary Agent root and local fake services; it never points at port 8900's normal app. Reuse the existing `router_module.services` replacement seam demonstrated by backend router tests, so production `router.py` does not need a test-only branch. Document `PLAYWRIGHT_DOWNLOAD_HOST` without embedding a mirror URL that may become stale; on this development host a reachable mirror is required for the first Chromium install.
 
 - [ ] **Step 3: Implement the complete interaction matrix**
 
@@ -1433,7 +1430,8 @@ Run:
 VR_1D_VERIFY=$(mktemp -d)
 python3 -m venv "$VR_1D_VERIFY/venv"
 cd backend
-"$VR_1D_VERIFY/venv/bin/pip" install -r requirements.txt
+PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
+  "$VR_1D_VERIFY/venv/bin/pip" install -r requirements.txt
 "$VR_1D_VERIFY/venv/bin/pip" check
 "$VR_1D_VERIFY/venv/bin/python" -c 'from importlib.metadata import version; print(version("commonmark"))'
 ```
