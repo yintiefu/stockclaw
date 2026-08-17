@@ -70,3 +70,61 @@ def build_builtin_tools() -> list[StructuredTool]:
 def compose_run_tools(skill_tools: Sequence[BaseTool] = ()) -> list[BaseTool]:
     """1C 组合点：内置工具 + Skill 快照工具（切片 3 起再追加 MCP 绑定包装）。"""
     return [*build_builtin_tools(), *skill_tools]
+
+
+CREATE_ARTIFACT_METADATA = {
+    "vr_origin": "artifact",
+    "vr_execution_lock": True,
+    "vr_capacity": True,
+}
+
+
+def create_artifact_tool() -> StructuredTool:
+    """唯一 Artifact 创建入口（REST 不提供 POST）；真实服务经治理上下文注入。"""
+
+    async def invoke(**kwargs: Any) -> str:
+        context = current_tool_execution_context()
+        if context is None or context.artifact_service is None:
+            raise RuntimeError("create_artifact 只能在治理执行上下文中调用")
+        result = await context.artifact_service.create_artifact(
+            thread_id=context.thread_id,
+            run_id=context.product_run_id,
+            control=context.control,
+            executor=context.executor,
+            lease=context.capacity_lease,
+            deadline=context.tool_deadline,
+            args=kwargs,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    return StructuredTool.from_function(
+        coroutine=invoke,
+        name="create_artifact",
+        description="创建不可变的 Markdown/表格/JSON/来源清单 Artifact（客观资料整理，"
+                    "不含投资建议）；sources 描述符引用本次运行已完成的工具调用或 URL",
+        args_schema={
+            "type": "object",
+            "properties": {
+                "type": {"type": "string", "enum": ["markdown", "table", "json", "sources"]},
+                "title": {"type": "string", "minLength": 1, "maxLength": 200},
+                "content": {"type": "object"},
+                "parent_artifact_id": {"type": "string"},
+                "sources": {
+                    "type": "array", "maxItems": 200,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["tool_call", "url"]},
+                            "tool_call_id": {"type": "string"},
+                            "url": {"type": "string", "maxLength": 2048},
+                            "label": {"type": "string", "maxLength": 200},
+                        },
+                        "required": ["kind"],
+                    },
+                },
+            },
+            "required": ["type", "title", "content"],
+            "additionalProperties": False,
+        },
+        metadata=dict(CREATE_ARTIFACT_METADATA),
+    )

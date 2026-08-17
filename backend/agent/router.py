@@ -70,9 +70,10 @@ from agent.mcp import (
     McpServerNotFound,
     StdioTrustRequired,
 )
+from agent.artifacts import ArtifactService, ArtifactStore
 from agent.skills import SkillError, SkillImporter, SkillRegistry, SkillResourceForbidden, SkillUnavailable
 from agent.tool_executor import BoundedToolExecutor
-from agent.tool_registry import build_builtin_tools
+from agent.tool_registry import build_builtin_tools, create_artifact_tool
 
 router = APIRouter(prefix="/api/agent")
 
@@ -89,6 +90,7 @@ class AgentServices:
     policy: PolicyStore
     executor: BoundedToolExecutor
     builtin_serial_lock: asyncio.Lock
+    artifacts_service: "ArtifactService"
 
 
 def build_services(root: Path | None = None) -> AgentServices:
@@ -103,10 +105,20 @@ def build_services(root: Path | None = None) -> AgentServices:
     policy = PolicyStore(paths.policy)
     executor = BoundedToolExecutor()
     builtin_serial_lock = asyncio.Lock()
+    artifact_store = ArtifactStore(paths.root)
+    artifacts_service = ArtifactService(
+        store=artifact_store, threads=threads, runs=runs,
+        thread_lock=lambda thread_id: _artifact_lock_target.thread_lock(thread_id))
+
+    class _CoordinatorRef:
+        pass
+
+    _artifact_lock_target = _CoordinatorRef()
 
     def _run_tools(skill_tools=()):
-        # 测试接缝：1A/1B 通过 monkeypatch agent.router.build_builtin_tools 注入
-        return [*build_builtin_tools(), *skill_tools]
+        # 测试接缝：1A/1B 通过 monkeypatch agent.router.build_builtin_tools 注入；
+        # create_artifact 只在生产组合中注册（REST 不提供 POST）
+        return [*build_builtin_tools(), *skill_tools, create_artifact_tool()]
 
     coordinator = RunCoordinator(
         factory=coordinator._factory, threads=threads, runs=runs,
@@ -117,9 +129,11 @@ def build_services(root: Path | None = None) -> AgentServices:
         executor=executor,
         builtin_serial_lock=builtin_serial_lock,
         policy=policy,
+        artifact_service=artifacts_service,
     )
+    _artifact_lock_target.thread_lock = coordinator.thread_lock
     return AgentServices(paths, threads, runs, coordinator, skills, importer, registry,
-                         policy, executor, builtin_serial_lock)
+                         policy, executor, builtin_serial_lock, artifacts_service)
 
 
 services = build_services()

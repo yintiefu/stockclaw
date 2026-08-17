@@ -777,6 +777,7 @@ class ToolExecutionGovernance(_AgentMiddleware):
         thread_id: str = "",
         run_id: str = "",
         clock: Callable[[], float] | None = None,
+        artifact_service: Any = None,
     ):
         super().__init__()
         self._control = control
@@ -786,6 +787,7 @@ class ToolExecutionGovernance(_AgentMiddleware):
         self._builtin_serial_lock = builtin_serial_lock
         self._thread_id = thread_id
         self._run_id = run_id
+        self._artifact_service = artifact_service
         # 截止时钟可注入（测试用 FakeClock 快进）；生产为 time.monotonic
         self._clock = clock or _time_module.monotonic
 
@@ -898,6 +900,7 @@ class ToolExecutionGovernance(_AgentMiddleware):
                 tool_deadline=tool_deadline,
                 capacity_lease=lease,
                 control=self._control,
+                artifact_service=self._artifact_service,
             )
             token = install_tool_execution_context(context)
             try:

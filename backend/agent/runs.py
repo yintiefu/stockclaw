@@ -477,6 +477,7 @@ class RunCoordinator:
         executor: "BoundedToolExecutor | None" = None,
         builtin_serial_lock: asyncio.Lock | None = None,
         policy: "PolicyStore | None" = None,
+        artifact_service: "Any | None" = None,
     ):
         self._factory = factory or AgentFactory()
         self._locks: dict[str, asyncio.Lock] = {}
@@ -495,6 +496,8 @@ class RunCoordinator:
         self._builtin_serial_lock = builtin_serial_lock
         # 1D：Policy store（新产品 run 准入时读取快照；损坏时 fail-closed）
         self._policy = policy
+        # 1D：Artifact 服务（经治理上下文注入 create_artifact 工具）
+        self._artifact_service = artifact_service
 
     def _lock(self, thread_id: str) -> asyncio.Lock:
         if thread_id not in self._locks:
@@ -535,7 +538,8 @@ class RunCoordinator:
                 ToolExecutionGovernance(
                     control, persist=persist, executor=self._executor,
                     builtin_serial_lock=self._builtin_serial_lock,
-                    thread_id=thread_id, run_id=run_id),
+                    thread_id=thread_id, run_id=run_id,
+                    artifact_service=self._artifact_service),
             )
 
         return factory
