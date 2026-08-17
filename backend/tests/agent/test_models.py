@@ -3,12 +3,47 @@ import pytest
 
 from agent.models import (
     AgentMessage,
+    ContextTruncation,
     ModelRef,
+    PolicySnapshot,
     RunDocument,
     RunSecrets,
+    RunUsage,
     RuntimeForwardedProps,
     ThreadDocument,
 )
+
+NOW = "2026-08-15T12:00:00Z"
+
+
+def legacy_run_payload() -> dict:
+    """1C 时代落盘的 run 文档：除空 budget_snapshot 外没有任何 1D 治理字段。"""
+    return {
+        "schema_version": 1,
+        "id": "run-legacy",
+        "thread_id": "thread-1",
+        "protocol_run_ids": ["protocol-1"],
+        "trigger_message_id": "user-1",
+        "retry_of": None,
+        "status": "completed",
+        "started_at": NOW,
+        "updated_at": NOW,
+        "ended_at": NOW,
+        "elapsed_ms": 10,
+        "active_elapsed_ms": 10,
+        "approval_wait_ms": 0,
+        "budget_snapshot": {},
+        "model_ref": {
+            "provider": "fixture",
+            "baseURL": "https://example.com/v1",
+            "model": "fixture-model",
+        },
+        "history_head_id": "user-1",
+        "usage": {"model_calls": 1, "tool_calls": 0},
+        "tool_summaries": [],
+        "error_code": None,
+        "error_message": None,
+    }
 
 
 def test_model_ref_uses_frontend_field_names_and_contains_no_secret():
@@ -112,3 +147,118 @@ def test_run_document_never_serializes_model_key():
     assert run.protocol_run_ids == ["protocol-1"]
     assert "api_key" not in encoded.lower()
     assert "secret" not in encoded.lower()
+
+
+def test_pre_1d_run_loads_without_inventing_governance_data():
+    run = RunDocument.model_validate(legacy_run_payload())
+    assert run.budget_snapshot == {}
+    assert run.control_revision == 0
+    assert run.usage.token_status == "unavailable"
+    assert run.context_truncation == ContextTruncation(occurred=False)
+
+
+def test_pre_1d_run_without_optional_governance_fields_uses_defaults():
+    payload = legacy_run_payload()
+    del payload["budget_snapshot"]
+    del payload["usage"]
+    run = RunDocument.model_validate(payload)
+    assert run.budget_snapshot == {}
+    assert run.usage == RunUsage()
+    assert run.usage.token_status == "unavailable"
+    assert run.control_revision == 0
+    assert run.context_truncation.occurred is False
+
+
+def test_policy_snapshot_enforces_inclusive_ranges_and_strict_fields():
+    valid = {
+        "policy_revision": 3,
+        "max_model_calls": 8,
+        "max_tool_calls": 16,
+        "tool_timeout_seconds": 30,
+        "max_active_seconds": 300,
+        "max_context_chars": 120_000,
+    }
+    snapshot = PolicySnapshot.model_validate(valid)
+    assert snapshot.policy_revision == 3 and snapshot.max_model_calls == 8
+    for key, bad in [
+        ("max_model_calls", 0), ("max_model_calls", 33),
+        ("max_tool_calls", 0), ("max_tool_calls", 65),
+        ("tool_timeout_seconds", 4), ("tool_timeout_seconds", 121),
+        ("max_active_seconds", 29), ("max_active_seconds", 1801),
+        ("max_context_chars", 15_999), ("max_context_chars", 500_001),
+        ("policy_revision", -1),
+    ]:
+        with pytest.raises(ValidationError):
+            PolicySnapshot.model_validate({**valid, key: bad})
+    with pytest.raises(ValidationError):
+        PolicySnapshot.model_validate({**valid, "surprise": True})
+
+
+def test_budget_snapshot_accepts_empty_dict_or_typed_snapshot_only():
+    payload = legacy_run_payload()
+    payload["budget_snapshot"] = {"max_model_calls": 8}
+    with pytest.raises(ValidationError):
+        RunDocument.model_validate(payload)
+
+    typed = legacy_run_payload()
+    typed["budget_snapshot"] = {
+        "policy_revision": 1,
+        "max_model_calls": 8,
+        "max_tool_calls": 16,
+        "tool_timeout_seconds": 30,
+        "max_active_seconds": 300,
+        "max_context_chars": 120_000,
+    }
+    run = RunDocument.model_validate(typed)
+    assert isinstance(run.budget_snapshot, PolicySnapshot)
+    assert run.budget_snapshot.policy_revision == 1
+    # 空 dict 与默认 Policy 快照保持可区分：类型不同即区分依据
+    assert RunDocument.model_validate(legacy_run_payload()).budget_snapshot == {}
+
+
+def test_usage_token_status_is_derivation_field_with_bounds():
+    usage = RunUsage()
+    assert usage.total_tokens is None
+    assert usage.token_status == "unavailable"
+    assert RunUsage.model_validate({
+        "model_calls": 2, "tool_calls": 1,
+        "input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+        "token_status": "partial",
+    }).token_status == "partial"
+    with pytest.raises(ValidationError):
+        RunUsage.model_validate({"model_calls": -1})
+    with pytest.raises(ValidationError):
+        RunUsage.model_validate({"token_status": "bogus"})
+    with pytest.raises(ValidationError):
+        RunUsage.model_validate({"total_tokens": -1})
+
+
+def test_context_truncation_defaults_and_non_negative_bounds():
+    default = ContextTruncation()
+    assert default.occurred is False
+    assert (default.original_chars, default.retained_chars, default.removed_turns) == (None, None, None)
+    trimmed = ContextTruncation(occurred=True, original_chars=100, retained_chars=60, removed_turns=2)
+    assert trimmed.retained_chars == 60
+    with pytest.raises(ValidationError):
+        ContextTruncation(occurred=True, original_chars=-1)
+    with pytest.raises(ValidationError):
+        ContextTruncation(occurred=True, removed_turns=-2)
+    with pytest.raises(ValidationError):
+        ContextTruncation(surprise=True)
+
+
+def test_new_run_document_round_trips_governance_defaults():
+    run = RunDocument.start(
+        run_id="run-1",
+        thread_id="thread-1",
+        protocol_run_id="protocol-1",
+        model_ref=ModelRef(provider="openai", baseURL="https://api.openai.com/v1", model="gpt-5-mini"),
+        trigger_message_id="user-1",
+        history_head_id="user-1",
+        now=NOW,
+    )
+    assert run.control_revision == 0
+    assert run.context_truncation == ContextTruncation(occurred=False)
+    assert run.usage.token_status == "unavailable"
+    reloaded = RunDocument.model_validate_json(run.model_dump_json())
+    assert reloaded == run

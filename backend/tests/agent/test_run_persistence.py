@@ -997,4 +997,47 @@ async def test_approval_wait_accounted_and_active_excludes_it(tmp_path):
     assert run.approval_wait_ms >= 40  # 审批等待已被结算
     assert run.active_elapsed_ms <= run.elapsed_ms  # active 扣除了审批等待
     # 直接驱动协调器（无流式事件）时 usage 计数为 0 也必须持久化，字段不缺失
-    assert set(run.usage.model_dump()) == {"model_calls", "tool_calls", "input_tokens", "output_tokens"}
+    assert set(run.usage.model_dump()) == {
+        "model_calls", "tool_calls", "input_tokens", "output_tokens",
+        "total_tokens", "token_status",
+    }
+
+
+def _pre_1d_run_payload() -> dict:
+    """构造 1C 时代的落盘 run JSON：没有任何 1D 治理字段。"""
+    payload = RunDocument.start(
+        run_id="run-legacy",
+        thread_id="thread-1",
+        protocol_run_id="protocol-legacy",
+        model_ref=MODEL_REF,
+        trigger_message_id="user-1",
+        history_head_id="user-1",
+        now=NOW,
+    ).model_copy(update={"status": "completed", "ended_at": NOW}).model_dump(mode="json")
+    payload.pop("control_revision", None)
+    payload.pop("context_truncation", None)
+    usage = payload.get("usage") or {}
+    usage.pop("total_tokens", None)
+    usage.pop("token_status", None)
+    return payload
+
+
+def test_pre_1d_run_file_loads_with_defaults_and_no_migration_write(tmp_path):
+    """1D 模型必须向后兼容：读取旧 run 文件不发明治理数据、也不触发迁移写。"""
+    from agent.models import ContextTruncation
+
+    paths = AgentPaths(tmp_path / "agent")
+    runs = RunStore(paths)
+    path = paths.runs / "run-legacy.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_pre_1d_run_payload(), ensure_ascii=False), encoding="utf-8")
+    original_bytes = path.read_bytes()
+
+    loaded = runs.get("run-legacy")
+
+    assert loaded.budget_snapshot == {}
+    assert loaded.control_revision == 0
+    assert loaded.usage.token_status == "unavailable"
+    assert loaded.usage.total_tokens is None
+    assert loaded.context_truncation == ContextTruncation(occurred=False)
+    assert path.read_bytes() == original_bytes  # 读取路径绝不回写
