@@ -64,6 +64,10 @@ class AgentPaths:
     def policy(self) -> Path:
         return self.root / "policy.json"
 
+    @property
+    def artifacts_dir(self) -> Path:
+        return self.root / "artifacts"
+
 
 class StoreError(RuntimeError):
     code = "AGENT_STORE_ERROR"

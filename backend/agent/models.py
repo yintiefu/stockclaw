@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, SecretStr, field_validator
+import math
+
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 
 class ModelRef(BaseModel):
@@ -40,6 +42,176 @@ class RuntimeForwardedProps(BaseModel):
     thread_revision: int = Field(ge=0, validation_alias="threadRevision")
     retry_of: str | None = Field(default=None, validation_alias="retryOf")
 
+
+# ---- 1D Artifact 线模型（spec §14） ----
+
+
+class MarkdownContent(BaseModel):
+    """纯 Markdown 字符串；渲染层禁用 raw HTML。"""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    markdown: str
+
+
+class TableColumn(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    key: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+    label: str = Field(min_length=1, max_length=100)
+
+
+class TableContent(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    columns: list[TableColumn] = Field(min_length=1, max_length=50)
+    rows: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
+
+    @model_validator(mode="after")
+    def validate_rows(self):
+        expected = [column.key for column in self.columns]
+        if len({column.key for column in self.columns}) != len(expected):
+            raise ValueError("table column key 必须唯一")
+        for row in self.rows:
+            if set(row) != set(expected):
+                raise ValueError("table row 必须恰好包含全部已声明 key（空单元格用 null）")
+            for value in row.values():
+                if not _is_json_scalar(value):
+                    raise ValueError("table cell 只能是 string/number/boolean/null")
+        return self
+
+
+def _is_json_scalar(value: Any) -> bool:
+    if value is None or isinstance(value, (str, bool)):
+        return True
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return False
+
+
+def _json_node_stats(value: Any, depth: int) -> tuple[int, int]:
+    """返回 (节点总数, 最大深度)；根节点深度为 1。"""
+    count = 1
+    max_depth = depth
+    if isinstance(value, dict):
+        for item in value.values():
+            child_count, child_depth = _json_node_stats(item, depth + 1)
+            count += child_count
+            max_depth = max(max_depth, child_depth)
+    elif isinstance(value, list):
+        for item in value:
+            child_count, child_depth = _json_node_stats(item, depth + 1)
+            count += child_count
+            max_depth = max(max_depth, child_depth)
+    else:
+        if not _is_json_scalar(value):
+            raise ValueError("JSON 内容包含非 JSON 类型")
+    return count, max_depth
+
+
+class JsonContent(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    value: Any
+
+    @model_validator(mode="after")
+    def validate_value(self):
+        count, depth = _json_node_stats(self.value, 1)
+        if depth > 32:
+            raise ValueError("JSON 内容最大嵌套深度为 32")
+        if count > 50_000:
+            raise ValueError("JSON 内容最多 50,000 个节点")
+        return self
+
+
+class SourcesContentItem(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_id: str = Field(min_length=1)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class SourcesContent(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    items: list[SourcesContentItem] = Field(default_factory=list, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_unique(self):
+        if len({item.source_id for item in self.items}) != len(self.items):
+            raise ValueError("sources content 的 source_id 必须唯一")
+        return self
+
+
+ArtifactContent = MarkdownContent | TableContent | JsonContent | SourcesContent
+
+
+class ArtifactDocument(BaseModel):
+    """不可变 Artifact：创建后不可修改，版本链经 parent_artifact_id 线性延伸。"""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    id: str = Field(min_length=1, max_length=128)
+    thread_id: str = Field(min_length=1, max_length=128)
+    run_id: str = Field(min_length=1, max_length=128)
+    type: Literal["markdown", "table", "json", "sources"]
+    title: str = Field(min_length=1, max_length=200)
+    created_at: str = Field(min_length=1)
+    parent_artifact_id: str | None = None
+    content: ArtifactContent
+    source_ids: list[str] = Field(default_factory=list, max_length=200)
+
+    @field_validator("title")
+    @classmethod
+    def _trim_title(cls, value: str) -> str:
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("title 不能为空白")
+        return trimmed
+
+    @model_validator(mode="after")
+    def _content_matches_type(self):
+        expected = {
+            "markdown": MarkdownContent, "table": TableContent,
+            "json": JsonContent, "sources": SourcesContent,
+        }
+        if not isinstance(self.content, expected[self.type]):
+            raise ValueError(f"content 形状与 type={self.type} 不匹配")
+        if len(set(self.source_ids)) != len(self.source_ids):
+            raise ValueError("source_ids 必须有序去重")
+        if isinstance(self.content, SourcesContent):
+            declared = set(self.source_ids)
+            for item in self.content.items:
+                if item.source_id not in declared:
+                    raise ValueError("sources content 引用了未声明的 source_id")
+        return self
+
+
+class ArtifactMetadata(BaseModel):
+    """事件/列表用的轻量 Artifact 元数据（不含 content）。"""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str
+    thread_id: str
+    run_id: str
+    type: Literal["markdown", "table", "json", "sources"]
+    title: str
+    created_at: str
+    parent_artifact_id: str | None = None
+    source_count: int = Field(default=0, ge=0)
+
+    @classmethod
+    def from_artifact(cls, artifact: ArtifactDocument) -> "ArtifactMetadata":
+        return cls(
+            id=artifact.id, thread_id=artifact.thread_id, run_id=artifact.run_id,
+            type=artifact.type, title=artifact.title, created_at=artifact.created_at,
+            parent_artifact_id=artifact.parent_artifact_id,
+            source_count=len(artifact.source_ids),
+        )
 
 SCHEMA_VERSION = 1
 
@@ -109,6 +281,8 @@ class ThreadDocument(BaseModel):
         """进入后续模型输入的完整消息：排除 partial 与 pending_interrupt。"""
         return [m for m in self.messages if not m.partial and not m.pending_interrupt]
 
+
+ARTIFACT_MAX_BYTES = 1_048_576
 
 TokenStatus = Literal["available", "partial", "unavailable"]
 
