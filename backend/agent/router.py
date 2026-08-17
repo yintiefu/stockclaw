@@ -452,6 +452,23 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
 
     async def event_generator():
         terminal: str = "completed"
+        sources_changed = False
+
+        async def final_sources_frame() -> str | None:
+            if not sources_changed or handle.product_run_id is None:
+                return None
+            run = await asyncio.to_thread(services.runs.get, handle.product_run_id)
+            converted = bridge.convert(CustomEvent(
+                name="sources.updated",
+                value={
+                    "threadId": thread_id,
+                    "runId": run.id,
+                    "sourceCount": len(run.sources),
+                    "sourcesTruncated": run.sources_truncated,
+                },
+            ))
+            return _redact_frame(encoder.encode(redact_event(converted[0], model_key)), model_key)
+
         # 准入阶段（接受用户消息）的 revision 事件：提交已成功；但 @ag-ui/client
         # 要求流的首个事件必须是 RUN_STARTED，故推迟到其后补发
         pending_initial = [
@@ -498,6 +515,9 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                                           handle.control, handle.control.view()) or "", model_key)
                         if budget_frame:
                             yield budget_frame
+                        sources_frame = await final_sources_frame()
+                        if sources_frame:
+                            yield sources_frame
                         terminal = "completed"
                     for converted in converted_events:
                         # 中断 outcome 携带的工具描述/元数据同样可能夹带密钥：出口统一脱敏
@@ -509,16 +529,32 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                     continue
                 for converted in converted_events:
                     safe_event = redact_event(converted, model_key)
+                    if isinstance(safe_event, CustomEvent) and safe_event.name == "sources.updated":
+                        # Graph 已在 SourceRecord 提交后发出；终局前合并为一条最终计数快照。
+                        sources_changed = True
+                        continue
                     if _event_kind(safe_event) in _MEMORY_ONLY_KINDS:
                         # 纯内存累积：不经过工作线程，也不持锁
                         if handle.journal is not None and not handle.journal.closed:
                             handle.journal.observe(safe_event)
                     else:
+                        previous_sources = None
+                        if handle.product_run_id is not None:
+                            previous_run = await asyncio.to_thread(
+                                services.runs.get, handle.product_run_id)
+                            previous_sources = (
+                                len(previous_run.sources), previous_run.sources_truncated)
                         commits = await _commit_or_fail(
                             lambda e=safe_event: services.coordinator.journal_observe(thread_id, e)
                         )
                         for commit in commits:
                             yield encoder.encode(thread_revision_updated(commit.thread_id, commit.revision, commit.persisted_at))
+                        if previous_sources is not None:
+                            persisted_run = await asyncio.to_thread(
+                                services.runs.get, handle.product_run_id)
+                            if previous_sources != (
+                                len(persisted_run.sources), persisted_run.sources_truncated):
+                                sources_changed = True
                     yield _redact_frame(encoder.encode(safe_event), model_key)
                     for frame in pending_initial:
                         yield frame
@@ -564,6 +600,9 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                                   handle.control, handle.control.view()) or "", model_key)
                 if budget_frame:
                     yield budget_frame
+                sources_frame = await final_sources_frame()
+                if sources_frame:
+                    yield sources_frame
             except _PersistenceFailure:
                 yield encoder.encode(RunErrorEvent(
                     message=f"运行状态未能持久化，本地历史可能不完整：{message}",

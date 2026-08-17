@@ -80,10 +80,43 @@ class BudgetUpdatedEventValue(ConfiguredBaseModel):
     contextTruncation: ContextTruncation
 
 
+class ArtifactCreatedEventValue(ConfiguredBaseModel):
+    """Artifact 提交完成后的元数据事件；不携带内容或来源摘要。"""
+
+    model_config = ConfiguredBaseModel.model_config.copy()
+    model_config["extra"] = "forbid"
+    model_config["validate_by_name"] = False
+
+    thread_id: str = Field(validation_alias="threadId", serialization_alias="threadId", min_length=1)
+    run_id: str = Field(validation_alias="runId", serialization_alias="runId", min_length=1)
+    artifact_id: str = Field(validation_alias="artifactId", serialization_alias="artifactId", min_length=1)
+    artifact_type: Literal["markdown", "table", "json", "sources"] = Field(
+        validation_alias="artifactType", serialization_alias="artifactType")
+    parent_artifact_id: str | None = Field(
+        default=None, validation_alias="parentArtifactId", serialization_alias="parentArtifactId", min_length=1)
+    thread_revision: int = Field(
+        validation_alias="threadRevision", serialization_alias="threadRevision", ge=0)
+
+
+class SourcesUpdatedEventValue(ConfiguredBaseModel):
+    """SourceRecord 已落盘后的计数事件；不暴露来源内容。"""
+
+    model_config = ConfiguredBaseModel.model_config.copy()
+    model_config["extra"] = "forbid"
+    model_config["validate_by_name"] = False
+
+    thread_id: str = Field(validation_alias="threadId", serialization_alias="threadId", min_length=1)
+    run_id: str = Field(validation_alias="runId", serialization_alias="runId", min_length=1)
+    source_count: int = Field(validation_alias="sourceCount", serialization_alias="sourceCount", ge=0)
+    sources_truncated: bool = Field(
+        validation_alias="sourcesTruncated", serialization_alias="sourcesTruncated")
+
+
 # Graph 内允许的 CustomEvent 白名单：载荷先按 schema 校验再放行（spec §19）
 CUSTOM_EVENT_MODELS: dict[str, type[ConfiguredBaseModel]] = {
     "budget.updated": BudgetUpdatedEventValue,
-    # artifact.created / sources.updated 的模型与生产者一起在 Task 13 注册
+    "artifact.created": ArtifactCreatedEventValue,
+    "sources.updated": SourcesUpdatedEventValue,
 }
 
 
@@ -180,7 +213,7 @@ class AgentProtocolBridge:
                 return [RunErrorEvent(message=f"Malformed custom event payload: {event.name}", code="INVALID_CUSTOM_EVENT")]
             # 规范化重编码（省略 null 字段）后按原 CustomEvent 类型放行
             canonical = CustomEvent(
-                name=event.name, value=parsed.model_dump_json(exclude_none=True))
+                name=event.name, value=parsed.model_dump_json(by_alias=True, exclude_none=True))
             return [canonical]
         if isinstance(event, RunFinishedEvent) and self.pending:
             interrupts = interrupt_payloads(self.pending)

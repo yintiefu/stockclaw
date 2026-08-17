@@ -14,6 +14,7 @@ from starlette.testclient import TestClient
 import app as app_module
 import agent.router as router_module
 from agent.router import build_services
+from agent.artifacts import ArtifactPersistenceFailed
 from agent.tool_executor import ToolExecutionContext, install_tool_execution_context, reset_tool_execution_context
 from tests.agent.conftest import enter_single_loop_client
 from tests.agent.fakes import ScriptedChatModel
@@ -55,6 +56,11 @@ def _artifact_tool_result(text: str) -> dict | None:
             except (json.JSONDecodeError, TypeError):
                 return None
     return None
+
+
+def _events(text: str) -> list[dict]:
+    return [json.loads(line[len("data: "):]) for line in text.splitlines()
+            if line.startswith("data: ")]
 
 
 async def _run_create(services, context, args) -> dict:
@@ -137,6 +143,150 @@ async def test_create_artifact_success_commits_sources_artifact_and_thread(servi
     urls = [s.url for s in refreshed_run.sources if s.kind == "model_url"]
     assert "https://new.example/y" in urls
     assert urls.count("https://example.com/report") == 1
+
+
+def test_graph_artifact_event_is_validated_and_metadata_only(services, client, monkeypatch):
+    monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: ScriptedChatModel([
+        AIMessage(content="", tool_calls=[{
+            "id": "call-artifact", "name": "create_artifact", "args": create_args(),
+        }]),
+        AIMessage(content="已整理"),
+    ]))
+    response = client.post("/api/agent/run", json={
+        "threadId": "thread-graph-art", "runId": "protocol-graph-art", "state": {},
+        "messages": [{"id": "user-graph-art", "role": "user", "content": "整理"}],
+        "tools": [], "context": [],
+        "forwardedProps": {"runtime": {"model": {
+            "provider": "fixture", "baseURL": "https://example.com/v1", "model": "m"},
+            "threadRevision": 0}},
+    }, headers=HEADERS)
+    assert response.status_code == 200, response.text
+    artifacts = [event for event in _events(response.text)
+                 if event.get("type") == "CUSTOM" and event.get("name") == "artifact.created"]
+    assert len(artifacts) == 1
+    payload = json.loads(artifacts[0]["value"])
+    assert set(payload) == {
+        "threadId", "runId", "artifactId", "artifactType", "threadRevision"}
+    assert payload["threadId"] == "thread-graph-art"
+    assert payload["runId"] == services.runs.list_documents()[0].id
+    assert payload["artifactType"] == "markdown"
+    assert "content" not in payload
+
+
+def test_artifact_publish_failure_emits_sources_after_terminal_commit(services, client, monkeypatch):
+    monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: ScriptedChatModel([
+        AIMessage(content="", tool_calls=[{
+            "id": "call-artifact-fail", "name": "create_artifact", "args": create_args(
+                sources=[{"kind": "url", "url": "https://new.example/fail"}]),
+        }]),
+    ]))
+    monkeypatch.setattr(services.artifacts_service.store, "publish",
+                        lambda staged: (_ for _ in ()).throw(OSError("disk full")))
+    response = client.post("/api/agent/run", json={
+        "threadId": "thread-graph-fail", "runId": "protocol-graph-fail", "state": {},
+        "messages": [{"id": "user-graph-fail", "role": "user", "content": "整理"}],
+        "tools": [], "context": [],
+        "forwardedProps": {"runtime": {"model": {
+            "provider": "fixture", "baseURL": "https://example.com/v1", "model": "m"},
+            "threadRevision": 0}},
+    }, headers=HEADERS)
+    assert response.status_code == 200, response.text
+    events = _events(response.text)
+    sources = [i for i, event in enumerate(events) if event.get("name") == "sources.updated"]
+    assert len(sources) == 1
+    assert not [event for event in events if event.get("name") == "artifact.created"]
+    final_thread = max(i for i, event in enumerate(events)
+                       if event.get("name") == "thread.revision.updated")
+    final_budget = max(i for i, event in enumerate(events)
+                       if event.get("name") == "budget.updated")
+    terminal = next(i for i, event in enumerate(events)
+                    if event["type"] in ("RUN_FINISHED", "RUN_ERROR"))
+    assert final_thread < final_budget < sources[0] < terminal
+
+
+@pytest.mark.asyncio
+async def test_create_artifact_dispatches_events_only_after_durable_facts(services, client, monkeypatch):
+    monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: ScriptedChatModel([
+        AIMessage(content="完成")]))
+    response = client.post("/api/agent/run", json={
+        "threadId": "thread-events", "runId": "protocol-events", "state": {},
+        "messages": [{"id": "user-events", "role": "user", "content": "问"}],
+        "tools": [], "context": [],
+        "forwardedProps": {"runtime": {"model": {
+            "provider": "fixture", "baseURL": "https://example.com/v1", "model": "m"},
+            "threadRevision": 0}},
+    }, headers=HEADERS)
+    assert response.status_code == 200
+    run = services.runs.list_documents()[0]
+    from agent.governance import DEFAULT_POLICY_SNAPSHOT, RunControl
+    context = ToolExecutionContext(
+        thread_id="thread-events", product_run_id=run.id,
+        execution_lock=asyncio.Lock(), builtin_serial_lock=asyncio.Lock(),
+        executor=services.executor, tool_deadline=__import__("time").monotonic() + 30,
+        control=RunControl(DEFAULT_POLICY_SNAPSHOT), artifact_service=services.artifacts_service)
+    observed = []
+
+    async def capture(name, payload):
+        observed.append((name, payload))
+        persisted_run = services.runs.get(run.id)
+        if name == "sources.updated":
+            assert len(persisted_run.sources) == payload["sourceCount"]
+        else:
+            assert services.artifacts_service.store.get("thread-events", payload["artifactId"])
+            assert payload["artifactId"] in services.threads.get("thread-events").artifact_ids
+
+    monkeypatch.setattr("langchain_core.callbacks.adispatch_custom_event", capture)
+    result = await _run_create(services, context, create_args(
+        sources=[{"kind": "url", "url": "https://new.example/report"}]))
+    assert result["ok"] is True
+    assert [name for name, _ in observed] == ["sources.updated", "artifact.created"]
+    assert observed[0][1] == {
+        "threadId": "thread-events", "runId": run.id,
+        "sourceCount": 1, "sourcesTruncated": False,
+    }
+    assert observed[1][1] == {
+        "threadId": "thread-events", "runId": run.id,
+        "artifactId": result["artifact"]["id"], "artifactType": "markdown",
+        "parentArtifactId": None, "threadRevision": result["thread_revision"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_publish_failure_after_source_commit_dispatches_sources_only(services, client, monkeypatch):
+    monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: ScriptedChatModel([
+        AIMessage(content="完成")]))
+    response = client.post("/api/agent/run", json={
+        "threadId": "thread-event-fail", "runId": "protocol-event-fail", "state": {},
+        "messages": [{"id": "user-event-fail", "role": "user", "content": "问"}],
+        "tools": [], "context": [],
+        "forwardedProps": {"runtime": {"model": {
+            "provider": "fixture", "baseURL": "https://example.com/v1", "model": "m"},
+            "threadRevision": 0}},
+    }, headers=HEADERS)
+    assert response.status_code == 200
+    run = services.runs.list_documents()[0]
+    from agent.governance import DEFAULT_POLICY_SNAPSHOT, RunControl
+    context = ToolExecutionContext(
+        thread_id="thread-event-fail", product_run_id=run.id,
+        execution_lock=asyncio.Lock(), builtin_serial_lock=asyncio.Lock(),
+        executor=services.executor, tool_deadline=__import__("time").monotonic() + 30,
+        control=RunControl(DEFAULT_POLICY_SNAPSHOT), artifact_service=services.artifacts_service)
+    observed = []
+
+    async def capture(name, payload):
+        observed.append((name, payload))
+
+    def fail_publish(staged):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("langchain_core.callbacks.adispatch_custom_event", capture)
+    monkeypatch.setattr(services.artifacts_service.store, "publish", fail_publish)
+    with pytest.raises(ArtifactPersistenceFailed):
+        await _run_create(services, context, create_args(
+            sources=[{"kind": "url", "url": "https://new.example/fail"}]))
+    assert [name for name, _ in observed] == ["sources.updated"]
+    assert observed[0][1]["sourceCount"] == 1
+    assert services.threads.get("thread-event-fail").artifact_ids == []
 
 
 @pytest.mark.asyncio

@@ -322,6 +322,32 @@ def test_final_budget_event_precedes_terminal_event(services, client, monkeypatc
     assert last_budget["budgetSnapshot"]["max_model_calls"] == 8
 
 
+def test_final_sources_event_follows_terminal_commit_and_budget(services, client, monkeypatch):
+    monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: ScriptedChatModel([
+        AIMessage(content="", tool_calls=[{
+            "id": "call-source", "name": "echo_tool", "args": {"code": "600519"}}]),
+        AIMessage(content="资料 https://example.com/report"),
+    ]))
+    response = client.post("/api/agent/run", json=start_payload(), headers=HEADERS)
+    assert response.status_code == 200
+    events = parse_sse(response.text)
+    source_indexes = [i for i, event in enumerate(events)
+                      if event.get("type") == "CUSTOM" and event.get("name") == "sources.updated"]
+    assert len(source_indexes) == 1
+    payload = json.loads(events[source_indexes[0]]["value"])
+    assert payload == {
+        "threadId": "thread-1d", "runId": services.runs.list_documents()[0].id,
+        "sourceCount": 2, "sourcesTruncated": False,
+    }
+    final_thread = max(i for i, event in enumerate(events)
+                       if event.get("type") == "CUSTOM" and event.get("name") == "thread.revision.updated")
+    final_budget = max(i for i, event in enumerate(events)
+                       if event.get("type") == "CUSTOM" and event.get("name") == "budget.updated")
+    terminal = next(i for i, event in enumerate(events)
+                    if event["type"] in ("RUN_FINISHED", "RUN_ERROR"))
+    assert final_thread < final_budget < source_indexes[0] < terminal
+
+
 def test_usage_counts_come_from_persisted_reservations_not_events(services, client, monkeypatch):
     """Provider 错误后：已持久化的 reservation 计数保持，不被事件推断覆盖。"""
     class FailingModel(ScriptedChatModel):
@@ -384,6 +410,8 @@ def test_governance_error_code_preserved_in_run_and_event(services, client, monk
     events = parse_sse(response.text)
     run_error = [e for e in events if e["type"] == "RUN_ERROR"][0]
     assert run_error["code"] == "MODEL_CALL_LIMIT_EXCEEDED"
-    # 不再有 slice-2 之前不存在的 sources 事件
-    assert not [e for e in events if e.get("name") == "sources.updated"]
+    # 已提交的工具来源即使终局失败也要通知；未创建 Artifact 则绝不发送其事件
+    source_events = [e for e in events if e.get("name") == "sources.updated"]
+    assert len(source_events) == 1
+    assert json.loads(source_events[0]["value"])["sourceCount"] == 8
     assert not [e for e in events if e.get("name") == "artifact.created"]

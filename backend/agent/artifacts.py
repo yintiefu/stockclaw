@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -208,6 +209,16 @@ class ArtifactPersistenceFailed(ArtifactError):
     """终局性持久化失败：绝不能作为可纠正工具结果返回。"""
 
     code = "ARTIFACT_PERSISTENCE_FAILED"
+
+
+async def _emit_persisted_event(name: str, payload: dict) -> None:
+    """提交完成后经 Graph CustomEvent 通道通知；发送失败不影响权威状态。"""
+    try:
+        from langchain_core.callbacks import adispatch_custom_event
+
+        await adispatch_custom_event(name, payload)
+    except Exception as exc:
+        print(f"artifact persisted event emit failed: {exc!r}", file=sys.stderr)
 
 
 @dataclass(frozen=True)
@@ -419,12 +430,19 @@ class ArtifactService:
                     # 1) 独立 SourceRecord 先行提交（即使后续失败也不回滚）
                     if plan.new_sources:
                         view = control.note_sources_added(len(plan.new_sources))
-                        self._runs.replace(run_now.model_copy(update={
+                        updated_run = run_now.model_copy(update={
                             "sources": [*run_now.sources, *plan.new_sources],
                             "sources_truncated": run_now.sources_truncated,
                             "control_revision": view.control_revision,
                             "updated_at": utc_now_stamp(),
-                        }))
+                        })
+                        self._runs.replace(updated_run)
+                        await _emit_persisted_event("sources.updated", {
+                            "threadId": thread_id,
+                            "runId": run_id,
+                            "sourceCount": len(updated_run.sources),
+                            "sourcesTruncated": updated_run.sources_truncated,
+                        })
                     # 2) 发布最终 Artifact 文件
                     try:
                         self.store.publish(staged)
@@ -444,6 +462,14 @@ class ArtifactService:
                             pass
                         raise ArtifactPersistenceFailed(
                             f"thread 引用提交失败: {exc}") from exc
+                    await _emit_persisted_event("artifact.created", {
+                        "threadId": thread_id,
+                        "runId": run_id,
+                        "artifactId": plan.artifact.id,
+                        "artifactType": plan.artifact.type,
+                        "parentArtifactId": plan.artifact.parent_artifact_id,
+                        "threadRevision": updated_thread.revision,
+                    })
                 except ArtifactPersistenceFailed:
                     staged.path.unlink(missing_ok=True)
                     raise
