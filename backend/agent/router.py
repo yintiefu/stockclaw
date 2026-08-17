@@ -118,7 +118,9 @@ def build_services(root: Path | None = None) -> AgentServices:
     artifact_store = ArtifactStore(paths.root)
     artifacts_service = ArtifactService(
         store=artifact_store, threads=threads, runs=runs,
-        thread_lock=lambda thread_id: _artifact_lock_target.thread_lock(thread_id))
+        thread_lock=lambda thread_id: _artifact_lock_target.thread_lock(thread_id),
+        on_thread_reference_committed=lambda thread_id, run_id, revision:
+        _artifact_lock_target.note_artifact_thread_reference(thread_id, run_id, revision))
 
     class _CoordinatorRef:
         pass
@@ -143,6 +145,7 @@ def build_services(root: Path | None = None) -> AgentServices:
         paths=paths,
     )
     _artifact_lock_target.thread_lock = coordinator.thread_lock
+    _artifact_lock_target.note_artifact_thread_reference = coordinator.note_artifact_thread_reference
     return AgentServices(paths, threads, runs, coordinator, skills, importer, registry,
                          policy, executor, builtin_serial_lock, artifacts_service)
 
@@ -550,6 +553,9 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                                           handle.control, segment_view) or "", model_key)
                         if budget_frame:
                             yield budget_frame
+                        sources_frame = await final_sources_frame()
+                        if sources_frame:
+                            yield sources_frame
                         terminal = "awaiting_approval"
                     else:
                         # 终局：最终 revision 事件必须先于 RUN_FINISHED

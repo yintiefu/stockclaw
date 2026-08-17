@@ -206,6 +206,98 @@ def test_artifact_publish_failure_emits_sources_after_terminal_commit(services, 
 
 
 @pytest.mark.asyncio
+async def test_cancel_after_artifact_reference_uses_current_handle_revision(services, client, monkeypatch):
+    from langchain.agents.middleware import HumanInTheLoopMiddleware
+
+    @lc_tool
+    def approval_tool(code: str) -> str:
+        """需要审批的测试工具。"""
+        return code
+
+    monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [approval_tool])
+    monkeypatch.setattr("agent.router.build_middleware", lambda: (
+        HumanInTheLoopMiddleware(interrupt_on={
+            "approval_tool": {"allowed_decisions": ["approve", "reject"]},
+        }),))
+    monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: ScriptedChatModel([
+        AIMessage(content="", tool_calls=[{
+            "id": "call-pause", "name": "approval_tool", "args": {"code": "600519"},
+        }]),
+    ]))
+    response = client.post("/api/agent/run", json={
+        "threadId": "thread-artifact-cancel", "runId": "protocol-artifact-cancel", "state": {},
+        "messages": [{"id": "user-artifact-cancel", "role": "user", "content": "整理"}],
+        "tools": [], "context": [],
+        "forwardedProps": {"runtime": {"model": {
+            "provider": "fixture", "baseURL": "https://example.com/v1", "model": "m"},
+            "threadRevision": 0}},
+    }, headers=HEADERS)
+    assert response.status_code == 200
+    handle = services.coordinator.active("thread-artifact-cancel")
+    assert handle is not None and handle.phase == "awaiting_approval"
+
+    result = await _run_create(services, _make_context(services, handle), create_args())
+    assert result["ok"] is True
+
+    await services.coordinator.cancel_run("thread-artifact-cancel", handle.product_run_id)
+    assert services.coordinator.active("thread-artifact-cancel") is None
+    assert services.runs.get(handle.product_run_id).status == "cancelled"
+    thread = services.threads.get("thread-artifact-cancel")
+    assert result["artifact"]["id"] in thread.artifact_ids
+    assert thread.last_run is not None and thread.last_run.status == "cancelled"
+
+
+def test_artifact_sources_emit_before_interrupt_terminal(services, client, monkeypatch):
+    from langchain.agents.middleware import HumanInTheLoopMiddleware
+
+    @lc_tool
+    def approval_tool(code: str) -> str:
+        """需要审批的测试工具。"""
+        return code
+
+    monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [approval_tool])
+    monkeypatch.setattr("agent.router.build_middleware", lambda: (
+        HumanInTheLoopMiddleware(interrupt_on={
+            "approval_tool": {"allowed_decisions": ["approve", "reject"]},
+        }),))
+    monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: ScriptedChatModel([
+        AIMessage(content="", tool_calls=[{
+            "id": "call-artifact-source", "name": "create_artifact", "args": create_args(
+                sources=[{"kind": "url", "url": "https://new.example/interrupt"}]),
+        }]),
+        AIMessage(content="", tool_calls=[{
+            "id": "call-approval", "name": "approval_tool", "args": {"code": "600519"},
+        }]),
+    ]))
+    response = client.post("/api/agent/run", json={
+        "threadId": "thread-artifact-interrupt", "runId": "protocol-artifact-interrupt", "state": {},
+        "messages": [{"id": "user-artifact-interrupt", "role": "user", "content": "整理"}],
+        "tools": [], "context": [],
+        "forwardedProps": {"runtime": {"model": {
+            "provider": "fixture", "baseURL": "https://example.com/v1", "model": "m"},
+            "threadRevision": 0}},
+    }, headers=HEADERS)
+    assert response.status_code == 200
+    events = _events(response.text)
+    run = services.runs.list_documents()[0]
+    assert run.status == "awaiting_approval"
+    sources = [i for i, event in enumerate(events) if event.get("name") == "sources.updated"]
+    assert len(sources) == 1
+    assert json.loads(events[sources[0]]["value"]) == {
+        "threadId": "thread-artifact-interrupt", "runId": run.id,
+        "controlRevision": run.control_revision,
+        "sourceCount": len(run.sources), "sourcesTruncated": False,
+    }
+    final_thread = max(i for i, event in enumerate(events)
+                       if event.get("name") == "thread.revision.updated")
+    final_budget = max(i for i, event in enumerate(events)
+                       if event.get("name") == "budget.updated")
+    terminal = next(i for i, event in enumerate(events) if event["type"] == "RUN_FINISHED")
+    assert events[terminal]["outcome"]["type"] == "interrupt"
+    assert final_thread < final_budget < sources[0] < terminal
+
+
+@pytest.mark.asyncio
 async def test_create_artifact_records_events_only_after_durable_facts(services, client, monkeypatch):
     monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: ScriptedChatModel([
         AIMessage(content="完成")]))

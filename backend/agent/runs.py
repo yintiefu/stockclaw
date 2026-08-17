@@ -1420,6 +1420,18 @@ class RunCoordinator:
     def thread_lock(self, thread_id: str) -> asyncio.Lock:
         return self._lock(thread_id)
 
+    def note_artifact_thread_reference(
+        self, thread_id: str, run_id: str, revision: int,
+    ) -> None:
+        """Artifact 引用提交后立即同步当前 handle 的 CAS revision。
+
+        调用方持有本 coordinator 的 thread lock；不能等 router 编码事件后再更新，
+        否则取消/断连可在两者之间以旧 revision 提交终态。
+        """
+        handle = self._handles.get(thread_id)
+        if handle is not None and handle.product_run_id == run_id:
+            handle.thread_revision = revision
+
     async def _journal_write(self, thread_id: str, fn: Callable[["RunJournal"], Any]) -> list:
         # 锁序不变量：artifact_mutation_lock 先于 coordinator thread lock；
         # Source 提交在该短协调段内完成，绝不取 reservation_lock

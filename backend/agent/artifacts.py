@@ -224,11 +224,13 @@ class ArtifactCommitPlan:
 class ArtifactService:
     """create_artifact 的唯一事务入口：计划 → staging → 复验 → 短提交。"""
 
-    def __init__(self, *, store: ArtifactStore, threads, runs, thread_lock):
+    def __init__(self, *, store: ArtifactStore, threads, runs, thread_lock,
+                 on_thread_reference_committed):
         self.store = store
         self._threads = threads
         self._runs = runs
         self._thread_lock = thread_lock
+        self._on_thread_reference_committed = on_thread_reference_committed
 
     def list_with_warnings(self, thread_id: str):
         """列表 + 线程引用核对告警（不扫描其他 thread 文档）。"""
@@ -452,6 +454,8 @@ class ArtifactService:
                             pass
                         raise ArtifactPersistenceFailed(
                             f"thread 引用提交失败: {exc}") from exc
+                    self._on_thread_reference_committed(
+                        thread_id, run_id, updated_thread.revision)
                     control.record_persisted_event_fact("artifact.created", {
                         "threadId": thread_id,
                         "runId": run_id,

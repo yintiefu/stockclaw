@@ -12,6 +12,7 @@ from ag_ui.core.events import (
     RunFinishedEvent,
     ToolCallArgsEvent,
     ToolCallEndEvent,
+    ToolCallResultEvent,
     ToolCallStartEvent,
 )
 from ag_ui.core.types import ConfiguredBaseModel
@@ -164,6 +165,7 @@ class AgentProtocolBridge:
         self.pending = pending if pending is not None else []
         self._tool_calls: dict[str, dict[str, Any]] = {}
         self._tool_call_order: list[str] = []
+        self._completed_tool_call_ids: set[str] = set()
 
     def convert(self, event: Any) -> list[Any]:
         if isinstance(event, RawEvent):
@@ -194,6 +196,9 @@ class AgentProtocolBridge:
         if isinstance(event, ToolCallEndEvent):
             if event.tool_call_id not in self._tool_calls:
                 raise ValueError("tool end arrived before tool start")
+            return [event]
+        if isinstance(event, ToolCallResultEvent):
+            self._completed_tool_call_ids.add(event.tool_call_id)
             return [event]
         if isinstance(event, CustomEvent):
             if event.name == "on_interrupt":
@@ -325,7 +330,8 @@ class AgentProtocolBridge:
         candidates = [
             (tool_call_id, self._tool_calls[tool_call_id])
             for tool_call_id in self._tool_call_order
-            if not any(item.tool_call_id == tool_call_id for item in self.pending)
+            if tool_call_id not in self._completed_tool_call_ids
+            and not any(item.tool_call_id == tool_call_id for item in self.pending)
         ]
         if len(candidates) < len(actions):
             # A repeated observation reuses the already captured mapping.
