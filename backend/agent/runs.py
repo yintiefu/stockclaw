@@ -23,8 +23,10 @@ from agent.governance import (
     ContextAndModelGovernance,
     GovernanceView,
     RunControl,
+    ToolExecutionGovernance,
     render_policy_explanation,
 )
+from agent.tool_executor import BoundedToolExecutor
 from agent.runtime import AgentFactory, RuntimeHandle
 from agent.skills import SkillError
 from agent.stores import DocumentNotFound, RevisionConflict, utc_now
@@ -406,6 +408,8 @@ class RunCoordinator:
         resolver: CapabilityResolver | None = None,
         middleware_provider: Callable[[], tuple] | None = None,
         allowances: "AllowanceRegistry | None" = None,
+        executor: "BoundedToolExecutor | None" = None,
+        builtin_serial_lock: asyncio.Lock | None = None,
     ):
         self._factory = factory or AgentFactory()
         self._locks: dict[str, asyncio.Lock] = {}
@@ -419,6 +423,9 @@ class RunCoordinator:
         self._middleware_provider = middleware_provider
         # 1C：thread_session 审批许可（内存；resume 持久化成功后写入）
         self._allowances = allowances
+        # 1D：进程级有界同步执行器与 legacy builtin 串行锁（router 注入）
+        self._executor = executor
+        self._builtin_serial_lock = builtin_serial_lock
 
     def _lock(self, thread_id: str) -> asyncio.Lock:
         if thread_id not in self._locks:
@@ -445,7 +452,7 @@ class RunCoordinator:
 
     def _governed_middleware_factory(self, lease: CapabilityLease, control: RunControl,
                                      thread_id: str, run_id: str):
-        """每个请求重建：治理中间件（闭包同一 control）+ lease 的 MCP guard/HITL。"""
+        """每个请求重建（锁序固定）：模型治理（最外层）→ lease 的 guard/HITL → 工具治理（最内层）。"""
         async def persist(view: GovernanceView) -> None:
             await self.persist_control_view(thread_id, view)
 
@@ -454,6 +461,10 @@ class RunCoordinator:
                 ContextAndModelGovernance(
                     control, persist=persist, thread_id=thread_id, run_id=run_id),
                 *lease.build_request_middleware(secrets),
+                ToolExecutionGovernance(
+                    control, persist=persist, executor=self._executor,
+                    builtin_serial_lock=self._builtin_serial_lock,
+                    thread_id=thread_id, run_id=run_id),
             )
 
         return factory

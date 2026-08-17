@@ -528,3 +528,5 @@ async def test_allowance_key_uses_real_thread_id(tmp_path):
                                allowances=registry)
     entry = policy.interrupt_on["mcp__fixture__echo"]
     assert entry["when"](type("R", (), {"tool_call": {"name": "mcp__fixture__echo"}})) is False
+
+

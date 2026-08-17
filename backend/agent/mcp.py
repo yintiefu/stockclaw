@@ -1008,4 +1008,5 @@ class McpToolBinding:
             description=binding.description,
             args_schema=binding.args_schema or {
                 "type": "object", "properties": {}, "required": []},
+            metadata={"vr_origin": "mcp"},
         )

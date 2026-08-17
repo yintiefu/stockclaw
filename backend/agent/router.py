@@ -109,6 +109,8 @@ def build_services(root: Path | None = None) -> AgentServices:
                                     registry=registry, allowances=allowances),
         middleware_provider=lambda: build_middleware(),
         allowances=allowances,
+        executor=executor,
+        builtin_serial_lock=builtin_serial_lock,
     )
     return AgentServices(paths, threads, runs, coordinator, skills, importer, registry,
                          policy, executor, builtin_serial_lock)

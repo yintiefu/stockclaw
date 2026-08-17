@@ -50,6 +50,18 @@ class ContextLimitExceeded(GovernanceError):
     code = "CONTEXT_LIMIT_EXCEEDED"
 
 
+class ToolTimedOut(GovernanceError):
+    """min(tool, active) 截止耗尽；code 按绑定来源映射 TOOL_TIMEOUT / RUN_ACTIVE_TIMEOUT。"""
+
+    def __init__(self, message: str, code: str):
+        super().__init__(message)
+        self.code = code
+
+
+class ToolArgsInvalid(ValueError):
+    """schema 预校验失败的可纠正错误：LangGraph 会转成 error ToolMessage。"""
+
+
 class GovernanceTerminalError(GovernanceError):
     """控制已终结后到达的预留/段开启请求；code 取自首次终结原因。"""
 
@@ -539,6 +551,20 @@ async def _default_emit(payload: dict) -> None:
         print(f"governance budget emit failed: {exc!r}", file=sys.stderr)
 
 
+def build_budget_payload(*, thread_id: str, run_id: str, control: RunControl,
+                         view: GovernanceView) -> dict:
+    """§19.1 budget.updated 载荷：恰好七个 camelCase 字段。"""
+    return {
+        "threadId": thread_id,
+        "runId": run_id,
+        "controlRevision": view.control_revision,
+        "budgetSnapshot": control.snapshot.model_dump(mode="json"),
+        "usage": view.usage.model_dump(mode="json"),
+        "activeElapsedMs": view.active_elapsed_ms,
+        "contextTruncation": view.context_truncation.model_dump(mode="json"),
+    }
+
+
 class ContextAndModelGovernance(AgentMiddleware):
     """模型调用治理中间件（元组第一位、最外层）。
 
@@ -578,15 +604,9 @@ class ContextAndModelGovernance(AgentMiddleware):
 
     async def _emit_budget(self, view: GovernanceView) -> None:
         try:
-            await self._emit({
-                "threadId": self._thread_id,
-                "runId": self._run_id,
-                "controlRevision": view.control_revision,
-                "budgetSnapshot": self._control.snapshot.model_dump(mode="json"),
-                "usage": view.usage.model_dump(mode="json"),
-                "activeElapsedMs": view.active_elapsed_ms,
-                "contextTruncation": view.context_truncation.model_dump(mode="json"),
-            })
+            await self._emit(build_budget_payload(
+                thread_id=self._thread_id, run_id=self._run_id,
+                control=self._control, view=view))
         except Exception as exc:  # 事件失败绝不影响已提交状态
             print(f"governance budget emit failed: {exc!r}", file=sys.stderr)
 
@@ -624,3 +644,265 @@ class ContextAndModelGovernance(AgentMiddleware):
         usage = extract_provider_usage(response)
         await self._persist_telemetry(self._control.record_model_usage(usage))
         return response
+
+
+# ---- 工具准入治理（spec §10：锁序、容量、reservation） ----
+
+import contextlib  # noqa: E402
+import time as _time_module  # noqa: E402
+
+from langchain.agents.middleware import AgentMiddleware as _AgentMiddleware  # noqa: E402
+
+from agent.tool_executor import (  # noqa: E402
+    BoundedToolExecutor,
+    CapacityLease,
+    ToolDeadlineExceeded,
+    ToolExecutionContext,
+    install_tool_execution_context,
+    reset_tool_execution_context,
+)
+
+CAPACITY_WAIT_SECONDS = 1.0
+_WAIT_POLL_SECONDS = 0.02
+
+_JSON_TYPE_FAMILY = {
+    "string": (str,),
+    "array": (list,),
+    "object": (dict,),
+    "boolean": (bool,),
+    "integer": (int,),
+    "number": (int, float),
+}
+
+
+def classify_tool(tool: Any) -> tuple[str, bool, bool, bool]:
+    """(origin, execution_lock, builtin_serial, capacity)；按不可变元数据分类。
+
+    无元数据的工具按本地工具处理（execution lock、无进程串行、无容量）。
+    """
+    metadata = getattr(tool, "metadata", None) or {}
+    origin = metadata.get("vr_origin") or "local"
+    if origin == "mcp":
+        return ("mcp", False, False, False)
+    execution_lock = bool(metadata.get("vr_execution_lock", origin != "mcp"))
+    builtin_serial = bool(metadata.get("vr_builtin_serial", False))
+    capacity = bool(metadata.get("vr_capacity", False))
+    return (origin, execution_lock, builtin_serial, capacity)
+
+
+def _json_schema_type_ok(expected: Any, value: Any) -> bool:
+    if expected is None:
+        return True
+    if isinstance(expected, list):
+        return all(_json_schema_type_ok(item, value) for item in expected)
+    family = _JSON_TYPE_FAMILY.get(str(expected))
+    if family is None:
+        return True
+    if isinstance(value, bool) and str(expected) not in ("boolean",):
+        return False
+    return isinstance(value, family)
+
+
+def _validate_json_schema_args(schema: dict, args: dict) -> None:
+    """legacy 内置 dict(JSON) schema 的最小预校验：required + 类型族。"""
+    for name in schema.get("required") or []:
+        if name not in args:
+            raise ToolArgsInvalid(f"缺少必填参数 {name}")
+    properties = schema.get("properties") or {}
+    extra_allowed = schema.get("additionalProperties", True)
+    for name, value in args.items():
+        if name not in properties:
+            if extra_allowed is False:
+                raise ToolArgsInvalid(f"未知参数 {name}")
+            continue
+        rule = properties[name] or {}
+        if not _json_schema_type_ok(rule.get("type"), value):
+            raise ToolArgsInvalid(f"参数 {name} 类型不合法")
+        enum = rule.get("enum")
+        if enum is not None and value not in enum:
+            raise ToolArgsInvalid(f"参数 {name} 不在允许取值内")
+        if isinstance(value, list) and rule.get("items"):
+            item_type = (rule["items"] or {}).get("type")
+            for item in value:
+                if not _json_schema_type_ok(item_type, item):
+                    raise ToolArgsInvalid(f"参数 {name} 的元素类型不合法")
+
+
+def prevalidate_tool_args(tool: Any, args: Any) -> str | None:
+    """返回 None 表示通过；'native' 表示交给原生校验路径；'invalid' 表示明确失败。"""
+    if tool is None:
+        return None
+    schema = getattr(tool, "args_schema", None)
+    if isinstance(schema, type) and hasattr(schema, "model_validate"):
+        if isinstance(args, dict):
+            try:
+                schema.model_validate(args)
+            except Exception:
+                return "invalid"
+        return None
+    if isinstance(schema, dict):
+        if isinstance(args, dict):
+            try:
+                _validate_json_schema_args(schema, args)
+            except ToolArgsInvalid:
+                return "invalid"
+        return None
+    return None
+
+
+class ToolExecutionGovernance(_AgentMiddleware):
+    """真实 handler 边界的准入治理（元组最后一位、最内层工具包装）。
+
+    顺序契约（锁序不变量）：schema 预校验 → execution lock → 进程级 builtin
+    serial lock → executor capacity → reservation（持久化成功才继续）→ 安装
+    ToolExecutionContext → handler（min(tool, active) 截止内）→ 复位并逆序释放。
+    MCP 跳过本地锁与容量，仅在真实调用前 reservation。
+    """
+
+    def __init__(
+        self,
+        control: RunControl,
+        *,
+        persist: PersistCallback,
+        emit: EmitCallback | None = None,
+        executor: BoundedToolExecutor | None = None,
+        builtin_serial_lock: asyncio.Lock | None = None,
+        thread_id: str = "",
+        run_id: str = "",
+        clock: Callable[[], float] | None = None,
+    ):
+        super().__init__()
+        self._control = control
+        self._persist = persist
+        self._emit_cb = emit
+        self._executor = executor
+        self._builtin_serial_lock = builtin_serial_lock
+        self._thread_id = thread_id
+        self._run_id = run_id
+        # 截止时钟可注入（测试用 FakeClock 快进）；生产为 time.monotonic
+        self._clock = clock or _time_module.monotonic
+
+    # ---- 截止与错误映射 ----
+
+    def _deadline_error(self) -> ToolTimedOut:
+        if self._control.remaining_active_seconds() <= 0:
+            return ToolTimedOut("本次运行的活跃时长已耗尽", "RUN_ACTIVE_TIMEOUT")
+        return ToolTimedOut("工具执行超过 Policy 截止时间", "TOOL_TIMEOUT")
+
+    def _remaining_seconds(self, tool_deadline: float) -> float:
+        """实际剩余 = min(tool 剩余, active 剩余)；时钟可注入故每次重算。"""
+        return min(
+            tool_deadline - self._clock(),
+            self._control.remaining_active_seconds(),
+        )
+
+    async def _acquire_lock_bounded(self, lock: asyncio.Lock, tool_deadline: float) -> None:
+        while True:
+            remaining = self._remaining_seconds(tool_deadline)
+            if remaining <= 0:
+                raise self._deadline_error()
+            acquire_task = asyncio.ensure_future(lock.acquire())
+            try:
+                await asyncio.wait_for(acquire_task, timeout=min(_WAIT_POLL_SECONDS, remaining))
+                return
+            except asyncio.TimeoutError:
+                if acquire_task.cancelled() is False:
+                    acquire_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await acquire_task
+                continue
+
+    async def _await_bounded(self, awaitable, tool_deadline: float):
+        """轮询式有界等待：每 20ms 重算剩余时间，配合可注入时钟可测。"""
+        task = asyncio.ensure_future(awaitable)
+        while True:
+            remaining = self._remaining_seconds(tool_deadline)
+            if remaining <= 0:
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    await task
+                raise self._deadline_error()
+            try:
+                return await asyncio.wait_for(asyncio.shield(task),
+                                              timeout=min(_WAIT_POLL_SECONDS, remaining))
+            except asyncio.TimeoutError:
+                continue
+
+    async def _emit_budget(self, view: GovernanceView) -> None:
+        emit = self._emit_cb or _default_emit
+        try:
+            await emit(build_budget_payload(
+                thread_id=self._thread_id, run_id=self._run_id,
+                control=self._control, view=view))
+        except Exception as exc:  # 事件失败绝不影响已提交状态
+            print(f"governance budget emit failed: {exc!r}", file=sys.stderr)
+
+    # ---- 中间件入口 ----
+
+    async def awrap_tool_call(self, request, call_tool, **kwargs):
+        tool = getattr(request, "tool", None)
+        tool_call = getattr(request, "tool_call", {}) or {}
+        args = tool_call.get("args")
+
+        # 1) schema 预校验：在任何锁 / reservation 之前（失败零消耗）
+        check = prevalidate_tool_args(tool, args)
+        if check == "invalid":
+            raise ToolArgsInvalid(f"工具 {tool_call.get('name')} 参数未通过 schema 校验")
+
+        origin, needs_execution_lock, needs_serial, needs_capacity = classify_tool(tool)
+
+        # 2) 截止：tool deadline 从预校验成功后开始；实际截止取 min(tool, active)
+        tool_deadline = self._clock() + self._control.snapshot.tool_timeout_seconds
+        if self._remaining_seconds(tool_deadline) <= 0:
+            raise self._deadline_error()
+
+        lease: CapacityLease | None = None
+        held_locks: list[asyncio.Lock] = []
+        try:
+            # 3) 前置条件（锁序：execution → serial → capacity）
+            if needs_execution_lock:
+                await self._acquire_lock_bounded(self._control.execution_lock, tool_deadline)
+                held_locks.append(self._control.execution_lock)
+            if needs_serial:
+                if self._builtin_serial_lock is None:
+                    raise GovernanceError("进程级 builtin serial lock 未注入")
+                await self._acquire_lock_bounded(self._builtin_serial_lock, tool_deadline)
+                held_locks.append(self._builtin_serial_lock)
+            if needs_capacity:
+                if self._executor is None:
+                    raise GovernanceError("有界同步执行器未注入")
+                # executor 内部使用真实单调时钟：剩余秒数从当前真实时刻起算
+                executor_deadline = _time_module.monotonic() + max(
+                    0.0, self._remaining_seconds(tool_deadline))
+                lease = await self._executor.acquire(
+                    capacity_wait_seconds=CAPACITY_WAIT_SECONDS, deadline=executor_deadline)
+
+            # 4) reservation：持久化成功才允许触达真实 handler
+            view = await self._control.reserve_tool(self._persist)
+            await self._emit_budget(view)
+
+            # 5) 安装请求级上下文（无密钥）并调用内层
+            context = ToolExecutionContext(
+                thread_id=self._thread_id,
+                product_run_id=self._run_id,
+                execution_lock=self._control.execution_lock,
+                builtin_serial_lock=self._builtin_serial_lock or asyncio.Lock(),
+                executor=self._executor or BoundedToolExecutor(),
+                tool_deadline=tool_deadline,
+                capacity_lease=lease,
+                control=self._control,
+            )
+            token = install_tool_execution_context(context)
+            try:
+                return await self._await_bounded(call_tool(request), tool_deadline)
+            finally:
+                reset_tool_execution_context(token)
+        except ToolDeadlineExceeded as exc:
+            raise self._deadline_error() from exc
+        finally:
+            # 逆序释放本层取得的锁；未提交的租约归还（已提交的归 future 回调）
+            if lease is not None and not lease.submitted and not lease.released:
+                lease.release_unsubmitted()
+            for lock in reversed(held_locks):
+                if lock.locked():
+                    lock.release()
