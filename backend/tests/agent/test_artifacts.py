@@ -122,6 +122,9 @@ def test_store_rejects_traversal_and_symlinks(tmp_path):
         store._path("thread-a", "../../etc/passwd")
     with pytest.raises(ArtifactInvalid):
         store.stage(artifact(thread_id="thread-a/../b"))
+    with pytest.raises(ArtifactInvalid):
+        store.stage(artifact(id="artifact.with.dot"))
+    assert not (tmp_path / "artifacts" / "thread-a").exists()
     # symlink 最终文件不跟随、不读取
     directory = tmp_path / "artifacts" / "thread-a"
     directory.mkdir(parents=True)

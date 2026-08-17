@@ -76,8 +76,9 @@ class ArtifactStore:
 
     def stage(self, artifact: ArtifactDocument) -> StagedArtifact:
         """只写 <artifact-id>.<nonce>.artifact.tmp（flush+fsync），不动权威状态。"""
+        final = self._path(artifact.thread_id, artifact.id)
         encoded = encode_artifact(artifact)
-        directory = self._thread_dir(artifact.thread_id)
+        directory = final.parent
         directory.mkdir(parents=True, exist_ok=True)
         tmp = directory / f"{artifact.id}.{uuid4().hex}.artifact.tmp"
         with tmp.open("wb") as handle:
