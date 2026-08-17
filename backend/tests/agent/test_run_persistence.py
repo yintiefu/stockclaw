@@ -1120,3 +1120,100 @@ async def test_persist_control_view_rejects_detached_handle(tmp_path):
                           active_elapsed_ms=10, context_truncation=ContextTruncation())
     with pytest.raises(RuntimeError):
         await coordinator.persist_control_view("thread-1", view)
+
+
+@pytest.mark.asyncio
+async def test_automatic_sources_recorded_for_tools_and_urls(tmp_path, monkeypatch):
+    """1D Task 9：完成的工具与 assistant URL 自动进入 run.sources。"""
+    import tempfile
+
+    import app as app_module
+    import agent.router as router_module
+    from agent.router import build_services
+    from langchain_core.tools import tool as lc_tool
+    from starlette.testclient import TestClient
+    from tests.agent.conftest import enter_single_loop_client
+    from tests.agent.fakes import ScriptedChatModel
+    from langchain_core.messages import AIMessage
+
+    @lc_tool
+    def source_tool(code: str) -> str:
+        """查一个值"""
+        return '{"price": 10}'
+
+    services = build_services(tempfile.mkdtemp())
+    monkeypatch.setattr(router_module, "services", services)
+    monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [source_tool])
+    monkeypatch.setattr("agent.router.build_middleware", lambda: ())
+    monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: ScriptedChatModel([
+        AIMessage(content="", tool_calls=[{"id": "call-src", "name": "source_tool",
+                                           "args": {"code": "600519"}}]),
+        AIMessage(content="资料见 https://Example.com/report.md 与 [公告](https://corp.example/x#a)。"),
+    ]))
+    client = enter_single_loop_client(TestClient(app_module.app, client=("127.0.0.1", 50051)))
+    response = client.post("/api/agent/run", json={
+        "threadId": "thread-src", "runId": "protocol-src", "state": {},
+        "messages": [{"id": "user-src", "role": "user", "content": "查"}],
+        "tools": [], "context": [],
+        "forwardedProps": {"runtime": {"model": {
+            "provider": "fixture", "baseURL": "https://example.com/v1", "model": "m"},
+            "threadRevision": 0}},
+    }, headers={"X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"})
+    assert response.status_code == 200, response.text
+    run = services.runs.list_documents()[0]
+    kinds = [(s.kind, getattr(s, "url", None) or getattr(s, "tool_call_id", None))
+             for s in run.sources]
+    assert ("tool_execution", "call-src") in kinds
+    assert ("model_url", "https://example.com/report.md") in kinds
+    assert ("model_url", "https://corp.example/x") in kinds
+    assert run.sources_truncated is False
+    tool_source = next(s for s in run.sources if s.kind == "tool_execution")
+    assert tool_source.verification == "executed_record"
+    assert tool_source.origin == "builtin"
+    assert "600519" in tool_source.arguments_summary
+    # pre-1D 兼容默认值
+    legacy = _pre_1d_run_payload()
+    legacy_run = RunDocument.model_validate(legacy)
+    assert legacy_run.sources == [] and legacy_run.sources_truncated is False
+
+
+def test_run_document_write_amplification_benchmark(tmp_path):
+    """最大合法 run 文档（20×6000 摘要 + 200×1000 来源）在约 3MB 保守上界内。"""
+    from agent.models import ModelUrlSource
+
+    paths = AgentPaths(tmp_path / "agent")
+    runs = RunStore(paths)
+    tool_summaries = [
+        {"id": f"call-{i}", "name": "t", "content": "x" * 6000} for i in range(20)
+    ]
+    sources = [
+        ModelUrlSource(id=f"source-{i}", kind="model_url",
+                       url=f"https://example.com/{i}/" + "p" * 60,
+                       created_at="2026-08-16T12:00:00Z").model_copy(
+            update={"_": None}) if False else
+        ModelUrlSource(id=f"source-{i}", kind="model_url",
+                       url=f"https://example.com/{i}/" + "p" * 60,
+                       created_at="2026-08-16T12:00:00Z")
+        for i in range(200)
+    ]
+    # 每个 model_url 来源的 summary 上限 1000 字符由 tool 来源覆盖：
+    tool_sources = [
+        {"id": f"source-t{i}", "kind": "tool_execution", "tool_call_id": f"c{i}",
+         "tool_name": "t", "origin": "builtin", "completed_at": "now",
+         "arguments_summary": "a" * 1000, "result_summary": "r" * 1000,
+         "verification": "executed_record"}
+        for i in range(200)
+    ]
+    run = RunDocument.start(
+        run_id="run-bench", thread_id="thread-bench", protocol_run_id="p",
+        model_ref=MODEL_REF, trigger_message_id="u", history_head_id=None, now=NOW,
+    ).model_copy(update={
+        "tool_summaries": tool_summaries,
+        "sources": tool_sources,
+        "budget_snapshot": {},
+    })
+    runs.replace(run)
+    encoded = (paths.runs / "run-bench.json").read_bytes()
+    assert len(encoded) < 3 * 1024 * 1024, len(encoded)
+    reloaded = runs.get("run-bench")
+    assert len(reloaded.sources) == 200

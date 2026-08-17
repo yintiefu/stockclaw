@@ -269,6 +269,13 @@ class RunControl:
             return "available"
         return "partial"
 
+    def note_sources_added(self, count: int) -> GovernanceView:
+        """短协调锁的 Source 提交路径：只递增 revision，不取 reservation_lock。"""
+        with self._counter_lock:
+            if count > 0:
+                self._control_revision += count
+            return self._view_locked()
+
     # ---- 终态 ----
 
     def mark_terminal(self, code: str, message: str = "") -> None:

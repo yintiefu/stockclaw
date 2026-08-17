@@ -137,6 +137,38 @@ class ContextTruncation(BaseModel):
     removed_turns: int | None = Field(default=None, ge=0)
 
 
+class ToolExecutionSource(BaseModel):
+    """已执行工具的来源记录（执行记录摘要，不是真实性认证）。"""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(min_length=1)
+    kind: Literal["tool_execution"]
+    tool_call_id: str = Field(min_length=1)
+    tool_name: str = Field(min_length=1)
+    origin: Literal["builtin", "skill", "mcp", "artifact"]
+    completed_at: str = Field(min_length=1)
+    arguments_summary: str = Field(default="", max_length=1000)
+    result_summary: str = Field(default="", max_length=1000)
+    verification: Literal["executed_record"] = "executed_record"
+
+
+class ModelUrlSource(BaseModel):
+    """模型提供的 URL：仅记录，绝不验证、抓取或评分。"""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(min_length=1)
+    kind: Literal["model_url"]
+    url: str = Field(min_length=1, max_length=2048)
+    label: str | None = Field(default=None, max_length=200)
+    created_at: str = Field(min_length=1)
+    verification: Literal["model_provided_unverified"] = "model_provided_unverified"
+
+
+SourceRecord = ToolExecutionSource | ModelUrlSource
+
+
 class RunUsage(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -173,6 +205,8 @@ class RunDocument(BaseModel):
     history_head_id: str | None = None
     usage: RunUsage = Field(default_factory=RunUsage)
     tool_summaries: list[dict[str, Any]] = Field(default_factory=list)
+    sources: list[SourceRecord] = Field(default_factory=list)
+    sources_truncated: bool = False
     error_code: str | None = None
     error_message: str | None = None
 

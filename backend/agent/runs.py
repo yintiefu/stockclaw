@@ -27,9 +27,15 @@ from agent.governance import (
     render_policy_explanation,
 )
 from agent.tool_executor import BoundedToolExecutor
+from agent.provenance import (
+    append_automatic_urls,
+    extract_model_urls,
+    summarize_tool_source,
+)
 from agent.runtime import AgentFactory, RuntimeHandle
 from agent.skills import SkillError
 from agent.policy import PolicyStore
+from agent.provenance import SOURCE_CAPACITY
 from agent.stores import DocumentNotFound, RevisionConflict, utc_now
 
 if TYPE_CHECKING:
@@ -317,7 +323,49 @@ class RunJournal:
             partial=partial,
             created_at=utc_now(),
         ))
+        # 完整非 partial 的 assistant 文本：按文本顺序提取 URL 来源（不验证、不评分）
+        if not partial and isinstance(buffer["content"], str) and buffer["content"]:
+            run_update: dict[str, Any] = {}
+            candidates = extract_model_urls(buffer["content"])
+            if candidates:
+                updated, truncated = append_automatic_urls(
+                    self._current_run().sources, candidates, now=utc_now())
+                if len(updated) != len(self._current_run().sources) or truncated:
+                    view = self._handle.control.note_sources_added(
+                        len(updated) - len(self._current_run().sources))
+                    run_update = {
+                        "sources": updated,
+                        "sources_truncated": truncated,
+                        "control_revision": view.control_revision,
+                    }
+            if run_update:
+                self._update_run(run_update)
         return [self._commit_thread("assistant_complete")]
+
+    def _origin_of(self, tool_name: str) -> str:
+        """按 lease 内工具的不可变元数据判定来源（无元数据按 builtin 兜底）。"""
+        lease = self._handle.capability_lease
+        if lease is not None:
+            for tool in lease.tools:
+                if tool.name == tool_name:
+                    origin = (getattr(tool, "metadata", None) or {}).get("vr_origin")
+                    if origin in ("builtin", "skill", "mcp", "artifact"):
+                        return origin
+                    return "builtin"
+        return "builtin"
+
+    def _append_sources(self, added: list, run_update: dict[str, Any]) -> None:
+        """Source 追加与 control_revision 递增并入同一 run 替换。"""
+        run = self._current_run()
+        sources = [*run.sources, *added]
+        truncated = run.sources_truncated
+        if len(sources) > SOURCE_CAPACITY:
+            truncated = True
+            sources = sources[:SOURCE_CAPACITY]
+        view = self._handle.control.note_sources_added(len(added))
+        run_update["sources"] = sources
+        run_update["sources_truncated"] = truncated
+        run_update["control_revision"] = view.control_revision
 
     def _commit_tool(self, event: Any) -> list[CommittedRevision]:
         # 模型协议：tool result 之前必须存在携带 tool_calls 的 assistant 请求消息
@@ -331,11 +379,33 @@ class RunJournal:
             created_at=utc_now(),
         ))
         call = self._tool_calls.get(event.tool_call_id) or {}
-        self._update_run({"tool_summaries": self._append_tool_summary({
+        run_update: dict[str, Any] = {"tool_summaries": self._append_tool_summary({
             "id": event.tool_call_id,
             "name": call.get("name", ""),
             "content": content,
-        })})
+        })}
+        # 完成并持久化的工具调用产生一条 tool_execution 来源（含结构化业务错误）
+        existing_ids = {s.tool_call_id for s in self._current_run().sources
+                        if s.kind == "tool_execution"}
+        if event.tool_call_id not in existing_ids:
+            try:
+                arguments = json.loads(call.get("args") or "{}")
+            except json.JSONDecodeError:
+                arguments = call.get("args")
+            try:
+                result_payload = json.loads(content)
+            except json.JSONDecodeError:
+                result_payload = content
+            source = summarize_tool_source({
+                "tool_call_id": event.tool_call_id,
+                "tool_name": call.get("name") or "",
+                "origin": self._origin_of(call.get("name") or ""),
+                "completed_at": utc_now(),
+                "args": arguments,
+                "result": result_payload,
+            })
+            self._append_sources([source], run_update)
+        self._update_run(run_update)
         commits.append(self._commit_thread("tool_complete"))
         return commits
 
@@ -1342,11 +1412,18 @@ class RunCoordinator:
         return self._lock(thread_id)
 
     async def _journal_write(self, thread_id: str, fn: Callable[["RunJournal"], Any]) -> list:
-        async with self._lock(thread_id):
-            handle = self._handles.get(thread_id)
-            if handle is None or handle.journal is None or handle.journal.closed:
-                return []  # 迟到事件：句柄已取消/关闭，直接丢弃
-            return await asyncio.to_thread(fn, handle.journal)
+        # 锁序不变量：artifact_mutation_lock 先于 coordinator thread lock；
+        # Source 提交在该短协调段内完成，绝不取 reservation_lock
+        handle = self._handles.get(thread_id)
+        if handle is None or handle.journal is None or handle.journal.closed:
+            return []  # 迟到事件：句柄已取消/关闭，直接丢弃
+        mutation_lock = handle.control.artifact_mutation_lock
+        async with mutation_lock:
+            async with self._lock(thread_id):
+                handle = self._handles.get(thread_id)
+                if handle is None or handle.journal is None or handle.journal.closed:
+                    return []
+                return await asyncio.to_thread(fn, handle.journal)
 
     async def journal_observe(self, thread_id: str, event: Any) -> list[CommittedRevision]:
         return await self._journal_write(thread_id, lambda journal: journal.observe(event))
