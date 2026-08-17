@@ -264,3 +264,59 @@ def test_message_history_excludes_partial_and_pending(tmp_path):
     })
     threads.create(doc)
     assert [m.id for m in threads.get("th-1").model_history()] == ["u1", "t1"]
+
+
+# ---- 1D：分页历史 run 读取 ----
+
+def _seed_runs(paths, thread_id="thread-page", other="thread-other", count=5):
+    runs = RunStore(paths)
+    ref = ModelRef(provider="fixture", base_url="https://example.com/v1", model="m")
+    made = []
+    for i in range(count):
+        run = RunDocument.start(
+            run_id=f"run-p{i}", thread_id=thread_id, protocol_run_id=f"protocol-p{i}",
+            model_ref=ref, trigger_message_id="u", history_head_id=None,
+            now=f"2026-08-1{i}T12:00:0{i}Z")
+        runs.replace(run)
+        made.append(run)
+    other_run = RunDocument.start(
+        run_id="run-other", thread_id=other, protocol_run_id="protocol-other",
+        model_ref=ref, trigger_message_id="u", history_head_id=None,
+        now="2026-08-15T12:00:00Z")
+    runs.replace(other_run)
+    return runs, made
+
+
+def test_page_for_thread_orders_desc_and_pages_with_cursor(tmp_path):
+    paths = AgentPaths(tmp_path / "agent")
+    runs, made = _seed_runs(paths)
+    page = runs.page_for_thread("thread-page", limit=2)
+    assert [r.id for r in page.runs] == ["run-p4", "run-p3"]
+    assert page.next_before == "run-p3"
+    second = runs.page_for_thread("thread-page", limit=2, before="run-p3")
+    assert [r.id for r in second.runs] == ["run-p2", "run-p1"]
+    assert second.next_before == "run-p1"  # 还有第三页
+    third = runs.page_for_thread("thread-page", limit=2, before="run-p1")
+    assert [r.id for r in third.runs] == ["run-p0"]
+    assert third.next_before is None
+
+
+def test_page_for_thread_rejects_foreign_cursor(tmp_path):
+    paths = AgentPaths(tmp_path / "agent")
+    runs, _ = _seed_runs(paths)
+    with pytest.raises(ValueError):
+        runs.page_for_thread("thread-page", limit=2, before="run-other")
+
+
+def test_page_for_thread_reports_scan_warnings_once(tmp_path):
+    paths = AgentPaths(tmp_path / "agent")
+    runs, _ = _seed_runs(paths)
+    corrupt = paths.runs / "run-corrupt.json"
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    corrupt.write_text("{broken", encoding="utf-8")
+    page = runs.page_for_thread("thread-page", limit=10)
+    assert [r.id for r in page.runs][0] == "run-p4"
+    assert any("run-corrupt" in w.filename for w in page.warnings)
+    # 轻量字段：绝不包含消息/工具摘要/密钥
+    assert set(page.runs[0].model_dump()) == {
+        "id", "status", "started_at", "updated_at", "ended_at", "retry_of", "error_code"}

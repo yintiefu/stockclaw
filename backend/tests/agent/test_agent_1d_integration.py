@@ -343,3 +343,47 @@ def test_usage_counts_come_from_persisted_reservations_not_events(services, clie
                if e["type"] == "CUSTOM" and e.get("name") == "budget.updated"]
     assert budgets[-1]["usage"]["model_calls"] == 1
     assert budgets[-1]["controlRevision"] == run.control_revision
+
+
+# ---- 1D Task 8：历史 run REST 与治理错误身份 ----
+
+
+def test_run_list_rest_contract(services, client, monkeypatch):
+    monkeypatch.setattr("agent.router.build_chat_model",
+                        lambda ref, sec: ScriptedChatModel([AIMessage(content="答")]))
+    for i in range(3):
+        response = client.post("/api/agent/run", json=start_payload(
+            thread_id=f"thread-list-{i}", run_id=f"protocol-list-{i}"), headers=HEADERS)
+        assert response.status_code == 200
+
+    listed = client.get("/api/agent/threads/thread-list-0/runs")
+    assert listed.status_code == 200
+    payload = listed.json()
+    assert len(payload["runs"]) == 1
+    item = payload["runs"][0]
+    assert set(item) == {"id", "status", "started_at", "updated_at",
+                         "ended_at", "retry_of", "error_code"}
+    assert payload["next_before"] is None
+
+    # 越界 limit → 422；跨线程 cursor → 400
+    assert client.get("/api/agent/threads/thread-list-0/runs?limit=0").status_code == 422
+    assert client.get("/api/agent/threads/thread-list-0/runs?limit=101").status_code == 422
+    foreign = client.get("/api/agent/threads/thread-list-0/runs?before=run-of-other")
+    assert foreign.status_code == 400
+    assert foreign.json()["code"] == "RUN_CURSOR_INVALID"
+
+
+def test_governance_error_code_preserved_in_run_and_event(services, client, monkeypatch):
+    monkeypatch.setattr("agent.router.build_chat_model",
+                        lambda ref, sec: scripted_tool_rounds(8))
+    response = client.post("/api/agent/run", json=start_payload(), headers=HEADERS)
+    assert response.status_code == 200
+    run = services.runs.list_documents()[0]
+    assert run.status == "failed"
+    assert run.error_code == "MODEL_CALL_LIMIT_EXCEEDED"
+    events = parse_sse(response.text)
+    run_error = [e for e in events if e["type"] == "RUN_ERROR"][0]
+    assert run_error["code"] == "MODEL_CALL_LIMIT_EXCEEDED"
+    # 不再有 slice-2 之前不存在的 sources 事件
+    assert not [e for e in events if e.get("name") == "sources.updated"]
+    assert not [e for e in events if e.get("name") == "artifact.created"]

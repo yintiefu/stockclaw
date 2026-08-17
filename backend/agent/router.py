@@ -49,6 +49,7 @@ from agent.stores import (
     InvalidDocumentId,
     RecoveryWarning,
     RevisionConflict,
+    RunListItem,
     RunStore,
     ThreadStore,
     default_agent_root,
@@ -172,8 +173,8 @@ def _conflict_response(code: str, detail: str, *, thread_id: str | None = None,
     })
 
 
-def _error_event(message: str) -> RunErrorEvent:
-    return RunErrorEvent(message=message, code="AGENT_RUN_FAILED")
+def _error_event(message: str, code: str = "AGENT_RUN_FAILED") -> RunErrorEvent:
+    return RunErrorEvent(message=message, code=code)
 
 
 def _budget_frame(thread_id: str, product_run_id: str | None, control, view) -> str | None:
@@ -526,9 +527,10 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
             services.coordinator.cancel_sync(thread_id)
         except Exception as exc:
             message = str(exc).replace(model_key, "[redacted]")[:1000]
+            error_code = getattr(exc, "code", None) or "AGENT_RUN_FAILED"
             try:
                 commits = await _commit_or_fail(
-                    lambda: services.coordinator.journal_terminal(thread_id, "failed", "AGENT_RUN_FAILED", message)
+                    lambda: services.coordinator.journal_terminal(thread_id, "failed", error_code, message)
                 )
                 for commit in commits:
                     yield encoder.encode(thread_revision_updated(commit.thread_id, commit.revision, commit.persisted_at))
@@ -542,7 +544,7 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                     message=f"运行状态未能持久化，本地历史可能不完整：{message}",
                     code="PERSISTENCE_FAILED",
                 ))
-            yield encoder.encode(_error_event(message))
+            yield encoder.encode(_error_event(message, error_code))
             terminal = "failed"
         finally:
             if terminal != "awaiting_approval":
@@ -706,6 +708,32 @@ async def cancel_run(run_id: str):
     await services.coordinator.cancel_run(run.thread_id, run.id)
     refreshed = await asyncio.to_thread(services.runs.get, run_id)
     return refreshed.model_dump(mode="json")
+
+
+class RunListResponse(BaseModel):
+    runs: list[RunListItem]
+    next_before: str | None = None
+    warnings: list[RecoveryWarningResponse]
+
+
+@router.get("/threads/{thread_id}/runs", response_model=None)
+async def list_thread_runs(
+    thread_id: str,
+    limit: int = Query(50, ge=1, le=100),
+    before: str | None = Query(None),
+):
+    try:
+        page = await asyncio.to_thread(
+            services.runs.page_for_thread, thread_id, limit=limit, before=before)
+    except ValueError as exc:
+        return _error_response("RUN_CURSOR_INVALID", str(exc), 400)
+    return RunListResponse(
+        runs=page.runs,
+        next_before=page.next_before,
+        warnings=[RecoveryWarningResponse(
+            code=w.code, document_type=w.document_type, filename=w.filename)
+            for w in page.warnings],
+    )
 
 
 @router.get("/runs/{run_id}")

@@ -250,6 +250,39 @@ class ThreadStore:
             return updated
 
 
+@dataclass(frozen=True)
+class RunPage:
+    """一次文件系统观察产出的分页结果（文档与告警同源）。"""
+
+    runs: list["RunListItem"]
+    next_before: str | None
+    warnings: list[RecoveryWarning]
+
+
+class RunListItem(BaseModel):
+    """历史 run 轻量摘要：不含消息、工具摘要、Source 或任何密钥。"""
+
+    id: str
+    status: str
+    started_at: str
+    updated_at: str
+    ended_at: str | None = None
+    retry_of: str | None = None
+    error_code: str | None = None
+
+    @classmethod
+    def from_run(cls, run: RunDocument) -> "RunListItem":
+        return cls(
+            id=run.id,
+            status=run.status,
+            started_at=run.started_at,
+            updated_at=run.updated_at,
+            ended_at=run.ended_at,
+            retry_of=run.retry_of,
+            error_code=run.error_code,
+        )
+
+
 class RunStore:
     def __init__(self, paths: AgentPaths):
         self._docs: _JsonDocuments[RunDocument] = _JsonDocuments(RunDocument, paths.runs, "run")
@@ -268,6 +301,25 @@ class RunStore:
 
     def scan(self) -> ScanResult[RunDocument]:
         return self._docs.scan()
+
+    def page_for_thread(self, thread_id: str, *, limit: int = 50,
+                        before: str | None = None) -> RunPage:
+        """按 (started_at, id) 倒序分页；before 必须是同 thread 的 run ID。
+
+        单次 scan 同时产出文档与告警（同一文件系统观察）。
+        """
+        result = self.scan()
+        runs = [r for r in result.documents if r.thread_id == thread_id]
+        if before is not None:
+            anchor = next((r for r in runs if r.id == before), None)
+            if anchor is None:
+                raise ValueError(f"before 游标 {before!r} 不属于线程 {thread_id}")
+            runs = [r for r in runs if (r.started_at, r.id) < (anchor.started_at, anchor.id)]
+        runs.sort(key=lambda r: (r.started_at, r.id), reverse=True)
+        page = runs[:limit]
+        next_before = page[-1].id if len(runs) > limit and page else None
+        return RunPage(runs=[RunListItem.from_run(r) for r in page],
+                       next_before=next_before, warnings=result.warnings)
 
     def find_by_protocol_run_id(self, protocol_run_id: str) -> RunDocument | None:
         return next(
