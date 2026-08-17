@@ -66,6 +66,7 @@ from agent.mcp import (
     StdioTrustRequired,
 )
 from agent.skills import SkillError, SkillImporter, SkillRegistry, SkillResourceForbidden, SkillUnavailable
+from agent.tool_executor import BoundedToolExecutor
 from agent.tool_registry import build_builtin_tools
 
 router = APIRouter(prefix="/api/agent")
@@ -81,6 +82,8 @@ class AgentServices:
     importer: SkillImporter
     registry: McpRegistry
     policy: PolicyStore
+    executor: BoundedToolExecutor
+    builtin_serial_lock: asyncio.Lock
 
 
 def build_services(root: Path | None = None) -> AgentServices:
@@ -93,6 +96,8 @@ def build_services(root: Path | None = None) -> AgentServices:
     allowances = AllowanceRegistry()
     registry = McpRegistry.for_root(paths.root, allowances)
     policy = PolicyStore(paths.policy)
+    executor = BoundedToolExecutor()
+    builtin_serial_lock = asyncio.Lock()
 
     def _run_tools(skill_tools=()):
         # 测试接缝：1A/1B 通过 monkeypatch agent.router.build_builtin_tools 注入
@@ -105,7 +110,8 @@ def build_services(root: Path | None = None) -> AgentServices:
         middleware_provider=lambda: build_middleware(),
         allowances=allowances,
     )
-    return AgentServices(paths, threads, runs, coordinator, skills, importer, registry, policy)
+    return AgentServices(paths, threads, runs, coordinator, skills, importer, registry,
+                         policy, executor, builtin_serial_lock)
 
 
 services = build_services()
@@ -1086,6 +1092,11 @@ async def startup_agent_services() -> None:
 
 
 async def shutdown_agent_services() -> None:
-    await services.coordinator.shutdown()
+    current = services
+    # 1D 停机顺序：先原子拒绝新的同步工具准入，再取消/持久化运行与关闭 MCP，
+    # 最后关闭执行器本身（不等待仍在运行的第三方代码）。
+    current.executor.begin_shutdown()
+    await current.coordinator.shutdown()
     # coordinator lease 释放后排空 MCP 会话
-    await services.registry.shutdown()
+    await current.registry.shutdown()
+    current.executor.shutdown()
