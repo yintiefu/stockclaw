@@ -136,3 +136,60 @@ async def test_resume_uses_empty_messages_new_graph_and_new_adapter():
     assert exc.value.code == "RUN_CONFIG_MISMATCH"
     assert builder_called is False
     assert_secret_absent(SENTINEL, exc.value, saver.storage, handle.snapshot)
+
+
+async def test_resume_rebuilds_same_governance_wrapper_and_control(tmp_path):
+    """1D：resume 重建 Graph 时闭包同一个 RunControl，治理计数跨 resume 连续。"""
+    from agent.governance import ContextAndModelGovernance
+    from agent.runs import RunCoordinator
+    from agent.stores import AgentPaths, RunStore, ThreadStore
+    from ag_ui.core.types import UserMessage
+
+    paths = AgentPaths(tmp_path / "agent")
+    threads = ThreadStore(paths)
+    runs = RunStore(paths)
+
+    class Builder:
+        def __call__(self, model_ref, secrets):
+            return ScriptedChatModel([AIMessage(content="answer")])
+
+    coordinator = RunCoordinator(factory=AgentFactory(), threads=threads, runs=runs)
+    admission = await coordinator.acquire_start(
+        model_ref=ModelRef(provider="fixture", baseURL="https://example.com/v1", model="fixture-model"),
+        secrets=RunSecrets.model_validate({"model_api_key": "request-only-key"}),
+        model_builder=Builder(),
+        tools=[],
+        thread_id="thread-governance",
+        middleware=(),
+        protocol_run_id="protocol-1",
+        messages=[UserMessage(id="user-1", content="问")],
+        client_revision=0,
+    )
+    handle = coordinator.active("thread-governance")
+    control = handle.control
+    await control.reserve_model(_noop_persist)
+    factory = handle.runtime.middleware_factory
+    secrets = RunSecrets.model_validate({"model_api_key": "request-only-key"})
+    middleware = factory(secrets)
+    assert isinstance(middleware[0], ContextAndModelGovernance)
+    assert middleware[0].control is control
+    # resume 后同一个 control 继续服务新构建的中间件
+    await coordinator.mark_awaiting_approval("thread-governance")
+    await coordinator.acquire_resume(
+        "thread-governance",
+        model_ref=ModelRef(provider="fixture", baseURL="https://example.com/v1", model="fixture-model"),
+        secrets=secrets,
+        model_builder=Builder(),
+        validate=lambda pending: ({}, []),
+        client_revision=handle.thread_revision,
+        protocol_run_id="protocol-2",
+    )
+    rebuilt = handle.runtime.middleware_factory(secrets)
+    assert rebuilt[0].control is control
+    assert handle.control is control
+    await coordinator.finish_if_terminal("thread-governance", "completed")
+
+
+async def _noop_persist(view):
+    import asyncio
+    await asyncio.sleep(0)

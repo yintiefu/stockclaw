@@ -19,6 +19,23 @@ from agent.stores import AgentPaths, RevisionConflict, RunStore, ThreadStore, ut
 from tests.agent.fakes import ScriptedChatModel
 
 NOW = "2026-08-15T12:00:00Z"
+
+
+def single_loop_client(addr):
+    """1D：同一测试内的多次请求共享一个事件循环（等价单 worker 生产进程）。"""
+    from tests.agent.conftest import enter_single_loop_client
+    return enter_single_loop_client(TestClient(app_module.app, client=addr))
+
+
+async def drive_full(app, payload) -> tuple[int, str]:
+    """在当前事件循环上完整驱动一次 /run（连接保持、收完整 SSE）。"""
+    task, sent, _ = await drive_asgi(app, payload, mode="hold")
+    await asyncio.wait_for(task, timeout=10)
+    status = next((m["status"] for m in sent if m["type"] == "http.response.start"), None)
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return status, body.decode("utf-8", "ignore")
+
+
 MODEL_REF = ModelRef(provider="fixture", baseURL="https://example.com/v1", model="fixture-model")
 SECRETS = RunSecrets.model_validate({"model_api_key": "request-only-key"})
 
@@ -321,7 +338,7 @@ def http(tmp_path, monkeypatch):
     monkeypatch.setattr(router_module, "services", services)
     monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [journal_tool])
     monkeypatch.setattr("agent.router.build_middleware", lambda: ())
-    client = TestClient(app_module.app, client=("127.0.0.1", 50010))
+    client = single_loop_client(("127.0.0.1", 50010))
     return client, services
 
 
@@ -504,12 +521,11 @@ async def test_disconnect_persists_partial_then_excludes_from_next_input(tmp_pat
         "agent.router.build_chat_model",
         lambda ref, sec: RecordingModel([AIMessage(content="下一轮回答")]),
     )
-    client = TestClient(app_module.app, client=("127.0.0.1", 50012))
-    resp = client.post("/api/agent/run", json=start_payload_json(
+    status, text = await drive_full(app_module.app, start_payload_json(
         thread_id="thread-disc", run_id="protocol-disc-2", content="继续", user_id="user-disc-2",
         revision=thread.revision, prefix=[("user-http", "hello")],
-    ), headers={"X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"})
-    assert resp.status_code == 200, resp.text
+    ))
+    assert status == 200, text
     model_input_ids = [getattr(m, "id", None) for m in RECORDED_INPUTS[-1]]
     assert all(p.id not in model_input_ids for p in partials)
 
@@ -601,7 +617,7 @@ async def test_retry_creates_new_product_run_without_duplicate_user_message(tmp_
         "agent.router.build_chat_model",
         lambda ref, sec: ScriptedChatModel([]),  # 空脚本 → 模型异常
     )
-    client = TestClient(app_module.app, client=("127.0.0.1", 50013))
+    client = single_loop_client(("127.0.0.1", 50013))
     failed = client.post("/api/agent/run", json=start_payload_json(thread_id="thread-retry", run_id="protocol-retry-1"), headers={
         "X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"})
     assert failed.status_code == 200 and "RUN_ERROR" in failed.text
@@ -639,7 +655,7 @@ async def test_retry_rejections_are_409_with_structured_body(tmp_path, monkeypat
     monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [])
     monkeypatch.setattr("agent.router.build_middleware", lambda: ())
     monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: PausingChatModel([AIMessage(content="ok")]))
-    client = TestClient(app_module.app, client=("127.0.0.1", 50014))
+    client = single_loop_client(("127.0.0.1", 50014))
     hdrs = {"X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"}
     ok = client.post("/api/agent/run", json=start_payload_json(thread_id="thread-r2", run_id="protocol-r2-1"), headers=hdrs)
     assert ok.status_code == 200
@@ -697,7 +713,7 @@ def test_retry_without_revision_is_invalid_runtime_props(tmp_path, monkeypatch):
     monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [])
     monkeypatch.setattr("agent.router.build_middleware", lambda: ())
     monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: ScriptedChatModel([]))
-    client = TestClient(app_module.app, client=("127.0.0.1", 50015))
+    client = single_loop_client(("127.0.0.1", 50015))
     payload = retry_payload("thread-r3", "protocol-r3", None, "run-missing")
     resp = client.post("/api/agent/run", json=payload, headers={
         "X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"})
@@ -712,7 +728,7 @@ async def test_lost_revision_event_converges_via_409_without_duplicate_write(tmp
     monkeypatch.setattr("agent.router.build_builtin_tools", lambda: [])
     monkeypatch.setattr("agent.router.build_middleware", lambda: ())
     monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: PausingChatModel([AIMessage(content="ok")]))
-    client = TestClient(app_module.app, client=("127.0.0.1", 50016))
+    client = single_loop_client(("127.0.0.1", 50016))
     hdrs = {"X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"}
     ok = client.post("/api/agent/run", json=start_payload_json(thread_id="thread-cv", run_id="protocol-cv-1"), headers=hdrs)
     assert ok.status_code == 200
@@ -741,7 +757,7 @@ async def test_full_lifecycle_create_partial_retry_restart_next_turn(tmp_path, m
     revisions_seen: list[int] = []
 
     # 1) 创建线程
-    client = TestClient(app_module.app, client=("127.0.0.1", 50020))
+    client = single_loop_client(("127.0.0.1", 50020))
     created = client.post("/api/agent/threads", json={"title": "生命周期"})
     assert created.status_code == 201
     thread_id = created.json()["id"]
@@ -782,11 +798,11 @@ async def test_full_lifecycle_create_partial_retry_restart_next_turn(tmp_path, m
         "agent.router.build_chat_model",
         lambda ref, sec: RecordingModel([AIMessage(content="重试后的完整回答")]),
     )
-    retry = client.post("/api/agent/run", json=retry_payload(
+    retry_status, retry_text = await drive_full(app_module.app, retry_payload(
         thread_id, "protocol-life-retry", thread.revision, cancelled_run.id,
-    ), headers=hdrs)
-    assert retry.status_code == 200, retry.text
-    for event in parse_sse(retry.text):
+    ))
+    assert retry_status == 200, retry_text
+    for event in parse_sse(retry_text):
         if event.get("type") == "CUSTOM" and event.get("name") == "thread.revision.updated":
             revisions_seen.append(json.loads(event["value"])["revision"])
 
@@ -824,11 +840,11 @@ async def test_full_lifecycle_create_partial_retry_restart_next_turn(tmp_path, m
         prefix_messages.append(entry)
     body = payload("protocol-life-2", "下一轮问题", "user-life-2", thread.revision, [])
     body["messages"] = [*prefix_messages, {"id": "user-life-2", "role": "user", "content": "下一轮问题"}]
-    next_resp = client.post("/api/agent/run", json=body, headers=hdrs)
-    assert next_resp.status_code == 200, next_resp.text
+    next_status, next_text = await drive_full(app_module.app, body)
+    assert next_status == 200, next_text
     model_ids = [getattr(m, "id", None) for m in RECORDED_INPUTS[-1]]
     assert all(p.id not in model_ids for p in partials)
-    for event in parse_sse(next_resp.text):
+    for event in parse_sse(next_text):
         if event.get("type") == "CUSTOM" and event.get("name") == "thread.revision.updated":
             revisions_seen.append(json.loads(event["value"])["revision"])
 
@@ -852,7 +868,7 @@ def test_retry_input_excludes_failed_runs_own_outputs(tmp_path, monkeypatch):
             AIMessage(content="", tool_calls=[{"id": "call-x", "name": "journal_tool", "args": {"code": "1"}}]),
         ]),
     )
-    client = TestClient(app_module.app, client=("127.0.0.1", 50030))
+    client = single_loop_client(("127.0.0.1", 50030))
     hdrs = {"X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"}
     failed = client.post("/api/agent/run", json=start_payload_json(thread_id="thread-rx", run_id="protocol-rx-1"), headers=hdrs)
     assert failed.status_code == 200 and "RUN_ERROR" in failed.text

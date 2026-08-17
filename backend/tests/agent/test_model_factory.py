@@ -56,3 +56,31 @@ def test_handle_never_stores_real_model_key(monkeypatch):
     assert secret not in rendered
     handle.release_graph()
     assert handle.graph is None and handle.model is None
+
+
+def test_compose_system_prompt_orders_neutrality_policy_catalog():
+    from agent.runtime import compose_system_prompt
+
+    prompt = compose_system_prompt("POLICY-EXPLANATION", "\n\n## 用户已启用的 Skill")
+    assert prompt.index("Agent 工作台") < prompt.index("POLICY-EXPLANATION") < prompt.index("用户已启用的 Skill")
+
+
+def test_create_and_resume_keep_policy_explanation_on_handle(monkeypatch):
+    from agent.runtime import AgentFactory
+
+    monkeypatch.setattr(chat, "_check_base_url", lambda value: None)
+    ref = ModelRef(provider="openai", base_url="https://api.openai.com/v1", model="gpt-5-mini")
+    factory = AgentFactory()
+    handle = factory.create(
+        model_ref=ref,
+        secrets=RunSecrets(model_api_key="k"),
+        model_builder=build_chat_model,
+        tools=[],
+        thread_id="thread-policy",
+        policy_explanation="POLICY-EXPLANATION",
+    )
+    assert handle.policy_explanation == "POLICY-EXPLANATION"
+    factory.resume(handle=handle, model_ref=ref, secrets=RunSecrets(model_api_key="k"),
+                   model_builder=build_chat_model)
+    assert handle.policy_explanation == "POLICY-EXPLANATION"
+    handle.release_graph()

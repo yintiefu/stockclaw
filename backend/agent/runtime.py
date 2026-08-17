@@ -73,6 +73,8 @@ class RuntimeHandle:
     # 请求级中间件工厂：resume 时用新 RunSecrets 重建（本句柄绝不保存已构建中间件或密钥）
     middleware_factory: Callable[[RunSecrets], tuple[Any, ...]] | None = None
     system_context: str = ""
+    # 1D：由 run 的 PolicySnapshot 推导的治理说明；resume 重建 Graph 时复用同一份
+    policy_explanation: str = ""
     graph: Any | None = None
     # 注意：不保存 model 引用。运行期间 Graph 内部持有模型（spec 允许），
     # 但 handle/coordinator 上不得保留独立的密钥载体（spec：原始 key 不得进入 ActiveRunHandle）。
@@ -133,6 +135,14 @@ class RuntimeHandle:
         self.model = None
 
 
+def compose_system_prompt(policy_explanation: str = "", system_context: str = "") -> str:
+    """顺序固定：中立提示 → Policy 说明（run 快照推导）→ Skill 目录。"""
+    base = chat.SYSTEM_PROMPT.format(context="Agent 工作台")
+    if policy_explanation and not policy_explanation.startswith("\n"):
+        policy_explanation = "\n\n" + policy_explanation.lstrip("\n")
+    return base + policy_explanation + system_context
+
+
 class AgentFactory:
     def create(
         self,
@@ -146,6 +156,7 @@ class AgentFactory:
         middleware: Sequence[Any] = (),
         system_context: str = "",
         middleware_factory: Callable[[RunSecrets], tuple[Any, ...]] | None = None,
+        policy_explanation: str = "",
     ) -> RuntimeHandle:
         model = model_builder(model_ref, secrets)
         saver = checkpointer or MemorySaver()
@@ -155,7 +166,7 @@ class AgentFactory:
         graph = create_agent(
             model,
             tools=list(tools),
-            system_prompt=chat.SYSTEM_PROMPT.format(context="Agent 工作台") + system_context,
+            system_prompt=compose_system_prompt(policy_explanation, system_context),
             middleware=list(middleware_factory(secrets)),
             checkpointer=saver,
         )
@@ -166,6 +177,7 @@ class AgentFactory:
             tools=tuple(tools),
             middleware_factory=middleware_factory,
             system_context=system_context,
+            policy_explanation=policy_explanation,
             graph=graph,
         )
 
@@ -183,12 +195,13 @@ class AgentFactory:
                 f"{RunConfigMismatch.code}: resume model config differs from the active thread"
             )
         model = model_builder(model_ref, secrets)
-        # 从当前请求的密钥重建请求级中间件（新 guard / HITL 实例，不复用旧对象）
+        # 从当前请求的密钥重建请求级中间件（新 guard / HITL 实例，不复用旧对象）；
+        # 治理中间件工厂闭包同一个 RunControl，resume 后计数/快照连续
         factory = handle.middleware_factory or (lambda secrets: ())
         handle.graph = create_agent(
             model,
             tools=list(handle.tools),
-            system_prompt=chat.SYSTEM_PROMPT.format(context="Agent 工作台") + handle.system_context,
+            system_prompt=compose_system_prompt(handle.policy_explanation, handle.system_context),
             middleware=list(factory(secrets)),
             checkpointer=handle.checkpointer,
         )

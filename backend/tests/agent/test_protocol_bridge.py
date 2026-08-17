@@ -121,3 +121,76 @@ def test_all_cancelled_is_steer_away_and_never_a_hitl_decision():
     assert bridge.is_steer_away(entries) is True
     with pytest.raises(ValueError):
         bridge.resume_value(entries)
+
+
+# ---- 1D：budget.updated 白名单与载荷校验 ----
+
+
+def budget_payload(**overrides) -> dict:
+    payload = {
+        "threadId": "thread-1",
+        "runId": "run-1",
+        "controlRevision": 12,
+        "budgetSnapshot": {
+            "policy_revision": 1,
+            "max_model_calls": 8,
+            "max_tool_calls": 16,
+            "tool_timeout_seconds": 30,
+            "max_active_seconds": 300,
+            "max_context_chars": 120000,
+        },
+        "usage": {"model_calls": 2, "tool_calls": 1, "input_tokens": 10,
+                  "output_tokens": 5, "total_tokens": 15, "token_status": "available"},
+        "activeElapsedMs": 3100,
+        "contextTruncation": {"occurred": False},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_budget_updated_string_payload_passes_with_canonical_value():
+    bridge = AgentProtocolBridge("thread-1", "run-1")
+    out = bridge.convert(CustomEvent(
+        type=EventType.CUSTOM, name="budget.updated",
+        value=json.dumps(budget_payload(), ensure_ascii=False)))
+    assert len(out) == 1
+    assert out[0].name == "budget.updated"
+    assert json.loads(out[0].value) == budget_payload()
+    assert isinstance(out[0], CustomEvent)
+
+
+def test_budget_updated_dict_payload_is_accepted_and_reencoded():
+    bridge = AgentProtocolBridge("thread-1", "run-1")
+    out = bridge.convert(CustomEvent(
+        type=EventType.CUSTOM, name="budget.updated", value=budget_payload()))
+    assert len(out) == 1
+    assert json.loads(out[0].value) == budget_payload()
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda p: {k: v for k, v in p.items() if k != "controlRevision"},
+    lambda p: {**p, "controlRevision": -1},
+    lambda p: {**p, "surprise": True},
+    lambda p: {**p, "usage": {"model_calls": -1}},
+    lambda p: {**p, "usage": {"token_status": "bogus"}},
+    lambda p: {**p, "budgetSnapshot": {"max_model_calls": 8}},  # 快照缺字段
+])
+def test_budget_updated_malformed_payload_fails_closed(mutation):
+    bridge = AgentProtocolBridge("thread-1", "run-1")
+    out = bridge.convert(CustomEvent(
+        type=EventType.CUSTOM, name="budget.updated",
+        value=json.dumps(mutation(budget_payload()))))
+    assert len(out) == 1
+    assert out[0].code == "INVALID_CUSTOM_EVENT"
+
+
+def test_budget_updated_non_object_payload_fails_closed():
+    bridge = AgentProtocolBridge("thread-1", "run-1")
+    out = bridge.convert(CustomEvent(type=EventType.CUSTOM, name="budget.updated", value="[]"))
+    assert out[0].code == "INVALID_CUSTOM_EVENT"
+
+
+def test_other_custom_events_remain_unsupported():
+    bridge = AgentProtocolBridge("thread-1", "run-1")
+    out = bridge.convert(CustomEvent(type=EventType.CUSTOM, name="budget.refreshed", value="{}"))
+    assert out[0].code == "UNSUPPORTED_CUSTOM_EVENT"

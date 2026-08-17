@@ -18,7 +18,13 @@ from agent.capabilities import (
     CapabilityResolver,
     StaticCapabilityLease,
 )
-from agent.governance import DEFAULT_POLICY_SNAPSHOT, GovernanceView, RunControl
+from agent.governance import (
+    DEFAULT_POLICY_SNAPSHOT,
+    ContextAndModelGovernance,
+    GovernanceView,
+    RunControl,
+    render_policy_explanation,
+)
 from agent.runtime import AgentFactory, RuntimeHandle
 from agent.skills import SkillError
 from agent.stores import DocumentNotFound, RevisionConflict, utc_now
@@ -431,6 +437,27 @@ class RunCoordinator:
         )
         return ActiveRunHandle(runtime=placeholder, phase="running")
 
+    # ---- 1D：治理控制与请求级中间件组合 ----
+
+    def _new_run_control(self) -> RunControl:
+        # Task 7 起从 PolicyStore 读取最新快照；当前使用与 Policy 默认值一致的快照
+        return RunControl(DEFAULT_POLICY_SNAPSHOT)
+
+    def _governed_middleware_factory(self, lease: CapabilityLease, control: RunControl,
+                                     thread_id: str, run_id: str):
+        """每个请求重建：治理中间件（闭包同一 control）+ lease 的 MCP guard/HITL。"""
+        async def persist(view: GovernanceView) -> None:
+            await self.persist_control_view(thread_id, view)
+
+        def factory(secrets):
+            return (
+                ContextAndModelGovernance(
+                    control, persist=persist, thread_id=thread_id, run_id=run_id),
+                *lease.build_request_middleware(secrets),
+            )
+
+        return factory
+
 
     # ---- 1C：两阶段能力准入 ----
 
@@ -693,6 +720,7 @@ class RunCoordinator:
 
         # 4) 创建产品 run 并写入 running 状态
         run_id = f"run-{uuid4().hex}"
+        control = self._new_run_control()
         run = RunDocument.start(
             run_id=run_id,
             thread_id=thread_id,
@@ -733,7 +761,9 @@ class RunCoordinator:
                 tools=lease.tools,
                 thread_id=thread_id,
                 system_context=lease.system_context,
-                middleware_factory=lease.build_request_middleware,
+                middleware_factory=self._governed_middleware_factory(
+                    lease, control, thread_id, run_id),
+                policy_explanation=render_policy_explanation(control.snapshot),
             )
         except Exception:
             # 持久化已成功：run 终态 failed、线程摘要修复；用户消息保留
@@ -763,6 +793,7 @@ class RunCoordinator:
             trigger_message_id=new_message.id,
             history_snapshot=tuple(model_history),
             capability_lease=lease,
+            control=control,
         )
         # 7) 持久化成功后才安装句柄（并挂上语义边界日志）
         handle.journal = RunJournal(threads=threads, runs=runs, handle=handle)
@@ -1058,6 +1089,7 @@ class RunCoordinator:
 
                 run_id = f"run-{uuid4().hex}"
                 now = utc_now()
+                control = self._new_run_control()
                 run = RunDocument.start(
                     run_id=run_id,
                     thread_id=thread_id,
@@ -1087,7 +1119,9 @@ class RunCoordinator:
                         tools=lease.tools,
                         thread_id=thread_id,
                         system_context=lease.system_context,
-                        middleware_factory=lease.build_request_middleware,
+                        middleware_factory=self._governed_middleware_factory(
+                            lease, control, thread_id, run_id),
+                        policy_explanation=render_policy_explanation(control.snapshot),
                     )
 
                 try:
@@ -1120,6 +1154,7 @@ class RunCoordinator:
                     trigger_message_id=target.trigger_message_id,
                     history_snapshot=tuple(retry_history),
                     capability_lease=lease,
+                    control=control,
                 )
                 handle.journal = RunJournal(threads=threads, runs=runs, handle=handle)
                 self._handles[thread_id] = handle

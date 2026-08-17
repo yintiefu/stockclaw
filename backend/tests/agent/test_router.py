@@ -31,6 +31,15 @@ def make_client(host: str = "127.0.0.1") -> TestClient:
 
 client = make_client()
 
+
+@pytest.fixture(autouse=True)
+def _shared_client_single_loop():
+    """1D：治理线程锁竞争绑定事件循环；共享客户端必须整测试驻留一个环。"""
+    from tests.agent.conftest import enter_single_loop_client
+    enter_single_loop_client(client)
+
+
+
 HEADERS = {"X-VR-Agent-Model-Key": "request-only-key", "Accept": "text/event-stream"}
 
 START = {
@@ -445,10 +454,15 @@ def test_resume_model_mismatch_returns_409(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_concurrent_resume_is_atomic(monkeypatch):
-    """两个并发 resume 只能有一个成功（单锁原子迁移）。"""
-    import httpx
+    """两个并发 resume 只能有一个成功（单锁原子迁移）。
+
+    全部请求经原始 ASGI 驱动（同一事件循环），避免跨环锁绑定。
+    """
     reset_coordinator()
-    pending_id = interrupt_and_get_pending(monkeypatch, client)
+    patch_interrupting(monkeypatch)
+    assert await fire_run(app_module.app, START) == 200
+    handle = router_module.coordinator._handles["thread-endpoint"]
+    pending_id = handle.pending_interrupts[0].bridge_interrupt_id
     build_calls = []
 
     def counting_builder(model_ref, secrets):
@@ -464,35 +478,40 @@ async def test_concurrent_resume_is_atomic(monkeypatch):
         "resume": [{"interruptId": pending_id, "status": "resolved", "payload": {"decision": "approve", "scope": "once"}}],
     }
 
-    async def fire(app):
-        body = json.dumps(resume).encode()
-        incoming = iter([{"type": "http.request", "body": body, "more_body": False}])
-        sent = []
-
-        async def receive():
-            return next(incoming, {"type": "http.disconnect"})
-
-        async def send(message):
-            sent.append(message)
-
-        await app({
-            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
-            "method": "POST", "scheme": "http", "path": "/api/agent/run",
-            "raw_path": b"/api/agent/run", "query_string": b"", "root_path": "",
-            "state": {}, "extensions": {}, "client": ("127.0.0.1", 50000), "server": ("t", 80),
-            "headers": [
-                (b"host", b"t"), (b"content-type", b"application/json"),
-                (b"accept", b"text/event-stream"), (b"x-vr-agent-model-key", b"request-only-key"),
-                (b"content-length", str(len(body)).encode()),
-            ],
-        }, receive, send)
-        status = next((m["status"] for m in sent if m["type"] == "http.response.start"), None)
-        return status
-
-    statuses = await asyncio.gather(fire(app_module.app), fire(app_module.app))
+    statuses = await asyncio.gather(fire_run(app_module.app, resume),
+                                    fire_run(app_module.app, resume))
     statuses = sorted(statuses)
     assert statuses == [200, 409]
     assert len(build_calls) == 1
+
+
+async def fire_run(app, payload) -> int:
+    """在当前事件循环上直接驱动一次 /api/agent/run（SSE 全量收完）。"""
+    body = json.dumps(payload).encode()
+    incoming = [{"type": "http.request", "body": body, "more_body": False}]
+    sent = []
+
+    async def receive():
+        # 请求体读完后保持连接（阻塞式 receive 视为未断开，等价真实客户端）
+        if incoming:
+            return incoming.pop(0)
+        await asyncio.Future()
+
+    async def send(message):
+        sent.append(message)
+
+    await app({
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": "POST", "scheme": "http", "path": "/api/agent/run",
+        "raw_path": b"/api/agent/run", "query_string": b"", "root_path": "",
+        "state": {}, "extensions": {}, "client": ("127.0.0.1", 50000), "server": ("t", 80),
+        "headers": [
+            (b"host", b"t"), (b"content-type", b"application/json"),
+            (b"accept", b"text/event-stream"), (b"x-vr-agent-model-key", b"request-only-key"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+    }, receive, send)
+    return next((m["status"] for m in sent if m["type"] == "http.response.start"), None)
 
 
 # ---- 1D：Policy REST ----

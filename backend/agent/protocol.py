@@ -15,6 +15,9 @@ from ag_ui.core.events import (
     ToolCallStartEvent,
 )
 from ag_ui.core.types import ConfiguredBaseModel
+from pydantic import Field, ValidationError
+
+from agent.models import ContextTruncation, PolicySnapshot, RunUsage
 
 
 class RunCancelledEvent(ConfiguredBaseModel):
@@ -60,6 +63,28 @@ def interrupt_payloads(pending: list[PendingInterrupt]) -> list[dict[str, Any]]:
             })
         payloads.append(payload)
     return payloads
+
+
+class BudgetUpdatedEventValue(ConfiguredBaseModel):
+    """§19.1 budget.updated 载荷：恰好七个 camelCase 字段，严格禁止未知字段。"""
+
+    model_config = ConfiguredBaseModel.model_config.copy()
+    model_config["extra"] = "forbid"
+
+    threadId: str = Field(min_length=1)
+    runId: str = Field(min_length=1)
+    controlRevision: int = Field(ge=0)
+    budgetSnapshot: PolicySnapshot
+    usage: RunUsage
+    activeElapsedMs: int = Field(ge=0)
+    contextTruncation: ContextTruncation
+
+
+# Graph 内允许的 CustomEvent 白名单：载荷先按 schema 校验再放行（spec §19）
+CUSTOM_EVENT_MODELS: dict[str, type[ConfiguredBaseModel]] = {
+    "budget.updated": BudgetUpdatedEventValue,
+    # artifact.created / sources.updated 的模型与生产者一起在 Task 13 注册
+}
 
 
 def thread_revision_updated(thread_id: str, revision: int, persisted_at: str) -> CustomEvent:
@@ -138,13 +163,25 @@ class AgentProtocolBridge:
                 raise ValueError("tool end arrived before tool start")
             return [event]
         if isinstance(event, CustomEvent):
-            if event.name != "on_interrupt":
+            if event.name == "on_interrupt":
+                # 本锁定版本里 CustomEvent.value 是 JSON 字符串而非 dict，统一解析。
+                raw = event.value
+                value = json.loads(raw) if isinstance(raw, str) else raw
+                self._capture(value)
+                return []
+            payload_model = CUSTOM_EVENT_MODELS.get(event.name)
+            if payload_model is None:
                 return [RunErrorEvent(message=f"Unsupported custom event: {event.name}", code="UNSUPPORTED_CUSTOM_EVENT")]
-            # 本锁定版本里 CustomEvent.value 是 JSON 字符串而非 dict，统一解析。
             raw = event.value
             value = json.loads(raw) if isinstance(raw, str) else raw
-            self._capture(value)
-            return []
+            try:
+                parsed = payload_model.model_validate(value)
+            except ValidationError:
+                return [RunErrorEvent(message=f"Malformed custom event payload: {event.name}", code="INVALID_CUSTOM_EVENT")]
+            # 规范化重编码（省略 null 字段）后按原 CustomEvent 类型放行
+            canonical = CustomEvent(
+                name=event.name, value=parsed.model_dump_json(exclude_none=True))
+            return [canonical]
         if isinstance(event, RunFinishedEvent) and self.pending:
             interrupts = interrupt_payloads(self.pending)
             return [RunFinishedEvent(

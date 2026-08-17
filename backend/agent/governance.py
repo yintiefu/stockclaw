@@ -1,4 +1,5 @@
-"""1D 治理核心：RunControl（reservation 事务、活跃段计时、Provider usage 聚合）。
+"""1D 治理核心：RunControl（reservation 事务、活跃段计时、Provider usage 聚合）
+与模型上下文治理（canonical 渲染、完整 turn 裁剪、模型 reservation、budget 事件）。
 
 RunControl 只持有 Policy 快照、计数、计时与遥测，不持有模型 key、MCP secret、
 session、真实 Skill 路径或无限工具原文。构造函数只接受 PolicySnapshot 与单调时钟。
@@ -7,15 +8,19 @@ session、真实 Skill 路径或无限工具原文。构造函数只接受 Polic
 from __future__ import annotations
 
 import asyncio
+import json
+import sys
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Literal
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Literal
 
 from agent.models import ContextTruncation, PolicySnapshot, RunUsage
 from agent.policy import POLICY_DEFAULTS
+from langchain.agents.middleware import AgentMiddleware
 
 PersistCallback = Callable[["GovernanceView"], Awaitable[None]]
+EmitCallback = Callable[[dict], Awaitable[None]]
 
 # 未接 PolicyStore 的构造路径（占位句柄/纯内存测试）使用的默认快照
 DEFAULT_POLICY_SNAPSHOT = PolicySnapshot(policy_revision=0, **POLICY_DEFAULTS)
@@ -39,6 +44,10 @@ class RunActiveTimeout(GovernanceError):
 
 class GovernancePersistenceFailed(GovernanceError):
     code = "PERSISTENCE_FAILED"
+
+
+class ContextLimitExceeded(GovernanceError):
+    code = "CONTEXT_LIMIT_EXCEEDED"
 
 
 class GovernanceTerminalError(GovernanceError):
@@ -292,3 +301,326 @@ class RunControl:
         if self._open_since is not None:
             total += max(0, int((self._clock() - self._open_since) * 1000))
         return total
+
+
+# ---- 上下文治理：canonical 渲染与完整 turn 裁剪（spec §11） ----
+
+_SKILL_TOOL_NAME = "load_skill"
+
+
+def _canonical_json(value: Any) -> str:
+    """排序 + 紧凑 + 非 ASCII 保留；allow_nan 兜底防止历史 NaN 打断计量。"""
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"), allow_nan=False)
+    except ValueError:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"))
+
+
+def render_policy_explanation(snapshot: PolicySnapshot) -> str:
+    """由 run 快照推导的确定性、无密钥治理说明。"""
+    return (
+        "\n\n## 本次运行的资源边界（Policy 快照，运行期间不变）\n"
+        f"- 模型调用上限：{snapshot.max_model_calls} 次\n"
+        f"- 工具调用上限：{snapshot.max_tool_calls} 次\n"
+        f"- 单个工具最长执行：{snapshot.tool_timeout_seconds} 秒\n"
+        f"- 本次运行最长活跃时长：{snapshot.max_active_seconds} 秒\n"
+        f"- 上下文字符上限：{snapshot.max_context_chars}\n"
+        "以上是客观运行约束说明，不构成任何投资建议。"
+    )
+
+
+def _render_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        parts = []
+        for piece in content:
+            if isinstance(piece, str):
+                parts.append(piece)
+            else:
+                parts.append(_canonical_json(piece))
+        return "".join(parts)
+    return _canonical_json(content)
+
+
+def _render_message(message: Any) -> str:
+    role = getattr(message, "type", None) or getattr(message, "role", "") or ""
+    name = getattr(message, "name", None)
+    label = f"{role}:{name}" if name else str(role)
+    pieces = [f"[{label}]"]
+    content = getattr(message, "content", "")
+    rendered_content = _render_content(content)
+    if rendered_content:
+        pieces.append(rendered_content)
+    for call in getattr(message, "tool_calls", None) or []:
+        pieces.append(
+            f"<tool_call id={call.get('id') or ''} name={call.get('name') or ''} "
+            f"args={_canonical_json(call.get('args') or {})}>")
+    tool_call_id = getattr(message, "tool_call_id", None)
+    if tool_call_id:
+        pieces.append(f"<tool_result call_id={tool_call_id}>")
+    return "\n".join(pieces)
+
+
+def render_model_context(system_message: Any, messages: list[Any]) -> str:
+    """System 与 message history 共用的 canonical renderer（计量与裁剪同源）。"""
+    blocks: list[str] = []
+    if system_message is not None:
+        blocks.append("[system]\n" + _render_content(getattr(system_message, "content", "")))
+    blocks.extend(_render_message(message) for message in messages)
+    return "\n".join(blocks)
+
+
+def _is_human(message: Any) -> bool:
+    return (getattr(message, "type", None) or getattr(message, "role", "")) in ("human", "user")
+
+
+def _message_tool_call_names(message: Any) -> dict[str, str]:
+    return {
+        call.get("id") or "": call.get("name") or ""
+        for call in (getattr(message, "tool_calls", None) or [])
+    }
+
+
+def _loaded_skill(message: Any, call_names: dict[str, str]) -> str | None:
+    """ToolMessage 若对应 load_skill 调用，返回其结果里声明的 Skill 名。"""
+    tool_call_id = getattr(message, "tool_call_id", None)
+    if not tool_call_id or call_names.get(tool_call_id) != _SKILL_TOOL_NAME:
+        return None
+    content = getattr(message, "content", "")
+    try:
+        payload = json.loads(content) if isinstance(content, str) else content
+        name = payload.get("name") if isinstance(payload, dict) else None
+        return name or None
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _group_turns(messages: list[Any]) -> list[list[Any]]:
+    """从每个 user message 到下一个 user message 之前为一组完整 turn。"""
+    turns: list[list[Any]] = []
+    current: list[Any] = []
+    for message in messages:
+        if _is_human(message) and current:
+            turns.append(current)
+            current = []
+        current.append(message)
+    if current:
+        turns.append(current)
+    return turns
+
+
+def _latest_skill_turns(messages: list[Any]) -> set[int]:
+    """每个已加载 Skill 的最新完整 load_skill turn（按消息索引返回）。"""
+    call_names: dict[str, str] = {}
+    for message in messages:
+        call_names.update(_message_tool_call_names(message))
+    latest: dict[str, int] = {}
+    for index, message in enumerate(messages):
+        skill = _loaded_skill(message, call_names)
+        if skill is not None:
+            latest[skill] = index
+    return set(latest.values())
+
+
+def trim_model_request(request: Any, limit: int) -> tuple[Any, ContextTruncation]:
+    """在 Provider 格式化与 reservation 之前裁剪 ModelRequest。
+
+    强制保留：system（中立提示 + Policy 说明 + Skill 目录）、当前 user turn、
+    每个已加载 Skill 的最新完整 load_skill turn。其余历史从新到旧加入完整 turn，
+    恢复时间顺序；强制内容超限时抛 ContextLimitExceeded（绝不切分单位）。
+    """
+    system = getattr(request, "system_message", None)
+    messages = list(getattr(request, "messages", []) or [])
+    original_chars = len(render_model_context(system, messages))
+    if original_chars <= limit:
+        return request, ContextTruncation(
+            occurred=False, original_chars=original_chars,
+            retained_chars=original_chars, removed_turns=0)
+
+    turns = _group_turns(messages)
+    if not turns:
+        raise ContextLimitExceeded(
+            f"强制上下文 {original_chars} 字符超过上限 {limit}")
+
+    # 每个 turn 的起止消息索引（turn 内部不可拆分）
+    starts: list[int] = []
+    index = 0
+    for turn in turns:
+        starts.append(index)
+        index += len(turn)
+
+    current_turn_index = len(turns) - 1
+    forced_turns = {current_turn_index}
+    for message_index in _latest_skill_turns(messages):
+        for position, start in enumerate(starts):
+            end = starts[position + 1] if position + 1 < len(starts) else len(messages)
+            if start <= message_index < end:
+                forced_turns.add(position)
+                break
+
+    def _turn_chars(turn_positions: set[int]) -> int:
+        selected = sorted(turn_positions)
+        kept = [message for position in selected for message in turns[position]]
+        return len(render_model_context(system, kept))
+
+    forced_chars = _turn_chars(forced_turns)
+    if forced_chars > limit:
+        raise ContextLimitExceeded(
+            f"强制保留内容 {forced_chars} 字符超过上限 {limit}，"
+            "不允许裁剪 System、Skill 指令或当前 turn")
+
+    kept_turns = set(forced_turns)
+    # 从新到旧加入完整 turn，直到下一个 turn 会超限
+    for position in range(len(turns) - 1, -1, -1):
+        if position in kept_turns:
+            continue
+        if _turn_chars(kept_turns | {position}) > limit:
+            break
+        kept_turns.add(position)
+
+    if len(kept_turns) == len(turns):
+        retained_chars = len(render_model_context(system, messages))
+        return request, ContextTruncation(
+            occurred=False, original_chars=original_chars,
+            retained_chars=retained_chars, removed_turns=0)
+
+    kept_messages = [
+        message for position in sorted(kept_turns) for message in turns[position]
+    ]
+    retained_chars = len(render_model_context(system, kept_messages))
+    trimmed = request.override(messages=kept_messages)
+    return trimmed, ContextTruncation(
+        occurred=True,
+        original_chars=original_chars,
+        retained_chars=retained_chars,
+        removed_turns=len(turns) - len(kept_turns),
+    )
+
+
+def extract_provider_usage(response: Any) -> tuple[int | None, int | None, int | None] | None:
+    """从 Provider 响应中的 AIMessage.usage_metadata 提取 token 用量。"""
+    if isinstance(response, list):
+        candidates = response
+    else:
+        candidates = []
+        for attr in ("messages", "result", "generations"):
+            inner = getattr(response, attr, None)
+            if isinstance(inner, list) and inner:
+                candidates = [
+                    item.message if hasattr(item, "message") else item for item in inner
+                ]
+                break
+        if not candidates:
+            result = getattr(response, "result", None)
+            candidates = [result] if result is not None else [response]
+    for message in candidates:
+        metadata = getattr(message, "usage_metadata", None)
+        if metadata:
+            return (
+                metadata.get("input_tokens"),
+                metadata.get("output_tokens"),
+                metadata.get("total_tokens"),
+            )
+    return None
+
+
+async def _default_emit(payload: dict) -> None:
+    """生产路径：经 LangGraph 自定义事件机制发布（无回调上下文时静默跳过）。"""
+    try:
+        from langchain_core.callbacks import adispatch_custom_event
+
+        await adispatch_custom_event("budget.updated", payload)
+    except Exception as exc:  # 事件失败绝不影响已提交状态
+        print(f"governance budget emit failed: {exc!r}", file=sys.stderr)
+
+
+class ContextAndModelGovernance(AgentMiddleware):
+    """模型调用治理中间件（元组第一位、最外层）。
+
+    顺序契约：上下文计量/裁剪 → active deadline 检查 → reservation（持久化成功
+    才继续）→ budget.updated → Provider 调用（剩余 active deadline 内）→
+    记录 usage（错误/取消也记录缺失 usage，不覆盖原始异常）。
+    """
+
+    def __init__(
+        self,
+        control: RunControl,
+        *,
+        persist: PersistCallback,
+        emit: EmitCallback | None = None,
+        thread_id: str = "",
+        run_id: str = "",
+    ):
+        super().__init__()
+        self._control = control
+        self._persist = persist
+        self._emit = emit or _default_emit
+        self._thread_id = thread_id
+        self._run_id = run_id
+
+    @property
+    def control(self) -> RunControl:
+        return self._control
+
+    async def _persist_telemetry(self, view: GovernanceView) -> None:
+        try:
+            await self._persist(view)
+        except BaseException as exc:
+            self._control.mark_terminal(
+                "PERSISTENCE_FAILED", f"治理遥测持久化失败: {exc}")
+            raise GovernancePersistenceFailed("治理遥测持久化失败") from exc
+        await self._emit_budget(view)
+
+    async def _emit_budget(self, view: GovernanceView) -> None:
+        try:
+            await self._emit({
+                "threadId": self._thread_id,
+                "runId": self._run_id,
+                "controlRevision": view.control_revision,
+                "budgetSnapshot": self._control.snapshot.model_dump(mode="json"),
+                "usage": view.usage.model_dump(mode="json"),
+                "activeElapsedMs": view.active_elapsed_ms,
+                "contextTruncation": view.context_truncation.model_dump(mode="json"),
+            })
+        except Exception as exc:  # 事件失败绝不影响已提交状态
+            print(f"governance budget emit failed: {exc!r}", file=sys.stderr)
+
+    async def awrap_model_call(self, request, call_llm, **kwargs):
+        # 1) 上下文治理：同一 renderer 负责计量与裁剪
+        trimmed, truncation = trim_model_request(
+            request, self._control.snapshot.max_context_chars)
+        if truncation.occurred:
+            await self._persist_telemetry(self._control.set_context_truncation(truncation))
+        elif truncation.original_chars is not None:
+            self._control.set_context_truncation(truncation)  # 只更新内存计量
+
+        # 2) active deadline：过期即拒绝 Provider 与 reservation
+        if self._control.remaining_active_seconds() <= 0:
+            raise RunActiveTimeout("本次运行的活跃时长已耗尽")
+
+        # 3) 模型 reservation：持久化成功才允许调用 Provider
+        view = await self._control.reserve_model(self._persist)
+        await self._emit_budget(view)
+
+        # 4) Provider 调用：剩余 active deadline 内
+        remaining = self._control.remaining_active_seconds()
+        try:
+            response = await asyncio.wait_for(
+                call_llm(trimmed), timeout=remaining if remaining > 0 else 0.0)
+        except asyncio.TimeoutError as exc:
+            raise RunActiveTimeout("Provider 调用超出本次运行的活跃时长") from exc
+        except BaseException:
+            # 错误/取消：按缺失 usage 记录一次完成；不覆盖原始异常
+            try:
+                await self._persist_telemetry(self._control.record_model_usage(None))
+            except GovernancePersistenceFailed:
+                pass
+            raise
+        usage = extract_provider_usage(response)
+        await self._persist_telemetry(self._control.record_model_usage(usage))
+        return response
