@@ -423,6 +423,30 @@ def test_reconcile_warns_and_keeps_diagnostic_when_artifact_quarantine_fails(tmp
                for w in warnings)
 
 
+def test_reconcile_stops_chain_retries_after_failed_quarantine(tmp_path, monkeypatch):
+    paths = make_paths(tmp_path)
+    threads = ThreadStore(paths)
+    threads.create(ThreadDocument.new("thread-1", "研究", now=NOW))
+    store = ArtifactStore(paths.root)
+    store.publish(store.stage(make_artifact("artifact-chain", parent_artifact_id="missing-parent")))
+    invalid = paths.artifacts_dir / "thread-1" / "artifact-chain.json"
+    calls: list[Path] = []
+
+    def fail_quarantine(path):
+        calls.append(path)
+        if len(calls) == 2:
+            path.unlink()
+        return path.name
+
+    monkeypatch.setattr("agent.stores._quarantine_artifact", fail_quarantine)
+
+    warnings = reconcile_artifacts(paths, threads, store)
+
+    assert calls == [invalid]
+    assert invalid.exists()
+    assert len([w for w in warnings if w.code == "ARTIFACT_CHAIN_INVALID"]) == 1
+
+
 def test_latest_runs_by_thread_prefers_max_updated_at_then_id():
     early = make_run(run_id="run-a", status="completed", updated_at="2026-08-15T10:00:00Z")
     late = make_run(run_id="run-b", status="completed", updated_at="2026-08-15T11:00:00Z")

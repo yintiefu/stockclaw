@@ -594,6 +594,8 @@ def _quarantine_invalid_chains(directory: Path, thread_id: str, artifact_store,
             filename = _quarantine_artifact(path)
             warnings.append(RecoveryWarning(
                 "ARTIFACT_CHAIN_INVALID", "artifact", f"{thread_id}/{filename}:{reason}"))
+            if filename == path.name:
+                return
             changed = True
         if not changed:
             return
