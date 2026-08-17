@@ -19,6 +19,14 @@ from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field, model_validator
 
 from agent.models import ModelRef, RunSecrets, RunSummary, RuntimeForwardedProps, ThreadDocument
+from agent.policy import (
+    PolicyCorrupt,
+    PolicyInvalid,
+    PolicyPatch,
+    PolicyReset,
+    PolicyRevisionConflict,
+    PolicyStore,
+)
 from agent.protocol import AgentProtocolBridge, PendingInterrupt, thread_revision_updated
 from agent.runs import (
     DuplicateRunActive,
@@ -72,6 +80,7 @@ class AgentServices:
     skills: SkillRegistry
     importer: SkillImporter
     registry: McpRegistry
+    policy: PolicyStore
 
 
 def build_services(root: Path | None = None) -> AgentServices:
@@ -83,6 +92,7 @@ def build_services(root: Path | None = None) -> AgentServices:
     importer = SkillImporter(paths.skills, skills)
     allowances = AllowanceRegistry()
     registry = McpRegistry.for_root(paths.root, allowances)
+    policy = PolicyStore(paths.policy)
 
     def _run_tools(skill_tools=()):
         # 测试接缝：1A/1B 通过 monkeypatch agent.router.build_builtin_tools 注入
@@ -95,7 +105,7 @@ def build_services(root: Path | None = None) -> AgentServices:
         middleware_provider=lambda: build_middleware(),
         allowances=allowances,
     )
-    return AgentServices(paths, threads, runs, coordinator, skills, importer, registry)
+    return AgentServices(paths, threads, runs, coordinator, skills, importer, registry, policy)
 
 
 services = build_services()
@@ -999,6 +1009,62 @@ async def refresh_mcp_server(server_id: str, payload: McpAction):
     doc = await asyncio.to_thread(services.registry.store.load)
     return doc.model_dump(mode="json")
 
+
+
+# ---- 1D：Policy REST ----
+
+
+def _policy_corrupt_response(exc: PolicyCorrupt) -> JSONResponse:
+    return JSONResponse(status_code=503, content={"code": "POLICY_CORRUPT", "detail": str(exc)})
+
+
+@router.get("/policy")
+async def get_policy():
+    try:
+        view = await asyncio.to_thread(services.policy.get)
+    except PolicyCorrupt as exc:
+        return _policy_corrupt_response(exc)
+    return view.model_dump(mode="json")
+
+
+@router.patch("/policy")
+async def patch_policy(payload: dict):
+    try:
+        patch = PolicyPatch.model_validate(payload)
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"code": "POLICY_INVALID", "detail": str(exc)[:500]})
+    try:
+        view = await asyncio.to_thread(services.policy.patch, patch)
+    except PolicyCorrupt as exc:
+        return _policy_corrupt_response(exc)
+    except PolicyRevisionConflict as exc:
+        return JSONResponse(status_code=409, content={
+            "code": "POLICY_REVISION_CONFLICT",
+            "detail": str(exc),
+            "current_revision": exc.current_revision,
+        })
+    return view.model_dump(mode="json")
+
+
+@router.post("/policy/reset")
+async def reset_policy(payload: dict):
+    try:
+        reset = PolicyReset.model_validate(payload)
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"code": "POLICY_INVALID", "detail": str(exc)[:500]})
+    try:
+        view = await asyncio.to_thread(services.policy.reset, reset)
+    except PolicyCorrupt as exc:
+        return _policy_corrupt_response(exc)
+    except PolicyRevisionConflict as exc:
+        return JSONResponse(status_code=409, content={
+            "code": "POLICY_REVISION_CONFLICT",
+            "detail": str(exc),
+            "current_revision": exc.current_revision,
+        })
+    except PolicyInvalid as exc:
+        return JSONResponse(status_code=400, content={"code": exc.code, "detail": str(exc)})
+    return view.model_dump(mode="json")
 
 
 def _new_thread_id() -> str:

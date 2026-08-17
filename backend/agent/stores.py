@@ -60,6 +60,10 @@ class AgentPaths:
     def mcp_work(self) -> Path:
         return self.root / "mcp-work"
 
+    @property
+    def policy(self) -> Path:
+        return self.root / "policy.json"
+
 
 class StoreError(RuntimeError):
     code = "AGENT_STORE_ERROR"

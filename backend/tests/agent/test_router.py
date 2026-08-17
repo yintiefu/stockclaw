@@ -493,3 +493,92 @@ async def test_concurrent_resume_is_atomic(monkeypatch):
     statuses = sorted(statuses)
     assert statuses == [200, 409]
     assert len(build_calls) == 1
+
+
+# ---- 1D：Policy REST ----
+
+
+def test_policy_get_returns_defaults_without_persisting():
+    reset_coordinator()
+    response = client.get("/api/agent/policy")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["revision"] == 0
+    assert payload["persisted"] is False
+    assert payload["max_model_calls"] == 8
+    assert payload["max_tool_calls"] == 16
+    assert not (router_module.services.paths.root / "policy.json").exists()
+
+
+def test_policy_patch_persists_full_document_and_bumps_revision():
+    reset_coordinator()
+    response = client.patch("/api/agent/policy", json={
+        "revision": 0, "max_model_calls": 10, "max_tool_calls": 20,
+    })
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["revision"] == 1
+    assert payload["persisted"] is True
+    assert payload["max_model_calls"] == 10
+    assert payload["tool_timeout_seconds"] == 30  # 未提交字段写默认值
+    reloaded = client.get("/api/agent/policy").json()
+    assert reloaded["persisted"] is True and reloaded["revision"] == 1
+
+
+def test_policy_patch_stale_revision_returns_409_with_current():
+    reset_coordinator()
+    client.patch("/api/agent/policy", json={"revision": 0, "max_model_calls": 10})
+    response = client.patch("/api/agent/policy", json={"revision": 0, "max_model_calls": 11})
+    assert response.status_code == 409
+    payload = response.json()
+    assert payload["code"] == "POLICY_REVISION_CONFLICT"
+    assert payload["current_revision"] == 1
+
+
+def test_policy_patch_invalid_payload_maps_to_400():
+    reset_coordinator()
+    unknown = client.patch("/api/agent/policy", json={"revision": 0, "bogus": 1})
+    assert unknown.status_code == 400
+    assert unknown.json()["code"] == "POLICY_INVALID"
+    empty = client.patch("/api/agent/policy", json={"revision": 0})
+    assert empty.status_code == 400 and empty.json()["code"] == "POLICY_INVALID"
+    out_of_range = client.patch("/api/agent/policy", json={"revision": 0, "max_model_calls": 33})
+    assert out_of_range.status_code == 400
+    assert out_of_range.json()["code"] == "POLICY_INVALID"
+
+
+def test_policy_corrupt_state_maps_to_503_until_explicit_reset():
+    reset_coordinator()
+    policy_path = router_module.services.paths.policy
+    policy_path.write_text('{"schema_version":1,"max_model_calls":0}', encoding="utf-8")
+    for attempt in (client.get("/api/agent/policy"),
+                    client.patch("/api/agent/policy", json={"revision": 1, "max_model_calls": 9}),
+                    client.get("/api/agent/policy")):
+        assert attempt.status_code == 503
+        assert attempt.json()["code"] == "POLICY_CORRUPT"
+        assert str(policy_path) not in attempt.json()["detail"]  # 无绝对路径
+        assert policy_path.exists()  # 非破坏性
+    response = client.post("/api/agent/policy/reset", json={"confirm_corrupt": True})
+    assert response.status_code == 200
+    assert response.json()["revision"] == 1
+    assert list(policy_path.parent.glob("policy.json.corrupt-*"))
+    healthy = client.get("/api/agent/policy")
+    assert healthy.status_code == 200 and healthy.json()["persisted"] is True
+
+
+def test_policy_normal_reset_writes_defaults():
+    reset_coordinator()
+    client.patch("/api/agent/policy", json={"revision": 0, "max_model_calls": 10})
+    response = client.post("/api/agent/policy/reset", json={"revision": 1})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["revision"] == 2
+    assert payload["max_model_calls"] == 8
+
+
+def test_policy_reset_rejects_mixed_or_empty_bodies():
+    reset_coordinator()
+    mixed = client.post("/api/agent/policy/reset", json={"revision": 1, "confirm_corrupt": True})
+    assert mixed.status_code == 400 and mixed.json()["code"] == "POLICY_INVALID"
+    empty = client.post("/api/agent/policy/reset", json={})
+    assert empty.status_code == 400 and empty.json()["code"] == "POLICY_INVALID"
