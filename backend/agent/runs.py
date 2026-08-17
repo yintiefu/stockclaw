@@ -29,6 +29,7 @@ from agent.governance import (
 from agent.tool_executor import BoundedToolExecutor
 from agent.runtime import AgentFactory, RuntimeHandle
 from agent.skills import SkillError
+from agent.policy import PolicyStore
 from agent.stores import DocumentNotFound, RevisionConflict, utc_now
 
 if TYPE_CHECKING:
@@ -131,8 +132,6 @@ class RunJournal:
         # 请求消息用它作为持久化 ID，保证直播与刷新后的消息 ID 一致
         self._request_parent_message_id: str | None = None
         self.closed = False
-        self.model_calls = 0
-        self.tool_calls = 0
 
     # ---- 观察（同步；增量内联，边界经 asyncio.to_thread 调用） ----
 
@@ -141,8 +140,8 @@ class RunJournal:
             return []
         kind = str(getattr(getattr(event, "type", None), "value", getattr(event, "type", "")))
         if kind == "TEXT_MESSAGE_START":
-            self.model_calls += 1
             # 文本开始 = 工具请求阶段结束：先把带 tool_calls 的请求 assistant 消息落盘
+            # （1D：模型调用计数来自已持久化的 reservation，不再由事件推断）
             commits = self._flush_request_message()
             self._assistant_buffers.setdefault(event.message_id, {"content": "", "tool_calls": []})
             return commits
@@ -156,7 +155,6 @@ class RunJournal:
             if not self._pending_request_calls:
                 # 新一轮模型调用的开始：优先记住事件自带的父消息 ID
                 self._request_parent_message_id = getattr(event, "parent_message_id", None)
-                self.model_calls += 1
             self._tool_calls.setdefault(event.tool_call_id, {"name": event.tool_call_name, "args": "", "message_id": None})
             if event.tool_call_id not in self._pending_request_calls:
                 self._pending_request_calls.append(event.tool_call_id)
@@ -198,6 +196,7 @@ class RunJournal:
         return self._commit_thread("interrupt")
 
     def persist_terminal(self, status: str, error_code: str | None = None, error_message: str | None = None) -> CommittedRevision:
+        self._handle.control.close_active_segment()  # 终局：关闭最后一段（幂等）
         run_update: dict[str, Any] = {"status": status}
         if error_code is not None:
             run_update["error_code"] = error_code
@@ -217,6 +216,7 @@ class RunJournal:
         if self.closed:
             return None
         self.closed = True
+        self._handle.control.close_active_segment()  # 取消：关闭最后一段（幂等）
         if self._pending_request_calls:
             self._flush_request_message(partial=True)
         for message_id, buffer in self._assistant_buffers.items():
@@ -255,18 +255,15 @@ class RunJournal:
         return settled + open_wait
 
     def _usage_update(self, approval_wait_ms: int) -> dict[str, Any]:
-        """终态/取消共用的时长与用量字段：active 扣除审批等待。"""
-        elapsed = self._elapsed_ms()
+        """终态/取消共用：usage/control_revision/active 一律取自 RunControl 权威视图。"""
+        view = self._handle.control.view()
         return {
-            "elapsed_ms": elapsed,
-            "active_elapsed_ms": max(0, elapsed - approval_wait_ms),
+            "elapsed_ms": self._elapsed_ms(),
+            "active_elapsed_ms": view.active_elapsed_ms,
             "approval_wait_ms": approval_wait_ms,
-            "usage": RunUsage(
-                model_calls=self.model_calls,
-                tool_calls=self.tool_calls,
-                input_tokens=None,
-                output_tokens=None,
-            ),
+            "usage": view.usage,
+            "control_revision": view.control_revision,
+            "context_truncation": view.context_truncation,
         }
 
     def _persisted_assistant_ids(self) -> set[str]:
@@ -334,7 +331,6 @@ class RunJournal:
             created_at=utc_now(),
         ))
         call = self._tool_calls.get(event.tool_call_id) or {}
-        self.tool_calls += 1
         self._update_run({"tool_summaries": self._append_tool_summary({
             "id": event.tool_call_id,
             "name": call.get("name", ""),
@@ -410,6 +406,7 @@ class RunCoordinator:
         allowances: "AllowanceRegistry | None" = None,
         executor: "BoundedToolExecutor | None" = None,
         builtin_serial_lock: asyncio.Lock | None = None,
+        policy: "PolicyStore | None" = None,
     ):
         self._factory = factory or AgentFactory()
         self._locks: dict[str, asyncio.Lock] = {}
@@ -426,6 +423,8 @@ class RunCoordinator:
         # 1D：进程级有界同步执行器与 legacy builtin 串行锁（router 注入）
         self._executor = executor
         self._builtin_serial_lock = builtin_serial_lock
+        # 1D：Policy store（新产品 run 准入时读取快照；损坏时 fail-closed）
+        self._policy = policy
 
     def _lock(self, thread_id: str) -> asyncio.Lock:
         if thread_id not in self._locks:
@@ -447,8 +446,10 @@ class RunCoordinator:
     # ---- 1D：治理控制与请求级中间件组合 ----
 
     def _new_run_control(self) -> RunControl:
-        # Task 7 起从 PolicyStore 读取最新快照；当前使用与 Policy 默认值一致的快照
-        return RunControl(DEFAULT_POLICY_SNAPSHOT)
+        """新产品 run 的控制：读取最新 Policy 快照（损坏时 PolicyCorrupt fail-closed）。"""
+        if self._policy is None:
+            return RunControl(DEFAULT_POLICY_SNAPSHOT)
+        return RunControl(self._policy.snapshot())
 
     def _governed_middleware_factory(self, lease: CapabilityLease, control: RunControl,
                                      thread_id: str, run_id: str):
@@ -713,6 +714,7 @@ class RunCoordinator:
         protocol_run_id: str,
         messages: Sequence[Any],
         client_revision: int | None,
+        control: RunControl | None = None,
     ) -> StartAdmission:
         """持锁准入（第三阶段）：复验 → 持久化 → 建 Graph → 装句柄。
 
@@ -729,9 +731,10 @@ class RunCoordinator:
         new_message = messages[-1]
 
 
-        # 4) 创建产品 run 并写入 running 状态
+        # 4) 创建产品 run 并写入 running 状态（Policy 快照在任何 user/run 写入前固定）
         run_id = f"run-{uuid4().hex}"
-        control = self._new_run_control()
+        if control is None:
+            control = self._new_run_control()  # PolicyCorrupt → 新 run fail-closed
         run = RunDocument.start(
             run_id=run_id,
             thread_id=thread_id,
@@ -740,7 +743,7 @@ class RunCoordinator:
             trigger_message_id=new_message.id,
             history_head_id=thread.messages[-1].id if thread.messages else None,
             now=utc_now(),
-        )
+        ).model_copy(update={"budget_snapshot": control.snapshot})
         runs.replace(run)
 
         # 5) 追加被接受的用户消息 + 更新 last_run 摘要（同一次 revision 递增）
@@ -778,12 +781,14 @@ class RunCoordinator:
             )
         except Exception:
             # 持久化已成功：run 终态 failed、线程摘要修复；用户消息保留
+            control.mark_terminal("GRAPH_BUILD_FAILED", "Graph 构建失败")
             runs.replace(run.model_copy(update={
                 "status": "failed",
                 "updated_at": utc_now(),
                 "ended_at": utc_now(),
                 "error_code": "GRAPH_BUILD_FAILED",
                 "error_message": "Graph 构建失败",
+                "budget_snapshot": control.snapshot,
             }))
             threads.update(
                 thread_id,
@@ -795,6 +800,8 @@ class RunCoordinator:
             raise
 
         model_history = updated_thread.model_history()
+        # 完成准入并占用 thread 后开启首个 active segment（与 elapsed 计时同点）
+        control.begin_active_segment()
         handle = ActiveRunHandle(
             runtime=runtime,
             phase="running",
@@ -923,6 +930,9 @@ class RunCoordinator:
                     if handle.approval_started_monotonic is not None:
                         approval_wait = int((time.monotonic() - handle.approval_started_monotonic) * 1000)
                         handle.approval_started_monotonic = None
+                    # 复用原控制并重开 active segment（不读取当前 Policy）
+                    handle.control.begin_active_segment()
+                    view = handle.control.view()
                     # 同一产品 run：追加 protocol ID、恢复 running、记录审批等待时长
                     runs.replace(run.model_copy(update={
                         "protocol_run_ids": [*run.protocol_run_ids, protocol_run_id],
@@ -930,6 +940,10 @@ class RunCoordinator:
                         "ended_at": None,
                         "approval_wait_ms": run.approval_wait_ms + approval_wait,
                         "updated_at": utc_now(),
+                        "usage": view.usage,
+                        "control_revision": view.control_revision,
+                        "active_elapsed_ms": view.active_elapsed_ms,
+                        "context_truncation": view.context_truncation,
                     }))
                     handle.protocol_run_ids = list(run.protocol_run_ids) + [protocol_run_id]
 
@@ -967,34 +981,22 @@ class RunCoordinator:
                 raise ResumeRejected(f"{ResumeRejected.code}: thread {thread_id} has no pending interrupts")
             validate(handle.pending_interrupts, entries)  # ValueError → 旧句柄保持原状
             threads, runs = self._require_stores()
-            old_product_run_id = handle.product_run_id
 
-            def _preflight_and_cancel_old() -> ThreadDocument:
-                # 先做无副作用 preflight：通过后才允许破坏旧运行
+            def _preflight_only_old() -> ThreadDocument:
+                # 只做无副作用 preflight；破坏旧运行推迟到全部前置成功之后
                 thread, _ = self._preflight_locked(
                     thread_id, protocol_run_id=protocol_run_id, messages=messages,
                     client_revision=client_revision,
                 )
-                # 旧 run 先持久化为 cancelled（即使新 run 写入失败也保持 cancelled）
-                if old_product_run_id is not None:
-                    old_run = runs.get(old_product_run_id)
-                    runs.replace(old_run.model_copy(update={
-                        "status": "cancelled",
-                        "updated_at": utc_now(),
-                        "ended_at": utc_now(),
-                        "error_code": "STEERED_AWAY",
-                        "error_message": "用户转向新问题，原运行取消",
-                    }))
                 return thread
 
-            thread = await asyncio.to_thread(_preflight_and_cancel_old)
+            thread = await asyncio.to_thread(_preflight_only_old)
             preview = CapabilityPreview(
                 thread_id=thread_id, thread_revision=thread.revision,
                 selected_skills=tuple(thread.selected_skills),
             )
-            handle.phase = "cancelled"
-            self._release_handle(handle)
-            self._handles.pop(thread_id, None)
+        # 锁外取得 Policy 快照与能力租约：任一失败都保留旧 pending run 原状
+        control = self._new_run_control()  # PolicyCorrupt → 旧 run 不受影响
         lease = await self._acquire_lease(preview, tools, middleware)
         try:
             async with self._lock(thread_id):
@@ -1004,9 +1006,31 @@ class RunCoordinator:
                         client_revision=client_revision,
                     )
                 )
-                self._verify_preview(thread, preview)
-                return await asyncio.to_thread(
-                    lambda: self._admit_locked(
+                # 原子过渡（同一持锁段）：先取消旧 run，复验 preview 后再准入新 run
+                def _cancel_old_then_admit():
+                    old_handle = self._handles.get(thread_id)
+                    if old_handle is not None:
+                        old_handle.phase = "cancelled"
+                        old_handle.control.mark_terminal(
+                            "STEERED_AWAY", "用户转向新问题，原运行取消")
+                        if old_handle.product_run_id is not None:
+                            old_run = runs.get(old_handle.product_run_id)
+                            runs.replace(old_run.model_copy(update={
+                                "status": "cancelled",
+                                "updated_at": utc_now(),
+                                "ended_at": utc_now(),
+                                "error_code": "STEERED_AWAY",
+                                "error_message": "用户转向新问题，原运行取消",
+                            }))
+                        self._release_handle(old_handle)
+                        self._handles.pop(thread_id, None)
+                    # 取消旧 run 之后、准入之前完成 preview 复验
+                    current_thread, _ = self._preflight_locked(
+                        thread_id, protocol_run_id=protocol_run_id, messages=messages,
+                        client_revision=client_revision,
+                    )
+                    self._verify_preview(current_thread, preview)
+                    return self._admit_locked(
                         thread_id,
                         model_ref=model_ref,
                         secrets=secrets,
@@ -1015,8 +1039,10 @@ class RunCoordinator:
                         protocol_run_id=protocol_run_id,
                         messages=messages,
                         client_revision=client_revision,
+                        control=control,
                     )
-                )
+
+                return await asyncio.to_thread(_cancel_old_then_admit)
         except BaseException:
             lease.release()
             raise
@@ -1100,7 +1126,7 @@ class RunCoordinator:
 
                 run_id = f"run-{uuid4().hex}"
                 now = utc_now()
-                control = self._new_run_control()
+                control = self._new_run_control()  # retry 是新产品 run：读最新 Policy
                 run = RunDocument.start(
                     run_id=run_id,
                     thread_id=thread_id,
@@ -1110,7 +1136,7 @@ class RunCoordinator:
                     history_head_id=retry_history[-1].id if retry_history else None,
                     now=now,
                     retry_of=retry_of,
-                )
+                ).model_copy(update={"budget_snapshot": control.snapshot})
                 await asyncio.to_thread(runs.replace, run)
 
                 def refresh_summary(doc: ThreadDocument) -> ThreadDocument:
@@ -1139,12 +1165,14 @@ class RunCoordinator:
                     runtime = await asyncio.to_thread(_build_retry_runtime)
                 except Exception:
                     def _mark_retry_build_failed() -> None:
+                        control.mark_terminal("GRAPH_BUILD_FAILED", "Graph 构建失败")
                         runs.replace(run.model_copy(update={
                             "status": "failed",
                             "updated_at": utc_now(),
                             "ended_at": utc_now(),
                             "error_code": "GRAPH_BUILD_FAILED",
                             "error_message": "Graph 构建失败",
+                            "budget_snapshot": control.snapshot,
                         }))
                         threads.update(
                             thread_id,
@@ -1156,6 +1184,7 @@ class RunCoordinator:
                     await asyncio.to_thread(_mark_retry_build_failed)
                     raise
 
+                control.begin_active_segment()  # 完成准入后开启首个 segment
                 handle = ActiveRunHandle(
                     runtime=runtime,
                     phase="running",
@@ -1179,13 +1208,31 @@ class RunCoordinator:
             lease.release()
             raise
 
-    async def mark_awaiting_approval(self, thread_id: str) -> None:
+    async def mark_awaiting_approval(self, thread_id: str) -> GovernanceView | None:
+        """中断持久化后：关闭 active segment 并把最终控制视图落进 run 文档。"""
         async with self._lock(thread_id):
             handle = self._handles.get(thread_id)
             if handle is None:
-                return
+                return None
             handle.phase = "awaiting_approval"
             handle.runtime.release_graph()
+            view = handle.control.close_active_segment()
+            product_run_id = handle.product_run_id
+
+            def _persist_segment() -> None:
+                run = self._runs.get(product_run_id)
+                if view.control_revision >= run.control_revision:
+                    self._runs.replace(run.model_copy(update={
+                        "usage": view.usage,
+                        "control_revision": view.control_revision,
+                        "active_elapsed_ms": view.active_elapsed_ms,
+                        "context_truncation": view.context_truncation,
+                        "updated_at": utc_now(),
+                    }))
+
+            if product_run_id is not None:
+                await asyncio.to_thread(_persist_segment)
+            return view
 
     async def cancel(self, thread_id: str) -> None:
         async with self._lock(thread_id):
@@ -1196,6 +1243,8 @@ class RunCoordinator:
         handle = self._handles.get(thread_id)
         if handle is None:
             return
+        # 先阻断新的 reservation，再停止等待（spec §8）
+        handle.control.mark_terminal("CLIENT_CANCELLED", "用户停止或断开连接，运行被取消")
         handle.phase = "cancelled"
         self._release_handle(handle)
         self._handles.pop(thread_id, None)
@@ -1324,6 +1373,7 @@ class RunCoordinator:
                 return None
             if product_run_id is not None and handle.product_run_id != product_run_id:
                 return None  # 目标 run 已终结，当前活动的是别的 run：不做任何事
+            handle.control.mark_terminal("CLIENT_CANCELLED", "用户停止或断开连接，运行被取消")
             handle.phase = "cancelled"  # 先标记：迟到的 journal 事件被拒
             journal = handle.journal
             product_run_id = handle.product_run_id

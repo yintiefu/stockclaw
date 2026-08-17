@@ -1068,7 +1068,7 @@ async def test_admitted_run_carries_default_snapshot_control(tmp_path):
     assert handle.control is not None
     assert handle.control.snapshot.max_model_calls == 8
     assert handle.control.snapshot.max_tool_calls == 16
-    assert admission.run.budget_snapshot == {}  # budget_snapshot 写入推迟到 Task 7
+    assert admission.run.budget_snapshot.policy_revision == 0  # Task 7：默认快照已写入
 
 
 @pytest.mark.asyncio

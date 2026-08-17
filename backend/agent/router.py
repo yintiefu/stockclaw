@@ -18,6 +18,10 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field, model_validator
 
+import json
+
+from ag_ui.core.events import CustomEvent
+from agent.governance import build_budget_payload
 from agent.models import ModelRef, RunSecrets, RunSummary, RuntimeForwardedProps, ThreadDocument
 from agent.policy import (
     PolicyCorrupt,
@@ -111,6 +115,7 @@ def build_services(root: Path | None = None) -> AgentServices:
         allowances=allowances,
         executor=executor,
         builtin_serial_lock=builtin_serial_lock,
+        policy=policy,
     )
     return AgentServices(paths, threads, runs, coordinator, skills, importer, registry,
                          policy, executor, builtin_serial_lock)
@@ -169,6 +174,16 @@ def _conflict_response(code: str, detail: str, *, thread_id: str | None = None,
 
 def _error_event(message: str) -> RunErrorEvent:
     return RunErrorEvent(message=message, code="AGENT_RUN_FAILED")
+
+
+def _budget_frame(thread_id: str, product_run_id: str | None, control, view) -> str | None:
+    """终局 budget.updated 帧：提交成功后、terminal 事件之前发出（§19.4）。"""
+    if view is None or product_run_id is None:
+        return None
+    payload = build_budget_payload(
+        thread_id=thread_id, run_id=product_run_id, control=control, view=view)
+    return EventEncoder().encode(CustomEvent(
+        name="budget.updated", value=json.dumps(payload, ensure_ascii=False)))
 
 
 def _redact_value(value, secret: str):
@@ -346,6 +361,10 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
             )
             handle = admission.handle
             adapter_input = admission.input
+    except PolicyCorrupt as exc:
+        # 新产品 run fail-closed：duplicate/busy/revision 检查已在协调器内优先完成
+        return JSONResponse(status_code=503, content={
+            "code": "POLICY_CORRUPT", "detail": str(exc)})
     except SkillError as exc:
         # 能力错误发生在任何 user/run 写入之前（400/404/409）
         return _skill_error_response(exc)
@@ -434,7 +453,12 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                         )
                         for commit in commits:
                             yield encoder.encode(thread_revision_updated(commit.thread_id, commit.revision, commit.persisted_at))
-                        await services.coordinator.mark_awaiting_approval(thread_id)
+                        segment_view = await services.coordinator.mark_awaiting_approval(thread_id)
+                        budget_frame = _redact_frame(
+                            _budget_frame(thread_id, handle.product_run_id,
+                                          handle.control, segment_view) or "", model_key)
+                        if budget_frame:
+                            yield budget_frame
                         terminal = "awaiting_approval"
                     else:
                         # 终局：最终 revision 事件必须先于 RUN_FINISHED
@@ -443,6 +467,11 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                         )
                         for commit in commits:
                             yield encoder.encode(thread_revision_updated(commit.thread_id, commit.revision, commit.persisted_at))
+                        budget_frame = _redact_frame(
+                            _budget_frame(thread_id, handle.product_run_id,
+                                          handle.control, handle.control.view()) or "", model_key)
+                        if budget_frame:
+                            yield budget_frame
                         terminal = "completed"
                     for converted in converted_events:
                         # 中断 outcome 携带的工具描述/元数据同样可能夹带密钥：出口统一脱敏
@@ -503,6 +532,11 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                 )
                 for commit in commits:
                     yield encoder.encode(thread_revision_updated(commit.thread_id, commit.revision, commit.persisted_at))
+                budget_frame = _redact_frame(
+                    _budget_frame(thread_id, handle.product_run_id,
+                                  handle.control, handle.control.view()) or "", model_key)
+                if budget_frame:
+                    yield budget_frame
             except _PersistenceFailure:
                 yield encoder.encode(RunErrorEvent(
                     message=f"运行状态未能持久化，本地历史可能不完整：{message}",
