@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
+from pathlib import Path
 
 import pytest
 from starlette.testclient import TestClient
@@ -11,7 +13,14 @@ from starlette.testclient import TestClient
 import app as app_module
 import agent.router as router_module
 from agent.router import build_services
-from agent.models import ArtifactDocument, MarkdownContent, TableContent, TableColumn
+from agent.models import (
+    ArtifactDocument,
+    MarkdownContent,
+    ModelRef,
+    RunDocument,
+    TableContent,
+    TableColumn,
+)
 from tests.agent.conftest import enter_single_loop_client
 
 
@@ -87,6 +96,55 @@ def test_list_detail_download_and_delete_contract(seeded, client, monkeypatch):
     assert not (seeded.paths.artifacts_dir / "thread-a" / "artifact-1.json").exists()
     refreshed = seeded.threads.get("thread-a")
     assert refreshed.artifact_ids == ["artifact-2"]
+
+
+def test_list_artifacts_serializes_artifact_recovery_warnings(seeded):
+    payload = json.loads((seeded.paths.artifacts_dir / "thread-a" / "artifact-1.json").read_text(
+        encoding="utf-8"))
+    payload["id"] = "artifact-orphan"
+    (seeded.paths.artifacts_dir / "thread-a" / "artifact-orphan.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    raw_client = TestClient(app_module.app, client=("127.0.0.1", 50081),
+                            raise_server_exceptions=False)
+    client = enter_single_loop_client(raw_client)
+
+    response = client.get("/api/agent/threads/thread-a/artifacts")
+
+    assert response.status_code == 200, response.text
+    assert {warning["code"] for warning in response.json()["warnings"]} == {"ARTIFACT_ORPHAN"}
+    assert response.json()["warnings"][0]["document_type"] == "artifact"
+
+
+def test_startup_retains_tombstone_cleanup_warning_for_thread_list(tmp_path, monkeypatch):
+    services = build_services(tmp_path / "agent")
+    monkeypatch.setattr(router_module, "services", services)
+    run = RunDocument.start(
+        run_id="run-1", thread_id="thread-1", protocol_run_id="protocol-run-1",
+        model_ref=ModelRef(provider="fixture", baseURL="https://example.com/v1", model="fixture-model"),
+        trigger_message_id="user-1", history_head_id="user-1", now="2026-08-15T12:00:00Z")
+    services.runs.replace(run)
+    original = services.paths.runs / "run-1.json"
+    tombstone = services.paths.runs / "run-1.json.deleting-20260817T120000000000"
+    original.replace(tombstone)
+    real_unlink = Path.unlink
+
+    def fail_tombstone_cleanup(path, *args, **kwargs):
+        if path == tombstone:
+            raise OSError("cleanup blocked")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_tombstone_cleanup)
+    asyncio.run(router_module.startup_agent_services())
+    client = enter_single_loop_client(TestClient(
+        app_module.app, client=("127.0.0.1", 50003), raise_server_exceptions=False))
+
+    response = client.get("/api/agent/threads")
+
+    assert response.status_code == 200
+    assert any(warning["code"] == "DELETE_TOMBSTONE_LEFTOVER"
+               and warning["document_type"] == "run"
+               and warning["filename"] == tombstone.name
+               for warning in response.json()["warnings"])
 
 
 def test_thread_delete_tombstone_and_recovery(seeded, client):

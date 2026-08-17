@@ -113,11 +113,21 @@ def atomic_write_json(path: Path, payload: dict) -> None:
             tmp.unlink()
 
 
+RecoveryWarningCode = Literal[
+    "DOCUMENT_CORRUPT",
+    "ARTIFACT_ORPHAN",
+    "ARTIFACT_MISSING_REF",
+    "ARTIFACT_CHAIN_INVALID",
+    "ARTIFACT_STAGING_LEFTOVER",
+    "DELETE_TOMBSTONE_LEFTOVER",
+]
+RecoveryWarningDocumentType = Literal["thread", "run", "artifact"]
+
+
 @dataclass(frozen=True)
 class RecoveryWarning:
-    code: Literal["DOCUMENT_CORRUPT", "ARTIFACT_ORPHAN", "ARTIFACT_MISSING_REF",
-                  "ARTIFACT_CHAIN_INVALID", "ARTIFACT_STAGING_LEFTOVER"]
-    document_type: Literal["thread", "run", "artifact"]
+    code: RecoveryWarningCode
+    document_type: RecoveryWarningDocumentType
     filename: str
 
 
@@ -392,6 +402,10 @@ def reconcile_agent_data(paths: AgentPaths, threads: ThreadStore, runs: RunStore
 
 
 ARTIFACT_TOMBSTONE_SUFFIX = ".deleting-"
+ARTIFACT_TOMBSTONE_RE = re.compile(
+    r"^(?P<thread_id>[A-Za-z0-9_-]{1,128})\.deleting-\d{8}T\d{12}$")
+RUN_TOMBSTONE_RE = re.compile(
+    r"^(?P<run_id>[A-Za-z0-9_-]{1,128})\.json\.deleting-\d{8}T\d{12}$")
 
 
 def reconcile_artifacts(paths: AgentPaths, threads: ThreadStore,
@@ -403,60 +417,189 @@ def reconcile_artifacts(paths: AgentPaths, threads: ThreadStore,
     - orphan JSON / missing ref / 链问题只告警，不静默修改。
     """
     warnings: list[RecoveryWarning] = []
+    _reconcile_run_tombstones(paths, warnings)
     root = paths.artifacts_dir
-    if root.exists():
-        for entry in sorted(root.iterdir()):
-            if entry.is_symlink():
-                continue
-            if entry.is_dir() and ARTIFACT_TOMBSTONE_SUFFIX in entry.name:
-                # 删除 tombstone：thread 文件存在 → 回滚 rename；否则清理
-                original_id = entry.name.split(ARTIFACT_TOMBSTONE_SUFFIX)[0]
-                if (paths.threads / f"{original_id}.json").exists():
-                    target = root / original_id
-                    if not target.exists():
-                        try:
-                            os.replace(entry, target)
-                        except OSError:
-                            pass
-                else:
-                    _remove_tree(entry)
-                continue
-            if not entry.is_dir():
-                continue
-            thread_id = entry.name
-            for child in sorted(entry.iterdir()):
-                if child.is_symlink():
-                    continue
-                name = child.name
-                if name.endswith(".artifact.tmp"):
-                    artifact_id = name.split(".")[0]
-                    if not (entry / f"{artifact_id}.json").exists():
-                        # 可证明未完成提交：staging 无对应最终文件
-                        try:
-                            child.unlink()
-                        except OSError:
-                            pass
-                    else:
-                        warnings.append(RecoveryWarning(
-                            "ARTIFACT_STAGING_LEFTOVER", "artifact", name))
-                elif name.endswith(".json"):
-                    warnings.append(RecoveryWarning(
-                        "ARTIFACT_ORPHAN", "artifact", f"{thread_id}/{name}"))
-        # 引用与链完整性（thread artifact_ids ↔ 文件）
-        from agent.artifacts import ArtifactStore  # 延迟导入避免环
-        for thread in threads.list_documents()[0]:
-            for artifact_id in thread.artifact_ids:
-                if not (root / thread.id / f"{artifact_id}.json").exists():
-                    warnings.append(RecoveryWarning(
-                        "ARTIFACT_MISSING_REF", "artifact", f"{thread.id}/{artifact_id}.json"))
-            issues = artifact_store.detect_chain_issues(thread.id) if hasattr(
-                artifact_store, "detect_chain_issues") else {}
-            for artifact_id, reason in issues.items():
+    thread_documents, _ = threads.list_documents()
+    threads_by_id = {thread.id: thread for thread in thread_documents}
+    if not root.exists():
+        return warnings
+
+    for entry in sorted(root.iterdir()):
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        tombstone = ARTIFACT_TOMBSTONE_RE.fullmatch(entry.name)
+        if tombstone:
+            _reconcile_artifact_tombstone(
+                paths, root, entry, tombstone.group("thread_id"), warnings)
+
+    for entry in sorted(root.iterdir()):
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        if ARTIFACT_TOMBSTONE_RE.fullmatch(entry.name):
+            continue
+        if not ID_RE.fullmatch(entry.name):
+            continue
+        thread_id = entry.name
+        _reconcile_staging_files(entry, thread_id, warnings)
+        _quarantine_invalid_artifacts(entry, thread_id, artifact_store, warnings)
+        _quarantine_invalid_chains(entry, thread_id, artifact_store, warnings)
+        healthy_ids = {item.id for item in artifact_store.list_for_thread(thread_id)}
+        thread = threads_by_id.get(thread_id)
+        referenced = set(thread.artifact_ids) if thread is not None else set()
+        for artifact_id in sorted(healthy_ids - referenced):
+            warnings.append(RecoveryWarning(
+                "ARTIFACT_ORPHAN", "artifact", f"{thread_id}/{artifact_id}.json"))
+
+    for thread in thread_documents:
+        healthy_ids = {item.id for item in artifact_store.list_for_thread(thread.id)}
+        for artifact_id in thread.artifact_ids:
+            if artifact_id not in healthy_ids:
                 warnings.append(RecoveryWarning(
-                    "ARTIFACT_CHAIN_INVALID", "artifact", f"{thread.id}/{artifact_id}.json:{reason}"))
+                    "ARTIFACT_MISSING_REF", "artifact", f"{thread.id}/{artifact_id}.json"))
     return warnings
 
 
 def _remove_tree(directory: Path) -> None:
     import shutil
-    shutil.rmtree(directory, ignore_errors=True)
+
+    shutil.rmtree(directory)
+
+
+def _reconcile_run_tombstones(paths: AgentPaths, warnings: list[RecoveryWarning]) -> None:
+    if not paths.runs.exists():
+        return
+    for tombstone in sorted(paths.runs.iterdir()):
+        if tombstone.is_symlink() or not tombstone.is_file():
+            continue
+        match = RUN_TOMBSTONE_RE.fullmatch(tombstone.name)
+        if match is None:
+            continue
+        try:
+            payload = json.loads(tombstone.read_text(encoding="utf-8"))
+            run = RunDocument.model_validate(payload)
+        except (json.JSONDecodeError, ValidationError, ValueError, OSError):
+            warnings.append(RecoveryWarning(
+                "DELETE_TOMBSTONE_LEFTOVER", "run", tombstone.name))
+            continue
+        if run.id != match.group("run_id"):
+            warnings.append(RecoveryWarning(
+                "DELETE_TOMBSTONE_LEFTOVER", "run", tombstone.name))
+            continue
+        thread_id = run.thread_id
+        original = paths.runs / f"{match.group('run_id')}.json"
+        thread_path = paths.threads / f"{thread_id}.json"
+        if thread_path.is_file() and not thread_path.is_symlink():
+            if original.exists():
+                warnings.append(RecoveryWarning(
+                    "DELETE_TOMBSTONE_LEFTOVER", "run", tombstone.name))
+                continue
+            try:
+                os.replace(tombstone, original)
+            except OSError:
+                warnings.append(RecoveryWarning(
+                    "DELETE_TOMBSTONE_LEFTOVER", "run", tombstone.name))
+            continue
+        try:
+            tombstone.unlink()
+        except OSError:
+            warnings.append(RecoveryWarning(
+                "DELETE_TOMBSTONE_LEFTOVER", "run", tombstone.name))
+
+
+def _reconcile_artifact_tombstone(paths: AgentPaths, root: Path, tombstone: Path,
+                                  thread_id: str, warnings: list[RecoveryWarning]) -> None:
+    target = root / thread_id
+    thread_path = paths.threads / f"{thread_id}.json"
+    if thread_path.is_file() and not thread_path.is_symlink():
+        if target.exists():
+            warnings.append(RecoveryWarning(
+                "DELETE_TOMBSTONE_LEFTOVER", "artifact", tombstone.name))
+            return
+        try:
+            os.replace(tombstone, target)
+        except OSError:
+            warnings.append(RecoveryWarning(
+                "DELETE_TOMBSTONE_LEFTOVER", "artifact", tombstone.name))
+        return
+    try:
+        _remove_tree(tombstone)
+    except OSError:
+        warnings.append(RecoveryWarning(
+            "DELETE_TOMBSTONE_LEFTOVER", "artifact", tombstone.name))
+
+
+def _reconcile_staging_files(directory: Path, thread_id: str,
+                             warnings: list[RecoveryWarning]) -> None:
+    from agent.artifacts import STAGING_RE  # 延迟导入避免 stores/artifacts 环
+
+    for current, directories, filenames in os.walk(directory, topdown=True, followlinks=False):
+        current_path = Path(current)
+        directories[:] = [name for name in directories if not (current_path / name).is_symlink()]
+        for name in filenames:
+            path = current_path / name
+            if path.is_symlink() or STAGING_RE.fullmatch(name) is None:
+                continue
+            artifact_id = name.removesuffix(".artifact.tmp").rsplit(".", 1)[0]
+            final = current_path / f"{artifact_id}.json"
+            if not final.is_symlink() and final.is_file():
+                warnings.append(RecoveryWarning(
+                    "ARTIFACT_STAGING_LEFTOVER", "artifact",
+                    f"{thread_id}/{path.relative_to(directory)}"))
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                warnings.append(RecoveryWarning(
+                    "ARTIFACT_STAGING_LEFTOVER", "artifact",
+                    f"{thread_id}/{path.relative_to(directory)}"))
+
+
+def _quarantine_invalid_artifacts(directory: Path, thread_id: str, artifact_store,
+                                  warnings: list[RecoveryWarning]) -> None:
+    from agent.artifacts import ArtifactError
+
+    for current, directories, filenames in os.walk(directory, topdown=True, followlinks=False):
+        current_path = Path(current)
+        directories[:] = [name for name in directories if not (current_path / name).is_symlink()]
+        for name in sorted(filenames):
+            path = current_path / name
+            if path.is_symlink() or not path.is_file() or path.suffix != ".json":
+                continue
+            if current_path != directory:
+                filename = _quarantine_artifact(path)
+                warnings.append(RecoveryWarning(
+                    "ARTIFACT_CHAIN_INVALID", "artifact",
+                    f"{thread_id}/{path.relative_to(directory).with_name(filename)}"))
+                continue
+            artifact_id = path.name[: -len(".json")]
+            try:
+                artifact_store.get(thread_id, artifact_id)
+            except (ArtifactError, DocumentCorrupt):
+                filename = _quarantine_artifact(path)
+                warnings.append(RecoveryWarning(
+                    "ARTIFACT_CHAIN_INVALID", "artifact", f"{thread_id}/{filename}"))
+
+
+def _quarantine_invalid_chains(directory: Path, thread_id: str, artifact_store,
+                               warnings: list[RecoveryWarning]) -> None:
+    while True:
+        issues = artifact_store.detect_chain_issues(thread_id)
+        if not issues:
+            return
+        changed = False
+        for artifact_id, reason in sorted(issues.items()):
+            path = directory / f"{artifact_id}.json"
+            if path.is_symlink() or not path.is_file():
+                continue
+            filename = _quarantine_artifact(path)
+            warnings.append(RecoveryWarning(
+                "ARTIFACT_CHAIN_INVALID", "artifact", f"{thread_id}/{filename}:{reason}"))
+            changed = True
+        if not changed:
+            return
+
+
+def _quarantine_artifact(path: Path) -> str:
+    quarantined = path.with_name(f"{path.name}.corrupt-{utc_stamp()}")
+    os.replace(path, quarantined)
+    return quarantined.name

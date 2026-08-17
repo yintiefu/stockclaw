@@ -1574,10 +1574,11 @@ class RunCoordinator:
                     try:
                         if tomb.is_dir():
                             import shutil
-                            shutil.rmtree(tomb, ignore_errors=True)
+                            shutil.rmtree(tomb)
                         else:
                             tomb.unlink(missing_ok=True)
                     except OSError:
+                        # 提交点后只保留 tombstone；启动对账会继续清理并上报恢复告警。
                         continue
 
             if self._paths is not None:

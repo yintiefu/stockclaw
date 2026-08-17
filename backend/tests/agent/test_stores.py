@@ -6,7 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from agent.models import AgentMessage, ModelRef, RunDocument, RunSummary, ThreadDocument
+from agent.artifacts import ArtifactStore
+from agent.models import (
+    AgentMessage,
+    ArtifactDocument,
+    MarkdownContent,
+    ModelRef,
+    RunDocument,
+    RunSummary,
+    ThreadDocument,
+)
 from agent.stores import (
     AgentPaths,
     DocumentCorrupt,
@@ -19,6 +28,7 @@ from agent.stores import (
     atomic_write_json,
     latest_runs_by_thread,
     reconcile_agent_data,
+    reconcile_artifacts,
 )
 
 NOW = "2026-08-15T12:00:00Z"
@@ -39,6 +49,19 @@ def make_run(run_id="run-1", thread_id="thread-1", status="completed", updated_a
         now=NOW,
     )
     return run.model_copy(update={"status": status, "updated_at": updated_at})
+
+
+def make_artifact(artifact_id="artifact-1", thread_id="thread-1", parent_artifact_id=None):
+    return ArtifactDocument(
+        id=artifact_id,
+        thread_id=thread_id,
+        run_id="run-1",
+        type="markdown",
+        title="研究摘录",
+        created_at=NOW,
+        parent_artifact_id=parent_artifact_id,
+        content=MarkdownContent(markdown="# 摘录"),
+    )
 
 
 def test_atomic_write_flushes_file_replaces_and_fsyncs_parent(tmp_path, monkeypatch):
@@ -222,6 +245,157 @@ def test_reconcile_repairs_run_status_and_thread_summary_then_removes_only_owned
 
     assert not owned_tmp.exists()
     assert unowned_tmp.exists()
+
+
+def test_reconcile_restores_run_tombstone_before_thread_delete_commit(tmp_path):
+    paths = make_paths(tmp_path)
+    threads = ThreadStore(paths)
+    runs = RunStore(paths)
+    threads.create(ThreadDocument.new("thread-1", "待删", now=NOW))
+    runs.replace(make_run())
+    original = paths.runs / "run-1.json"
+    tombstone = paths.runs / "run-1.json.deleting-20260817T120000000000"
+    original.replace(tombstone)
+
+    warnings = reconcile_artifacts(paths, threads, ArtifactStore(paths.root))
+
+    assert warnings == []
+    assert original.exists()
+    assert not tombstone.exists()
+    assert runs.get("run-1").thread_id == "thread-1"
+
+
+def test_reconcile_does_not_restore_run_tombstone_with_mismatched_payload_id(tmp_path):
+    paths = make_paths(tmp_path)
+    threads = ThreadStore(paths)
+    runs = RunStore(paths)
+    threads.create(ThreadDocument.new("thread-1", "待删", now=NOW))
+    runs.replace(make_run(run_id="run-payload"))
+    original = paths.runs / "run-payload.json"
+    tombstone = paths.runs / "run-file.json.deleting-20260817T120000000000"
+    original.replace(tombstone)
+
+    warnings = reconcile_artifacts(paths, threads, ArtifactStore(paths.root))
+
+    assert not (paths.runs / "run-file.json").exists()
+    assert tombstone.exists()
+    assert any(w.code == "DELETE_TOMBSTONE_LEFTOVER" and w.filename == tombstone.name
+               for w in warnings)
+
+
+def test_reconcile_cleans_run_tombstone_after_thread_delete_commit_and_retries_failures(tmp_path, monkeypatch):
+    paths = make_paths(tmp_path)
+    threads = ThreadStore(paths)
+    runs = RunStore(paths)
+    runs.replace(make_run())
+    original = paths.runs / "run-1.json"
+    tombstone = paths.runs / "run-1.json.deleting-20260817T120000000000"
+    original.replace(tombstone)
+
+    real_unlink = Path.unlink
+
+    def fail_tombstone_cleanup(path, *args, **kwargs):
+        if path == tombstone:
+            raise OSError("cleanup blocked")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_tombstone_cleanup)
+    warnings = reconcile_artifacts(paths, threads, ArtifactStore(paths.root))
+
+    assert tombstone.exists()
+    assert any(w.code == "DELETE_TOMBSTONE_LEFTOVER" and w.document_type == "run"
+               and w.filename == tombstone.name for w in warnings)
+
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    warnings = reconcile_artifacts(paths, threads, ArtifactStore(paths.root))
+    assert warnings == []
+    assert not original.exists()
+    assert not tombstone.exists()
+
+
+def test_reconcile_artifacts_only_cleans_strict_staging_without_following_symlinks(tmp_path):
+    paths = make_paths(tmp_path)
+    threads = ThreadStore(paths)
+    thread = ThreadDocument.new("thread-1", "研究", now=NOW)
+    threads.create(thread)
+    store = ArtifactStore(paths.root)
+    artifact_dir = paths.artifacts_dir / thread.id
+    artifact_dir.mkdir(parents=True)
+    strict = artifact_dir / "artifact-1.abcdef0123456789abcdef0123456789.artifact.tmp"
+    malformed = artifact_dir / "artifact-2.ABCDEF0123456789ABCDEF0123456789.artifact.tmp"
+    nested = artifact_dir / "nested"
+    nested.mkdir()
+    nested_strict = nested / "artifact-3.abcdef0123456789abcdef0123456789.artifact.tmp"
+    strict.write_text("{}", encoding="utf-8")
+    malformed.write_text("{}", encoding="utf-8")
+    nested_strict.write_text("{}", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_staging = outside / "artifact-4.abcdef0123456789abcdef0123456789.artifact.tmp"
+    outside_staging.write_text("{}", encoding="utf-8")
+    (paths.artifacts_dir / "thread-link").symlink_to(outside, target_is_directory=True)
+    symlink_final_staging = artifact_dir / "artifact-5.abcdef0123456789abcdef0123456789.artifact.tmp"
+    symlink_final_staging.write_text("{}", encoding="utf-8")
+    (artifact_dir / "artifact-5.json").symlink_to(outside / "artifact-5.json")
+    (outside / "artifact-5.json").write_text("{}", encoding="utf-8")
+    nested_json = nested / "artifact-nested.json"
+    nested_json.write_text("{}", encoding="utf-8")
+
+    reconcile_artifacts(paths, threads, store)
+
+    assert not strict.exists()
+    assert malformed.exists()
+    assert not nested_strict.exists()
+    assert outside_staging.exists()
+    assert not symlink_final_staging.exists()
+    assert not nested_json.exists()
+    assert list(nested.glob("artifact-nested.json.corrupt-*"))
+
+
+def test_reconcile_validates_artifacts_restored_from_precommit_tombstone(tmp_path):
+    paths = make_paths(tmp_path)
+    threads = ThreadStore(paths)
+    threads.create(ThreadDocument.new("thread-1", "研究", now=NOW))
+    store = ArtifactStore(paths.root)
+    tombstone = paths.artifacts_dir / "thread-1.deleting-20260817T120000000000"
+    tombstone.mkdir(parents=True)
+    tombstone.joinpath("artifact-identity.json").write_text(
+        json.dumps(make_artifact("artifact-payload").model_dump(mode="json")), encoding="utf-8")
+
+    warnings = reconcile_artifacts(paths, threads, store)
+
+    restored = paths.artifacts_dir / "thread-1"
+    assert restored.exists()
+    assert not (restored / "artifact-identity.json").exists()
+    assert list(restored.glob("artifact-identity.json.corrupt-*"))
+    assert any(w.code == "ARTIFACT_CHAIN_INVALID" and "artifact-identity" in w.filename
+               for w in warnings)
+
+
+def test_reconcile_artifacts_keeps_referenced_files_and_quarantines_identity_and_chain_failures(tmp_path):
+    paths = make_paths(tmp_path)
+    threads = ThreadStore(paths)
+    threads.create(ThreadDocument.new("thread-1", "研究", now=NOW).model_copy(
+        update={"artifact_ids": ["artifact-ok"]}))
+    store = ArtifactStore(paths.root)
+    store.publish(store.stage(make_artifact("artifact-ok")))
+    store.publish(store.stage(make_artifact("artifact-orphan")))
+    store.publish(store.stage(make_artifact("artifact-payload")))
+    artifact_dir = paths.artifacts_dir / "thread-1"
+    (artifact_dir / "artifact-payload.json").replace(artifact_dir / "artifact-identity.json")
+    store.publish(store.stage(make_artifact("artifact-chain", parent_artifact_id="missing-parent")))
+
+    warnings = reconcile_artifacts(paths, threads, store)
+
+    assert not any(w.code == "ARTIFACT_ORPHAN" and "artifact-ok" in w.filename for w in warnings)
+    assert any(w.code == "ARTIFACT_ORPHAN" and "artifact-orphan" in w.filename for w in warnings)
+    assert any(w.code == "ARTIFACT_CHAIN_INVALID" and "artifact-identity" in w.filename for w in warnings)
+    assert any(w.code == "ARTIFACT_CHAIN_INVALID" and "artifact-chain" in w.filename for w in warnings)
+    assert store.get("thread-1", "artifact-ok").id == "artifact-ok"
+    assert not (artifact_dir / "artifact-identity.json").exists()
+    assert not (artifact_dir / "artifact-chain.json").exists()
+    assert list(artifact_dir.glob("artifact-identity.json.corrupt-*"))
+    assert list(artifact_dir.glob("artifact-chain.json.corrupt-*"))
 
 
 def test_latest_runs_by_thread_prefers_max_updated_at_then_id():

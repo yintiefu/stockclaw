@@ -4,7 +4,7 @@ import asyncio
 import ipaddress
 import os
 from typing import TypeVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -48,6 +48,8 @@ from agent.stores import (
     DocumentNotFound,
     InvalidDocumentId,
     RecoveryWarning,
+    RecoveryWarningCode,
+    RecoveryWarningDocumentType,
     RevisionConflict,
     RunListItem,
     RunStore,
@@ -98,6 +100,7 @@ class AgentServices:
     executor: BoundedToolExecutor
     builtin_serial_lock: asyncio.Lock
     artifacts_service: "ArtifactService"
+    recovery_warnings: list[RecoveryWarning] = field(default_factory=list)
 
 
 def build_services(root: Path | None = None) -> AgentServices:
@@ -603,8 +606,8 @@ class ThreadSummaryResponse(BaseModel):
 
 
 class RecoveryWarningResponse(BaseModel):
-    code: Literal["DOCUMENT_CORRUPT"]
-    document_type: Literal["thread", "run"]
+    code: RecoveryWarningCode
+    document_type: RecoveryWarningDocumentType
     filename: str
 
 
@@ -636,7 +639,7 @@ async def list_threads():
     summaries = [_summary_of(t) for t in threads]
     warnings = [
         RecoveryWarningResponse(code=w.code, document_type=w.document_type, filename=w.filename)
-        for w in list(thread_warnings) + list(run_scan.warnings)
+        for w in list(services.recovery_warnings) + list(thread_warnings) + list(run_scan.warnings)
     ]
     return ThreadListResponse(threads=summaries, warnings=warnings)
 
@@ -1148,11 +1151,15 @@ async def list_thread_artifacts(thread_id: str):
         {**item.model_dump(), "has_children": item.id in parents}
         for item in artifacts
     ]
+    recovery_warnings = [
+        warning for warning in services.recovery_warnings
+        if warning.document_type == "artifact"
+    ]
     return ArtifactListResponse(
         artifacts=enriched,
         warnings=[RecoveryWarningResponse(
             code=w.code, document_type=w.document_type, filename=w.filename)
-            for w in warnings])
+            for w in [*recovery_warnings, *warnings]])
 
 
 @router.get("/threads/{thread_id}/artifacts/{artifact_id}")
@@ -1302,7 +1309,7 @@ async def startup_agent_services() -> None:
     # 1D 对账顺序：interrupted-run 恢复 → Artifact/tombstone 对账
     await asyncio.to_thread(reconcile_agent_data, current.paths, current.threads, current.runs)
     from agent.stores import reconcile_artifacts
-    await asyncio.to_thread(
+    current.recovery_warnings = await asyncio.to_thread(
         reconcile_artifacts, current.paths, current.threads, current.artifacts_service.store)
     # 1C：Skill 导入恢复 + 首次扫描（不连接网络，也不触碰默认数据根以外的目录）
     await asyncio.to_thread(current.importer.recover)
