@@ -70,7 +70,14 @@ from agent.mcp import (
     McpServerNotFound,
     StdioTrustRequired,
 )
-from agent.artifacts import ArtifactService, ArtifactStore
+from agent.artifacts import (
+    ArtifactError,
+    ArtifactHasChild,
+    ArtifactInvalid,
+    ArtifactNotFound,
+    ArtifactService,
+    ArtifactStore,
+)
 from agent.skills import SkillError, SkillImporter, SkillRegistry, SkillResourceForbidden, SkillUnavailable
 from agent.tool_executor import BoundedToolExecutor
 from agent.tool_registry import build_builtin_tools, create_artifact_tool
@@ -130,6 +137,7 @@ def build_services(root: Path | None = None) -> AgentServices:
         builtin_serial_lock=builtin_serial_lock,
         policy=policy,
         artifact_service=artifacts_service,
+        paths=paths,
     )
     _artifact_lock_target.thread_lock = coordinator.thread_lock
     return AgentServices(paths, threads, runs, coordinator, skills, importer, registry,
@@ -1095,6 +1103,134 @@ async def refresh_mcp_server(server_id: str, payload: McpAction):
 
 
 
+# ---- 1D：Artifact REST ----
+
+ARTIFACT_DOWNLOAD = {
+    "markdown": ("md", "text/markdown; charset=utf-8"),
+    "table": ("json", "application/json; charset=utf-8"),
+    "json": ("json", "application/json; charset=utf-8"),
+    "sources": ("json", "application/json; charset=utf-8"),
+}
+
+
+class ArtifactListResponse(BaseModel):
+    artifacts: list[dict]
+    warnings: list[RecoveryWarningResponse]
+
+
+def _artifact_error(exc: Exception, status: int) -> JSONResponse:
+    code = getattr(exc, "code", "ARTIFACT_ERROR")
+    return JSONResponse(status_code=status, content={"code": code, "detail": str(exc)})
+
+
+async def _artifact_membership(thread_id: str, artifact_id: str):
+    """先读路径 thread 文档并确认成员关系，再受控构造文件路径。"""
+    thread = await asyncio.to_thread(services.threads.get, thread_id)
+    if artifact_id not in thread.artifact_ids:
+        raise KeyError("ARTIFACT_NOT_IN_THREAD")
+    return thread
+
+
+@router.get("/threads/{thread_id}/artifacts")
+async def list_thread_artifacts(thread_id: str):
+    try:
+        await asyncio.to_thread(services.threads.get, thread_id)
+    except InvalidDocumentId as exc:
+        return _artifact_error(exc, 400)
+    except DocumentNotFound as exc:
+        return _artifact_error(exc, 404)
+    except DocumentCorrupt as exc:
+        return _artifact_error(exc, 500)
+    artifacts, warnings = await asyncio.to_thread(
+        services.artifacts_service.list_with_warnings, thread_id)
+    parents = {item.parent_artifact_id for item in artifacts if item.parent_artifact_id}
+    enriched = [
+        {**item.model_dump(), "has_children": item.id in parents}
+        for item in artifacts
+    ]
+    return ArtifactListResponse(
+        artifacts=enriched,
+        warnings=[RecoveryWarningResponse(
+            code=w.code, document_type=w.document_type, filename=w.filename)
+            for w in warnings])
+
+
+@router.get("/threads/{thread_id}/artifacts/{artifact_id}")
+async def get_thread_artifact(thread_id: str, artifact_id: str):
+    try:
+        await _artifact_membership(thread_id, artifact_id)
+        artifact = await asyncio.to_thread(
+            services.artifacts_service.store.get, thread_id, artifact_id)
+    except KeyError:
+        return _artifact_error(ArtifactNotFound("未引用"), 404)
+    except (InvalidDocumentId,) as exc:
+        return _artifact_error(exc, 400)
+    except DocumentNotFound as exc:
+        return _store_error_response(exc, 404)
+    except DocumentCorrupt as exc:
+        return _store_error_response(exc, 500)
+    except ArtifactNotFound as exc:
+        return _artifact_error(exc, 404)
+    return artifact.model_dump(mode="json")
+
+
+@router.get("/threads/{thread_id}/artifacts/{artifact_id}/download")
+async def download_thread_artifact(thread_id: str, artifact_id: str):
+    try:
+        await _artifact_membership(thread_id, artifact_id)
+        artifact = await asyncio.to_thread(
+            services.artifacts_service.store.get, thread_id, artifact_id)
+    except KeyError:
+        return _artifact_error(ArtifactNotFound("未引用"), 404)
+    except DocumentNotFound as exc:
+        return _store_error_response(exc, 404)
+    except DocumentCorrupt as exc:
+        return _store_error_response(exc, 500)
+    except ArtifactNotFound as exc:
+        return _artifact_error(exc, 404)
+    extension, media_type = ARTIFACT_DOWNLOAD[artifact.type]
+    payload = await asyncio.to_thread(
+        services.artifacts_service.store.read_bytes, thread_id, artifact_id)
+    return Response(
+        content=payload,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{artifact_id}.{extension}"',
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "sandbox; default-src 'none'",
+        },
+    )
+
+
+class ArtifactDelete(BaseModel):
+    thread_revision: int = Field(ge=0)
+
+
+@router.delete("/threads/{thread_id}/artifacts/{artifact_id}")
+async def delete_thread_artifact(thread_id: str, artifact_id: str, payload: ArtifactDelete):
+    try:
+        result = await services.coordinator.delete_artifact(
+            thread_id, artifact_id, expected_revision=payload.thread_revision)
+    except ArtifactNotFound as exc:
+        return _artifact_error(exc, 404)
+    except DocumentNotFound as exc:
+        return _store_error_response(exc, 404)
+    except RevisionConflict as exc:
+        return _store_error_response(exc, 409)
+    except ThreadBusy as exc:
+        return _store_error_response(exc, 409)
+    except ArtifactHasChild as exc:
+        return _artifact_error(exc, 409)
+    except ArtifactError as exc:
+        return _artifact_error(exc, 400)
+    except OSError as exc:
+        return JSONResponse(status_code=500, content={
+            "code": "ARTIFACT_DELETE_FAILED",
+            "detail": f"文件清理失败，已保留权威状态：{exc}",
+        })
+    return {"thread_revision": result}
+
+
 # ---- 1D：Policy REST ----
 
 
@@ -1163,7 +1299,11 @@ def _new_thread_id() -> str:
 async def startup_agent_services() -> None:
     # 调用时再解引用模块级 services，测试可先 monkeypatch 再进入 lifespan
     current = services
+    # 1D 对账顺序：interrupted-run 恢复 → Artifact/tombstone 对账
     await asyncio.to_thread(reconcile_agent_data, current.paths, current.threads, current.runs)
+    from agent.stores import reconcile_artifacts
+    await asyncio.to_thread(
+        reconcile_artifacts, current.paths, current.threads, current.artifacts_service.store)
     # 1C：Skill 导入恢复 + 首次扫描（不连接网络，也不触碰默认数据根以外的目录）
     await asyncio.to_thread(current.importer.recover)
     await asyncio.to_thread(current.skills.refresh)

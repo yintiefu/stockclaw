@@ -115,8 +115,9 @@ def atomic_write_json(path: Path, payload: dict) -> None:
 
 @dataclass(frozen=True)
 class RecoveryWarning:
-    code: Literal["DOCUMENT_CORRUPT"]
-    document_type: Literal["thread", "run"]
+    code: Literal["DOCUMENT_CORRUPT", "ARTIFACT_ORPHAN", "ARTIFACT_MISSING_REF",
+                  "ARTIFACT_CHAIN_INVALID", "ARTIFACT_STAGING_LEFTOVER"]
+    document_type: Literal["thread", "run", "artifact"]
     filename: str
 
 
@@ -351,8 +352,13 @@ def latest_runs_by_thread(runs: list[RunDocument]) -> dict[str, RunDocument]:
     return latest
 
 
-def reconcile_agent_data(paths: AgentPaths, threads: ThreadStore, runs: RunStore) -> None:
-    """启动对账：活跃 run → interrupted；线程摘要反查修复；只清理自有临时文件。"""
+def reconcile_agent_data(paths: AgentPaths, threads: ThreadStore, runs: RunStore,
+                          artifact_warnings: list[RecoveryWarning] | None = None) -> None:
+    """启动对账：活跃 run → interrupted；线程摘要反查修复；只清理自有临时文件。
+
+    1D：先完成 interrupted-run 恢复，再执行 Artifact/tombstone 对账（调用方
+    传入 `reconcile_artifacts` 的产出告警一并向调用方返回的场景见 router）。
+    """
     all_runs = runs.list_documents(include_corrupt=False)
     reconciled_runs = []
     for run in all_runs:
@@ -383,3 +389,74 @@ def reconcile_agent_data(paths: AgentPaths, threads: ThreadStore, runs: RunStore
         for child in directory.glob("*.tmp"):
             if OWNED_TMP_RE.fullmatch(child.name):
                 child.unlink()
+
+
+ARTIFACT_TOMBSTONE_SUFFIX = ".deleting-"
+
+
+def reconcile_artifacts(paths: AgentPaths, threads: ThreadStore,
+                        artifact_store) -> list[RecoveryWarning]:
+    """Artifact/删除 tombstone 对账（在 interrupted-run 恢复之后执行）。
+
+    - 只删除能证明是本写入管线未完成提交的严格 `<id>.<nonce>.artifact.tmp`。
+    - delete tombstone：按 thread 提交点（thread 文件是否存在）回滚或清理。
+    - orphan JSON / missing ref / 链问题只告警，不静默修改。
+    """
+    warnings: list[RecoveryWarning] = []
+    root = paths.artifacts_dir
+    if root.exists():
+        for entry in sorted(root.iterdir()):
+            if entry.is_symlink():
+                continue
+            if entry.is_dir() and ARTIFACT_TOMBSTONE_SUFFIX in entry.name:
+                # 删除 tombstone：thread 文件存在 → 回滚 rename；否则清理
+                original_id = entry.name.split(ARTIFACT_TOMBSTONE_SUFFIX)[0]
+                if (paths.threads / f"{original_id}.json").exists():
+                    target = root / original_id
+                    if not target.exists():
+                        try:
+                            os.replace(entry, target)
+                        except OSError:
+                            pass
+                else:
+                    _remove_tree(entry)
+                continue
+            if not entry.is_dir():
+                continue
+            thread_id = entry.name
+            for child in sorted(entry.iterdir()):
+                if child.is_symlink():
+                    continue
+                name = child.name
+                if name.endswith(".artifact.tmp"):
+                    artifact_id = name.split(".")[0]
+                    if not (entry / f"{artifact_id}.json").exists():
+                        # 可证明未完成提交：staging 无对应最终文件
+                        try:
+                            child.unlink()
+                        except OSError:
+                            pass
+                    else:
+                        warnings.append(RecoveryWarning(
+                            "ARTIFACT_STAGING_LEFTOVER", "artifact", name))
+                elif name.endswith(".json"):
+                    warnings.append(RecoveryWarning(
+                        "ARTIFACT_ORPHAN", "artifact", f"{thread_id}/{name}"))
+        # 引用与链完整性（thread artifact_ids ↔ 文件）
+        from agent.artifacts import ArtifactStore  # 延迟导入避免环
+        for thread in threads.list_documents()[0]:
+            for artifact_id in thread.artifact_ids:
+                if not (root / thread.id / f"{artifact_id}.json").exists():
+                    warnings.append(RecoveryWarning(
+                        "ARTIFACT_MISSING_REF", "artifact", f"{thread.id}/{artifact_id}.json"))
+            issues = artifact_store.detect_chain_issues(thread.id) if hasattr(
+                artifact_store, "detect_chain_issues") else {}
+            for artifact_id, reason in issues.items():
+                warnings.append(RecoveryWarning(
+                    "ARTIFACT_CHAIN_INVALID", "artifact", f"{thread.id}/{artifact_id}.json:{reason}"))
+    return warnings
+
+
+def _remove_tree(directory: Path) -> None:
+    import shutil
+    shutil.rmtree(directory, ignore_errors=True)

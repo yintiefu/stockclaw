@@ -31,6 +31,10 @@ class ArtifactNotFound(ArtifactError):
     code = "ARTIFACT_NOT_FOUND"
 
 
+class ArtifactHasChild(ArtifactError):
+    code = "ARTIFACT_HAS_CHILD"
+
+
 def encode_artifact(artifact: ArtifactDocument) -> bytes:
     """canonical JSON（排序/紧凑/非 ASCII/无 NaN）+ 末尾换行；超 1MB 拒绝。"""
     payload = artifact.model_dump(mode="json")
@@ -100,6 +104,12 @@ class ArtifactStore:
             self._fsync_dir(final.parent)
 
     # ---- 读 ----
+
+    def read_bytes(self, thread_id: str, artifact_id: str) -> bytes:
+        final = self._path(thread_id, artifact_id)
+        if final.is_symlink() or not final.exists():
+            raise ArtifactNotFound(f"Artifact 不存在: {artifact_id}")
+        return final.read_bytes()
 
     def get(self, thread_id: str, artifact_id: str) -> ArtifactDocument:
         final = self._path(thread_id, artifact_id)
@@ -186,6 +196,13 @@ class ArtifactStore:
             pass
 
 
+@dataclass(frozen=True)
+class _SimpleWarning:
+    code: str
+    document_type: str
+    filename: str
+
+
 class ArtifactPersistenceFailed(ArtifactError):
     """终局性持久化失败：绝不能作为可纠正工具结果返回。"""
 
@@ -211,6 +228,26 @@ class ArtifactService:
         self._threads = threads
         self._runs = runs
         self._thread_lock = thread_lock
+
+    def list_with_warnings(self, thread_id: str):
+        """列表 + 线程引用核对告警（不扫描其他 thread 文档）。"""
+        artifacts = self.store.metadata_for_thread(thread_id)
+        warnings = []
+        try:
+            thread = self._threads.get(thread_id)
+        except Exception:
+            return artifacts, warnings
+        referenced = set(thread.artifact_ids)
+        for item in artifacts:
+            if item.id not in referenced:
+                warnings.append(("ARTIFACT_ORPHAN", f"{thread_id}/{item.id}.json"))
+        for artifact_id in referenced:
+            if not any(item.id == artifact_id for item in artifacts):
+                warnings.append(("ARTIFACT_MISSING_REF", f"{thread_id}/{artifact_id}.json"))
+        from dataclasses import dataclass as _dc
+        return artifacts, [
+            _SimpleWarning(code=code, document_type="artifact", filename=filename)
+            for code, filename in warnings]
 
     # ---- 可纠正错误 ----
 

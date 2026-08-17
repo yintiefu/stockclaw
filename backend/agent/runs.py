@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, Sequence
 from uuid import uuid4
 
@@ -478,6 +480,7 @@ class RunCoordinator:
         builtin_serial_lock: asyncio.Lock | None = None,
         policy: "PolicyStore | None" = None,
         artifact_service: "Any | None" = None,
+        paths: "Any | None" = None,
     ):
         self._factory = factory or AgentFactory()
         self._locks: dict[str, asyncio.Lock] = {}
@@ -498,6 +501,8 @@ class RunCoordinator:
         self._policy = policy
         # 1D：Artifact 服务（经治理上下文注入 create_artifact 工具）
         self._artifact_service = artifact_service
+        # 1D：数据根（thread tombstone 删除需要受控路径）
+        self._paths = paths
 
     def _lock(self, thread_id: str) -> asyncio.Lock:
         if thread_id not in self._locks:
@@ -1490,8 +1495,37 @@ class RunCoordinator:
                 handle.thread_revision = updated.revision
             return updated
 
+    async def delete_artifact(self, thread_id: str, artifact_id: str,
+                              *, expected_revision: int) -> int:
+        """叶子 Artifact 删除：先提交引用移除，再删文件；失败保留权威状态。"""
+        from agent.artifacts import ArtifactHasChild, ArtifactNotFound
+        threads, _ = self._require_stores()
+        if self._artifact_service is None:
+            raise RuntimeError("RunCoordinator 未注入 Artifact 服务")
+        async with self._lock(thread_id):
+            handle = self._handles.get(thread_id)
+            if handle is not None and handle.phase in ("running", "awaiting_approval"):
+                raise ThreadBusy(f"{ThreadBusy.code}: thread {thread_id} has an active run")
+
+            def _delete_locked() -> int:
+                thread = threads.get(thread_id)
+                if artifact_id not in thread.artifact_ids:
+                    raise ArtifactNotFound(f"Artifact 不存在或未引用: {artifact_id}")
+                children = self._artifact_service.store.children_map(thread_id)
+                if children.get(artifact_id):
+                    raise ArtifactHasChild("Artifact 存在子版本，只有叶子可以删除")
+                updated = threads.update(
+                    thread_id, expected_revision,
+                    lambda doc: doc.model_copy(update={
+                        "artifact_ids": [a for a in doc.artifact_ids if a != artifact_id]}))
+                # 引用已提交；文件删除失败时保留状态并返回 500（由 router 映射）
+                self._artifact_service.store.delete_file(thread_id, artifact_id)
+                return updated.revision
+
+            return await asyncio.to_thread(_delete_locked)
+
     async def delete_thread(self, thread_id: str, expected_revision: int | None = None) -> None:
-        """删除线程（连带其全部 run 文件）；删除前按顶层不变量做 revision CAS。"""
+        """删除线程：tombstone 事务（rename → 删 thread 提交 → 清理）。"""
         threads, runs = self._require_stores()
         async with self._lock(thread_id):
             thread = await asyncio.to_thread(self._load_thread, thread_id)
@@ -1506,10 +1540,53 @@ class RunCoordinator:
                 self._release_handle(handle)
             if self._allowances is not None:
                 self._allowances.clear_thread(thread_id)
-            thread_runs = await asyncio.to_thread(runs.runs_for_thread, thread_id)
-            for run in thread_runs:
-                await asyncio.to_thread(runs.delete, run.id)
-            await asyncio.to_thread(threads.delete, thread_id)
+
+            def _tombstone_delete(paths) -> None:
+                from agent.stores import ARTIFACT_TOMBSTONE_SUFFIX, utc_stamp
+                stamp = utc_stamp()
+                renames: list[tuple[Path, Path]] = []
+                try:
+                    artifact_dir = paths.artifacts_dir / thread_id
+                    if artifact_dir.exists():
+                        tomb = artifact_dir.with_name(
+                            f"{thread_id}{ARTIFACT_TOMBSTONE_SUFFIX}{stamp}")
+                        os.replace(artifact_dir, tomb)
+                        renames.append((tomb, artifact_dir))
+                    for run in runs.runs_for_thread(thread_id):
+                        original = paths.runs / f"{run.id}.json"
+                        if original.exists():
+                            tomb = original.with_name(f"{run.id}.json{ARTIFACT_TOMBSTONE_SUFFIX}{stamp}")
+                            os.replace(original, tomb)
+                            renames.append((tomb, original))
+                    # 提交点：删除 thread 文件
+                    threads.delete(thread_id)
+                except BaseException:
+                    # 提交点前失败：回滚已完成的 rename，保留 thread
+                    for tomb, original in reversed(renames):
+                        try:
+                            if tomb.exists() and not original.exists():
+                                os.replace(tomb, original)
+                        except OSError:
+                            continue
+                    raise
+                # 提交点后：清理失败不回滚、不重新暴露已删除 thread（交给对账）
+                for tomb, _ in renames:
+                    try:
+                        if tomb.is_dir():
+                            import shutil
+                            shutil.rmtree(tomb, ignore_errors=True)
+                        else:
+                            tomb.unlink(missing_ok=True)
+                    except OSError:
+                        continue
+
+            if self._paths is not None:
+                await asyncio.to_thread(_tombstone_delete, self._paths)
+            else:
+                thread_runs = await asyncio.to_thread(runs.runs_for_thread, thread_id)
+                for run in thread_runs:
+                    await asyncio.to_thread(runs.delete, run.id)
+                await asyncio.to_thread(threads.delete, thread_id)
 
     async def shutdown(self) -> None:
         """进程退出：每个活动 run 走统一的持久化取消迁移（partial 落盘 + run 终态）。"""
