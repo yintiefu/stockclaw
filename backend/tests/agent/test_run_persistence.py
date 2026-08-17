@@ -1041,3 +1041,66 @@ def test_pre_1d_run_file_loads_with_defaults_and_no_migration_write(tmp_path):
     assert loaded.usage.total_tokens is None
     assert loaded.context_truncation == ContextTruncation(occurred=False)
     assert path.read_bytes() == original_bytes  # 读取路径绝不回写
+
+
+@pytest.mark.asyncio
+async def test_admitted_run_carries_default_snapshot_control(tmp_path):
+    """Task 4：生产准入创建的句柄必须带有 RunControl（默认快照直到 Task 7 接 Policy）。"""
+    coordinator, threads, runs = make_coordinator(tmp_path)
+    admission = await start(coordinator)
+    handle = coordinator.active("thread-1")
+    assert handle.control is not None
+    assert handle.control.snapshot.max_model_calls == 8
+    assert handle.control.snapshot.max_tool_calls == 16
+    assert admission.run.budget_snapshot == {}  # budget_snapshot 写入推迟到 Task 7
+
+
+@pytest.mark.asyncio
+async def test_persist_control_view_replaces_run_governance_fields(tmp_path):
+    from agent.governance import GovernanceView
+    from agent.models import ContextTruncation, RunUsage
+
+    coordinator, threads, runs = make_coordinator(tmp_path)
+    admission = await start(coordinator)
+
+    view = GovernanceView(
+        control_revision=3,
+        usage=RunUsage(model_calls=2, tool_calls=1, input_tokens=10, output_tokens=5,
+                       total_tokens=15, token_status="available"),
+        active_elapsed_ms=12_345,
+        context_truncation=ContextTruncation(occurred=True, original_chars=200,
+                                             retained_chars=80, removed_turns=1),
+    )
+    await coordinator.persist_control_view("thread-1", view)
+    persisted = runs.get(admission.run.id)
+    assert persisted.control_revision == 3
+    assert persisted.usage == view.usage
+    assert persisted.active_elapsed_ms == 12_345
+    assert persisted.context_truncation == view.context_truncation
+
+    # 低 revision 不得覆盖高 revision（迟到回调）
+    stale = GovernanceView(
+        control_revision=2,
+        usage=RunUsage(model_calls=1, tool_calls=0),
+        active_elapsed_ms=999,
+        context_truncation=ContextTruncation(),
+    )
+    await coordinator.persist_control_view("thread-1", stale)
+    still = runs.get(admission.run.id)
+    assert still.control_revision == 3
+    assert still.usage.model_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_persist_control_view_rejects_detached_handle(tmp_path):
+    from agent.governance import GovernanceView
+    from agent.models import ContextTruncation, RunUsage
+
+    coordinator, threads, runs = make_coordinator(tmp_path)
+    admission = await start(coordinator)
+    await coordinator.cancel_run("thread-1")
+
+    view = GovernanceView(control_revision=1, usage=RunUsage(model_calls=1),
+                          active_elapsed_ms=10, context_truncation=ContextTruncation())
+    with pytest.raises(RuntimeError):
+        await coordinator.persist_control_view("thread-1", view)

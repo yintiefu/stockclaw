@@ -18,6 +18,7 @@ from agent.capabilities import (
     CapabilityResolver,
     StaticCapabilityLease,
 )
+from agent.governance import DEFAULT_POLICY_SNAPSHOT, GovernanceView, RunControl
 from agent.runtime import AgentFactory, RuntimeHandle
 from agent.skills import SkillError
 from agent.stores import DocumentNotFound, RevisionConflict, utc_now
@@ -48,6 +49,9 @@ class ActiveRunHandle:
     journal: "RunJournal | None" = None
     # 1C：本次 run 的能力租约（无密钥）；resume 复用同一 lease
     capability_lease: CapabilityLease | None = None
+    # 1D：本次 run 的治理控制（reservation/段计时/usage）；resume 复用同一 control。
+    # 占位/纯内存句柄走默认快照；生产准入在 Task 7 起注入 PolicyStore 快照。
+    control: RunControl = field(default_factory=lambda: RunControl(DEFAULT_POLICY_SNAPSHOT))
 
 
 @dataclass
@@ -1206,6 +1210,36 @@ class RunCoordinator:
 
     def active(self, thread_id: str) -> ActiveRunHandle | None:
         return self._handles.get(thread_id)
+
+    # ---- 1D：治理视图持久化（reservation/usage/段计时回调的落盘点） ----
+
+    async def persist_control_view(self, thread_id: str, view: GovernanceView) -> None:
+        """线程锁内用治理视图替换完整 run 字段。
+
+        预留回调在 reservation_lock 内 await 本方法（锁序：reservation → 线程锁）。
+        拒绝脱离/终态句柄；迟到的低 revision 不得覆盖高 revision。
+        """
+        threads, runs = self._require_stores()
+        async with self._lock(thread_id):
+            handle = self._handles.get(thread_id)
+            if handle is None or handle.phase not in ("running", "awaiting_approval"):
+                raise RuntimeError(
+                    f"线程 {thread_id} 没有可持久化治理视图的活动 run（句柄已脱离或已终结）")
+            product_run_id = handle.product_run_id
+
+            def _replace() -> None:
+                run = runs.get(product_run_id)
+                if view.control_revision < run.control_revision:
+                    return
+                runs.replace(run.model_copy(update={
+                    "usage": view.usage,
+                    "control_revision": view.control_revision,
+                    "active_elapsed_ms": view.active_elapsed_ms,
+                    "context_truncation": view.context_truncation,
+                    "updated_at": utc_now(),
+                }))
+
+            await asyncio.to_thread(_replace)
 
     # ---- 1B：语义边界日志（与准入/改名的锁共用） ----
 
