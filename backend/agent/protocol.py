@@ -311,9 +311,16 @@ class AgentProtocolBridge:
         return {"decisions": decisions}
 
     def _capture(self, value: dict[str, Any]) -> None:
-        actions = value.get("action_requests") or []
-        reviews = value.get("review_configs") or []
-        if not actions or len(actions) != len(reviews):
+        actions = value.get("action_requests")
+        reviews = value.get("review_configs")
+        if (
+            not isinstance(actions, list)
+            or not isinstance(reviews, list)
+            or not actions
+            or len(actions) != len(reviews)
+            or any(not isinstance(action, dict) for action in actions)
+            or any(not isinstance(review, dict) for review in reviews)
+        ):
             raise ValueError("legacy interrupt has an invalid HITL request")
         candidates = [
             (tool_call_id, self._tool_calls[tool_call_id])

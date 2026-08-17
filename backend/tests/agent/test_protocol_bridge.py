@@ -243,6 +243,15 @@ def test_malformed_legacy_interrupt_json_fails_closed():
     assert out[0].code == "INVALID_CUSTOM_EVENT"
 
 
+def test_malformed_legacy_interrupt_items_fail_closed():
+    bridge = AgentProtocolBridge("thread-1", "run-1")
+    observe_tool_call(bridge)
+    out = bridge.convert(CustomEvent(type=EventType.CUSTOM, name="on_interrupt", value={
+        "action_requests": [None], "review_configs": [{}],
+    }))
+    assert out[0].code == "INVALID_CUSTOM_EVENT"
+
+
 def test_other_custom_events_remain_unsupported():
     bridge = AgentProtocolBridge("thread-1", "run-1")
     out = bridge.convert(CustomEvent(type=EventType.CUSTOM, name="budget.refreshed", value="{}"))
