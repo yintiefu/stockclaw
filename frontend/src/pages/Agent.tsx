@@ -204,15 +204,20 @@ export function Agent() {
 
   // 终局 / Stop / 断连后收敛到服务端权威状态（last_run、Retry 可用性、最新 revision）。
   // 停止时后端还在落盘 partial，先等一拍再重载；若仍在运行则再补一次。
-  const onStreamEnd = useCallback(() => {
-    const threadId = controller.getActiveThreadId();
+  const onInvalidate = useCallback((threadId: string, _runId: string) => {
+    void controller.reload(threadId).then(syncFromController).catch(() => undefined);
+  }, [controller, syncFromController]);
+
+  const onStreamEnd = useCallback((streamThreadId?: string, _runId?: string) => {
+    const threadId = streamThreadId ?? controller.getActiveThreadId();
     if (!threadId) return;
-    setConverging(true); // Stop/终态后先禁用输入，等待取消持久化 + 权威 reload
+    const isCurrentThread = () => controller.getActiveThreadId() === threadId;
+    if (isCurrentThread()) setConverging(true); // Stop/终态后先禁用输入，等待取消持久化 + 权威 reload
     const reloadOnce = async (bumpEpoch: boolean) => {
       try {
         const thread = await controller.reload(threadId);
         await syncFromController();
-        if (bumpEpoch) {
+        if (bumpEpoch && isCurrentThread()) {
           // 用服务端权威历史替换 runtime 本地消息
           setSessionEpoch((epoch) => epoch + 1);
         }
@@ -222,7 +227,7 @@ export function Agent() {
       } catch {
         // 重载失败保持现状
       } finally {
-        setConverging(false);
+        if (isCurrentThread()) setConverging(false);
       }
     };
     // 后端 Stop 后仍在落盘 partial：先等一拍再重载
@@ -328,6 +333,7 @@ export function Agent() {
             onConflict={onConflict}
             onError={onError}
             onUnavailable={onUnavailable}
+            onInvalidate={onInvalidate}
             controller={controller}
             onRuntime={(refs) => {
               runtimeRefs.current = refs;

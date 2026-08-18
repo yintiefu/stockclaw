@@ -4,15 +4,24 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 
 // AgentRuntimeProvider / AgentThread 以轻量桩替代，专注页面自身状态契约
-const captured = vi.hoisted(() => ({ onError: null as ((e: Error) => void) | null, onConflict: null as ((v: Record<string, unknown>) => void) | null }));
+const captured = vi.hoisted(() => ({
+  onError: null as ((e: Error) => void) | null,
+  onConflict: null as ((v: Record<string, unknown>) => void) | null,
+  onStreamEnd: null as ((threadId?: string, runId?: string) => void) | null,
+  onInvalidate: null as ((threadId: string, runId: string) => void) | null,
+}));
 vi.mock("@/lib/agent/runtime", () => ({
-  AgentRuntimeProvider: ({ children, onError, onConflict }: {
+  AgentRuntimeProvider: ({ children, onError, onConflict, onStreamEnd, onInvalidate }: {
     children: React.ReactNode;
     onError: (e: Error) => void;
     onConflict: (v: Record<string, unknown>) => void;
+    onStreamEnd?: (threadId?: string, runId?: string) => void;
+    onInvalidate?: (threadId: string, runId: string) => void;
   }) => {
     captured.onError = onError;
     captured.onConflict = onConflict;
+    captured.onStreamEnd = onStreamEnd ?? null;
+    captured.onInvalidate = onInvalidate ?? null;
     return <div data-testid="agent-runtime-stub">{children}</div>;
   },
 }));
@@ -52,6 +61,8 @@ describe("Agent 工作台页面", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    captured.onStreamEnd = null;
+    captured.onInvalidate = null;
     api.listThreads.mockResolvedValue({ threads: [], warnings: [] });
     api.createThread.mockResolvedValue(threadDoc("th-new", 0));
     api.getThread.mockImplementation(async (id: string) => threadDoc(id, 1));
@@ -184,6 +195,36 @@ describe("Agent 工作台页面", () => {
     captured.onError?.(new Error("上游余额不足"));
     await waitFor(() => expect(screen.getByText(/上游余额不足/)).toBeInTheDocument());
     expect(document.body.textContent ?? "").not.toContain("sk-page-key");
+  });
+
+  it("stream invalidation reloads the originating inactive thread", async () => {
+    api.listThreads.mockResolvedValue({
+      threads: [{ id: "th-active", title: "当前", updated_at: "2026-08-15T12:00:00Z", revision: 1, last_run: null }],
+      warnings: [],
+    });
+    const user = userEvent.setup();
+    render(<MemoryRouter><Agent /></MemoryRouter>);
+    await completeForm(user);
+    await waitFor(() => expect(captured.onInvalidate).not.toBeNull());
+
+    captured.onInvalidate?.("th-origin", "run-origin");
+
+    await waitFor(() => expect(api.getThread).toHaveBeenCalledWith("th-origin"));
+  });
+
+  it("stream end reloads the originating inactive thread", async () => {
+    api.listThreads.mockResolvedValue({
+      threads: [{ id: "th-active", title: "当前", updated_at: "2026-08-15T12:00:00Z", revision: 1, last_run: null }],
+      warnings: [],
+    });
+    const user = userEvent.setup();
+    render(<MemoryRouter><Agent /></MemoryRouter>);
+    await completeForm(user);
+    await waitFor(() => expect(captured.onStreamEnd).not.toBeNull());
+
+    captured.onStreamEnd?.("th-origin", "run-origin");
+
+    await waitFor(() => expect(api.getThread).toHaveBeenCalledWith("th-origin"), { timeout: 2000 });
   });
 
   it("恢复警告只显示隔离文件名", async () => {
