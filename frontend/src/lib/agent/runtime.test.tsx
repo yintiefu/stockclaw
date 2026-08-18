@@ -133,6 +133,50 @@ it("intercepts thread.revision.updated CUSTOM events monotonically", async () =>
   expect(revisions).toEqual([["thread-1", 2], ["thread-1", 1]]);
 });
 
+it("scans each persisted custom event without consuming the runtime stream", async () => {
+  const events: string[] = [];
+  const streamEnd = vi.fn();
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(
+    'data: {"type":"CUSTOM","name":"thread.revision.updated","value":"{\\"threadId\\":\\"thread-1\\",\\"revision\\":2}"}\n\n'
+      + 'data: {"type":"CUSTOM","name":"budget.updated","value":"{\\"threadId\\":\\"thread-1\\",\\"runId\\":\\"run-1\\",\\"controlRevision\\":1,\\"budgetSnapshot\\":{\\"policy_revision\\":0,\\"max_model_calls\\":8,\\"max_tool_calls\\":16,\\"tool_timeout_seconds\\":30,\\"max_active_seconds\\":300,\\"max_context_chars\\":120000},\\"usage\\":{\\"model_calls\\":0,\\"tool_calls\\":0,\\"input_tokens\\":null,\\"output_tokens\\":null,\\"total_tokens\\":null,\\"token_status\\":\\"unavailable\\"},\\"activeElapsedMs\\":0,\\"contextTruncation\\":{\\"occurred\\":false,\\"original_chars\\":null,\\"retained_chars\\":null,\\"removed_turns\\":null}}"}\n\n'
+      + 'data: {"type":"CUSTOM","name":"artifact.created","value":"{\\"threadId\\":\\"thread-1\\",\\"runId\\":\\"run-1\\",\\"artifactId\\":\\"artifact-1\\",\\"type\\":\\"markdown\\",\\"title\\":\\"facts\\",\\"threadRevision\\":2}"}\n\n'
+      + 'data: {"type":"CUSTOM","name":"sources.updated","value":"{\\"threadId\\":\\"thread-1\\",\\"runId\\":\\"run-1\\",\\"controlRevision\\":1,\\"sourceCount\\":1,\\"sourcesTruncated\\":false}"}\n\n'
+      + 'data: {"type":"RUN_FINISHED","threadId":"thread-1","runId":"run-1"}\n\n',
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  )));
+  const agent = new AgentHttpAgent(CONFIG, vi.fn(), vi.fn(), {
+    onEvent: (event) => events.push(event.name),
+    onStreamEnd: streamEnd,
+  });
+  await new Promise<void>((resolve, reject) => {
+    agent.run(INPUT).subscribe({ complete: resolve, error: reject });
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  expect(events).toEqual([
+    "thread.revision.updated", "budget.updated", "artifact.created", "sources.updated",
+  ]);
+  expect(streamEnd).toHaveBeenCalledWith("thread-1", "run-1");
+});
+
+it("invalidates REST only for malformed persisted custom events", async () => {
+  const invalidated: Array<[string, string]> = [];
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(
+    'data: {"type":"CUSTOM","name":"sources.updated","value":"{\\"threadId\\":\\"thread-1\\",\\"runId\\":false,\\"controlRevision\\":1}"}\n\n'
+      + 'data: {"type":"RUN_FINISHED","threadId":"thread-1","runId":"run-1"}\n\n',
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  )));
+  const agent = new AgentHttpAgent(CONFIG, vi.fn(), vi.fn(), {
+    onInvalidate: (threadId, runId) => invalidated.push([threadId, runId]),
+  });
+  await new Promise<void>((resolve, reject) => {
+    agent.run(INPUT).subscribe({ complete: resolve, error: reject });
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  expect(invalidated).toEqual([["thread-1", "run-1"]]);
+});
+
 it("overrides the runtime thread id with the server thread id", async () => {
   let captured: RequestInit | undefined;
   vi.stubGlobal("fetch", vi.fn(async (_url, init) => {

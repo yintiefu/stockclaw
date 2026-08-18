@@ -3,9 +3,18 @@
 import { authHeaders } from "@/lib/api";
 import type {
   AgentConflict,
+  AgentManagementError,
+  AgentPolicy,
+  AgentPolicyPatch,
+  AgentPolicyReset,
   AgentRun,
+  AgentRunDetail,
+  AgentRunListResponse,
   AgentThread,
   AgentThreadListResponse,
+  ArtifactDetail,
+  ArtifactDownload,
+  ArtifactListResponse,
   SkillDetail,
   SkillImportResult,
   SkillListResponse,
@@ -25,7 +34,7 @@ export class AgentApiError extends Error {
     fingerprint: string;
   };
 
-  constructor(status: number, payload: AgentConflict & { preview?: {
+  constructor(status: number, payload: AgentManagementError & { preview?: {
     executable: string;
     resolved_executable: string;
     args: string[];
@@ -40,6 +49,19 @@ export class AgentApiError extends Error {
     this.runStatus = payload.status ?? null;
     this.preview = payload.preview;
   }
+}
+
+function downloadFilename(header: string | null): string | null {
+  if (!header) return null;
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(header)?.[1];
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded);
+    } catch {
+      return null;
+    }
+  }
+  return /filename="([^"]+)"/i.exec(header)?.[1] ?? null;
 }
 
 async function agentRequest<T>(
@@ -83,6 +105,40 @@ export const agentApi = {
     agentRequest<void>(`/api/agent/threads/${encodeURIComponent(id)}`, "DELETE", { revision }),
   cancelRun: (id: string) =>
     agentRequest<AgentRun>(`/api/agent/runs/${encodeURIComponent(id)}/cancel`, "POST"),
+  getPolicy: () => agentRequest<AgentPolicy>("/api/agent/policy"),
+  patchPolicy: (patch: AgentPolicyPatch) =>
+    agentRequest<AgentPolicy>("/api/agent/policy", "PATCH", patch),
+  resetPolicy: (reset: AgentPolicyReset) =>
+    agentRequest<AgentPolicy>("/api/agent/policy/reset", "POST", reset),
+  listRuns: (threadId: string, limit = 50, before?: string) => {
+    const query = `limit=${limit}${before ? `&before=${encodeURIComponent(before)}` : ""}`;
+    return agentRequest<AgentRunListResponse>(
+      `/api/agent/threads/${encodeURIComponent(threadId)}/runs?${query}`,
+    );
+  },
+  getRun: (runId: string) => agentRequest<AgentRunDetail>(`/api/agent/runs/${encodeURIComponent(runId)}`),
+  listArtifacts: (threadId: string) => agentRequest<ArtifactListResponse>(
+    `/api/agent/threads/${encodeURIComponent(threadId)}/artifacts`,
+  ),
+  getArtifact: (threadId: string, artifactId: string) => agentRequest<ArtifactDetail>(
+    `/api/agent/threads/${encodeURIComponent(threadId)}/artifacts/${encodeURIComponent(artifactId)}`,
+  ),
+  downloadArtifact: async (threadId: string, artifactId: string): Promise<ArtifactDownload> => {
+    const response = await fetch(
+      `/api/agent/threads/${encodeURIComponent(threadId)}/artifacts/${encodeURIComponent(artifactId)}/download`,
+      { headers: authHeaders() },
+    );
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({})) as AgentManagementError;
+      throw new AgentApiError(response.status, payload);
+    }
+    return { blob: await response.blob(), filename: downloadFilename(response.headers.get("Content-Disposition")) };
+  },
+  deleteArtifact: (threadId: string, artifactId: string, threadRevision: number) => agentRequest<{ thread_revision: number }>(
+    `/api/agent/threads/${encodeURIComponent(threadId)}/artifacts/${encodeURIComponent(artifactId)}`,
+    "DELETE",
+    { thread_revision: threadRevision },
+  ),
   listSkills: () => agentRequest<SkillListResponse>("/api/agent/skills"),
   getSkill: (name: string) =>
     agentRequest<SkillDetail>(`/api/agent/skills/${encodeURIComponent(name)}`),

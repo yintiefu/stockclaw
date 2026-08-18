@@ -6,7 +6,7 @@ import { HttpAgent, type RunAgentInput } from "@ag-ui/client";
 import { authHeaders } from "@/lib/api";
 import type { AgentHistoryController } from "./history";
 import type { AgentModelConfig } from "./model-config";
-import type { AgentConflict } from "./types";
+import type { AgentConflict, AgentStreamEvent } from "./types";
 
 type Conflict = AgentConflict;
 
@@ -17,8 +17,12 @@ export type AgentTransportOptions = {
   getRevision?: () => number;
   /** 流内 thread.revision.updated 事件（提交后到达）。 */
   onRevision?: (threadId: string, revision: number) => void;
+  /** 已通过基础身份/修订号校验的持久化领域事件。 */
+  onEvent?: (event: AgentStreamEvent) => void;
+  /** 流中事件无法解析时，仅标记对应 REST 数据失效。 */
+  onInvalidate?: (threadId: string, runId: string) => void;
   /** 流结束（终局 / 停止 / 断连）后触发一次，用于收敛到服务端权威状态。 */
-  onStreamEnd?: () => void;
+  onStreamEnd?: (threadId?: string, runId?: string) => void;
   /** 流开始前的 503（MCP_UNAVAILABLE）：不重试、不 reload。 */
   onUnavailable?: (detail: string) => void;
 };
@@ -37,12 +41,19 @@ async function scanStream(
   handlers: {
     onRunError: (message: string) => void;
     onRevision?: (threadId: string, revision: number) => void;
-    onStreamEnd?: () => void;
+    onEvent?: (event: AgentStreamEvent) => void;
+    onInvalidate?: (threadId: string, runId: string) => void;
+    onStreamEnd?: (threadId?: string, runId?: string) => void;
+    threadId?: string;
+    runId?: string;
   },
 ) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let streamThreadId = handlers.threadId;
+  let streamRunId = handlers.runId;
+  let pendingInvalidation = false;
   try {
     for (;;) {
       const { done, value } = await reader.read();
@@ -53,23 +64,75 @@ async function scanStream(
       for (const line of lines) {
         const event = parseSsePayload(line);
         if (!event) continue;
+        if (typeof event.threadId === "string" && event.threadId) streamThreadId = event.threadId;
+        if (typeof event.runId === "string" && event.runId) streamRunId = event.runId;
+        if (pendingInvalidation && streamThreadId && streamRunId) {
+          handlers.onInvalidate?.(streamThreadId, streamRunId);
+          pendingInvalidation = false;
+        }
         if (event.type === "RUN_ERROR") {
           handlers.onRunError(String(event.message || "Agent 运行出错"));
         }
-        if (event.type === "CUSTOM" && event.name === "thread.revision.updated") {
-          const raw = event.value;
-          const value = typeof raw === "string" ? JSON.parse(raw) : raw;
-          if (value && typeof value.revision === "number") {
-            handlers.onRevision?.(String(value.threadId ?? ""), value.revision);
+        if (event.type === "CUSTOM" && typeof event.name === "string") {
+          let value: unknown = event.value;
+          if (typeof value === "string") {
+            try {
+              value = JSON.parse(value);
+            } catch {
+              if (streamThreadId && streamRunId) handlers.onInvalidate?.(streamThreadId, streamRunId);
+              else pendingInvalidation = true;
+              continue;
+            }
           }
+          const custom = parsePersistedEvent(event.name, value);
+          if (!custom) {
+            if (streamThreadId && streamRunId) handlers.onInvalidate?.(streamThreadId, streamRunId);
+            else pendingInvalidation = true;
+            continue;
+          }
+          streamThreadId = custom.value.threadId;
+          if ("runId" in custom.value) streamRunId = custom.value.runId;
+          if (custom.name === "thread.revision.updated") {
+            handlers.onRevision?.(custom.value.threadId, custom.value.revision);
+          }
+          handlers.onEvent?.(custom);
         }
       }
     }
   } catch {
     // 扫描失败不影响主流程
   } finally {
-    handlers.onStreamEnd?.();
+    if (pendingInvalidation && streamThreadId && streamRunId) {
+      handlers.onInvalidate?.(streamThreadId, streamRunId);
+    }
+    handlers.onStreamEnd?.(streamThreadId, streamRunId);
   }
+}
+
+function isIdentity(value: Record<string, unknown>, revision: string, run = false): boolean {
+  return typeof value.threadId === "string" && value.threadId.length > 0
+    && (!run || (typeof value.runId === "string" && value.runId.length > 0))
+    && typeof value[revision] === "number" && Number.isInteger(value[revision]) && value[revision] >= 0;
+}
+
+/** 只在这里接受持久化事件；复杂字段留给 REST 权威详情，避免破坏 assistant-ui 流。 */
+function parsePersistedEvent(name: string, raw: unknown): AgentStreamEvent | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const value = raw as Record<string, unknown>;
+  if (name === "thread.revision.updated" && isIdentity(value, "revision")) {
+    return { name, value: value as AgentStreamEvent["value"] & { threadId: string; revision: number } } as AgentStreamEvent;
+  }
+  if (name === "budget.updated" && isIdentity(value, "controlRevision", true)) {
+    return { name, value: value as AgentStreamEvent["value"] & { threadId: string; runId: string; controlRevision: number } } as AgentStreamEvent;
+  }
+  if (name === "artifact.created" && isIdentity(value, "threadRevision", true)
+    && typeof value.artifactId === "string" && value.artifactId.length > 0) {
+    return { name, value: value as AgentStreamEvent["value"] & { threadId: string; runId: string; threadRevision: number } } as AgentStreamEvent;
+  }
+  if (name === "sources.updated" && isIdentity(value, "controlRevision", true)) {
+    return { name, value: value as AgentStreamEvent["value"] & { threadId: string; runId: string; controlRevision: number } } as AgentStreamEvent;
+  }
+  return null;
 }
 
 export class AgentHttpAgent extends HttpAgent {
@@ -104,7 +167,10 @@ export class AgentHttpAgent extends HttpAgent {
         void scanStream(forScan, {
           onRunError,
           onRevision: transportOptions.onRevision,
+          onEvent: transportOptions.onEvent,
+          onInvalidate: transportOptions.onInvalidate,
           onStreamEnd: transportOptions.onStreamEnd,
+          threadId: transportOptions.getThreadId?.() ?? undefined,
         });
         return new Response(forCaller, {
           status: response.status,
