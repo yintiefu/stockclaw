@@ -12,7 +12,8 @@ import {
 } from "@/lib/agent/model-config";
 import { AgentHistoryController } from "@/lib/agent/history";
 import { AgentRuntimeProvider, type AgentHttpAgent } from "@/lib/agent/runtime";
-import type { AgentThreadSummary, AgentThread as AgentThreadDoc, SkillSummary } from "@/lib/agent/types";
+import { createAgentWorkspaceStore } from "@/lib/agent/workspace";
+import type { AgentStreamEvent, AgentThreadSummary, AgentThread as AgentThreadDoc, SkillSummary } from "@/lib/agent/types";
 import { agentApi } from "@/lib/agent/api";
 import { ApiError } from "@/lib/api";
 
@@ -39,6 +40,11 @@ export function Agent() {
     controllerRef.current = new AgentHistoryController();
   }
   const controller = controllerRef.current;
+  const workspaceRef = useRef<ReturnType<typeof createAgentWorkspaceStore> | null>(null);
+  if (workspaceRef.current === null) {
+    workspaceRef.current = createAgentWorkspaceStore();
+  }
+  const workspace = workspaceRef.current;
   const [, forceRefresh] = useState(0);
   const bump = useCallback(() => forceRefresh((n) => n + 1), []);
 
@@ -205,8 +211,13 @@ export function Agent() {
   // 终局 / Stop / 断连后收敛到服务端权威状态（last_run、Retry 可用性、最新 revision）。
   // 停止时后端还在落盘 partial，先等一拍再重载；若仍在运行则再补一次。
   const onInvalidate = useCallback((threadId: string, _runId: string) => {
+    workspace.getState().markRunStale(threadId, _runId);
     void controller.reload(threadId).then(syncFromController).catch(() => undefined);
-  }, [controller, syncFromController]);
+  }, [controller, syncFromController, workspace]);
+
+  const onEvent = useCallback((event: AgentStreamEvent) => {
+    workspace.getState().applyEvent(event);
+  }, [workspace]);
 
   const onStreamEnd = useCallback((streamThreadId?: string, _runId?: string) => {
     const threadId = streamThreadId ?? controller.getActiveThreadId();
@@ -334,6 +345,7 @@ export function Agent() {
             onError={onError}
             onUnavailable={onUnavailable}
             onInvalidate={onInvalidate}
+            onEvent={onEvent}
             controller={controller}
             onRuntime={(refs) => {
               runtimeRefs.current = refs;

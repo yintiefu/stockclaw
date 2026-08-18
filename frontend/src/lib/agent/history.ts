@@ -126,6 +126,7 @@ export class AgentHistoryController {
   private activeThread: AgentThread | null = null;
   private listCache: AgentThreadListResponse = { threads: [], warnings: [] };
   private revisionByThread = new Map<string, number>();
+  private reloadGenerationByThread = new Map<string, number>();
   private revisionListeners = new Set<() => void>();
 
   getActiveThread(): AgentThread | null {
@@ -192,12 +193,20 @@ export class AgentHistoryController {
 
   /** 权威重载：任何 409 / 终局后调用，恰好替换一次本地视图。 */
   async reload(threadId: string): Promise<AgentThread> {
+    const generation = (this.reloadGenerationByThread.get(threadId) ?? 0) + 1;
+    this.reloadGenerationByThread.set(threadId, generation);
     const thread = await agentApi.getThread(threadId);
-    if (this.activeThread?.id === threadId || this.activeThread === null) {
-      this.activeThread = thread;
+    const currentRevision = this.getRevision(threadId);
+    if (
+      this.reloadGenerationByThread.get(threadId) === generation
+      && (this.activeThread === null || thread.revision >= currentRevision)
+    ) {
+      if (this.activeThread?.id === threadId || this.activeThread === null) {
+        this.activeThread = thread;
+      }
+      this.applyRevision(threadId, thread.revision);
+      await this.refreshList().catch(() => undefined);
     }
-    this.applyRevision(threadId, thread.revision);
-    await this.refreshList().catch(() => undefined);
     return thread;
   }
 
@@ -220,6 +229,7 @@ export class AgentHistoryController {
   async remove(threadId: string, revision?: number): Promise<void> {
     await agentApi.deleteThread(threadId, revision ?? this.getRevision(threadId));
     this.revisionByThread.delete(threadId);
+    this.reloadGenerationByThread.delete(threadId);
     if (this.activeThread?.id === threadId) {
       this.activeThread = null;
     }

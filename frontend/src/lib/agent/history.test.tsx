@@ -40,6 +40,12 @@ const listResponse = (threads: AgentThreadListResponse["threads"], warnings: Age
   warnings,
 });
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 describe("AgentHistoryController", () => {
   beforeEach(() => {
     vi.mocked(agentApi.listThreads).mockReset();
@@ -85,6 +91,33 @@ describe("AgentHistoryController", () => {
     expect(thread.revision).toBe(5);
     expect(controller.getActiveThread()?.id).toBe("th-1");
     expect(agentApi.getThread).toHaveBeenCalledTimes(1);
+  });
+
+  it("out-of-order reload responses cannot regress the active thread document", async () => {
+    const older = deferred<AgentThread>();
+    const newer = deferred<AgentThread>();
+    vi.mocked(agentApi.getThread)
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise);
+    vi.mocked(agentApi.listThreads).mockResolvedValue(listResponse([]));
+    const controller = new AgentHistoryController();
+
+    const first = controller.reload("th-1");
+    const second = controller.reload("th-1");
+    newer.resolve({
+      ...threaded("th-1", 2, "2026-08-15T12:00:02Z"),
+      messages: [{ id: "new", role: "assistant", content: "new", partial: false, pending_interrupt: false, interrupts: [], tool_calls: [], tool_call_id: null, created_at: null }],
+    });
+    await second;
+    older.resolve({
+      ...threaded("th-1", 1, "2026-08-15T12:00:01Z"),
+      messages: [{ id: "old", role: "assistant", content: "old", partial: false, pending_interrupt: false, interrupts: [], tool_calls: [], tool_call_id: null, created_at: null }],
+    });
+    await first;
+
+    expect(controller.getActiveThread()?.revision).toBe(2);
+    expect(controller.getActiveThread()?.messages[0]?.id).toBe("new");
+    expect(controller.getRevision("th-1")).toBe(2);
   });
 
   it("history append/update 不发起第二次写请求", async () => {

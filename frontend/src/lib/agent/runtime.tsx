@@ -272,6 +272,7 @@ export function AgentRuntimeProvider({
   onRuntime,
   onStreamEnd,
   onInvalidate,
+  onEvent,
   onUnavailable,
   children,
 }: {
@@ -282,6 +283,7 @@ export function AgentRuntimeProvider({
   onRuntime?: (refs: { agent: AgentHttpAgent; startRun: (parentId: string | null) => void }) => void;
   onStreamEnd?: (threadId?: string, runId?: string) => void;
   onInvalidate?: (threadId: string, runId: string) => void;
+  onEvent?: (event: AgentStreamEvent) => void;
   onUnavailable?: (detail: string) => void;
   children: ReactNode;
 }) {
@@ -302,11 +304,12 @@ export function AgentRuntimeProvider({
         onRevision: (id, revision) => controller?.applyRevision(id, revision),
         onStreamEnd,
         onInvalidate,
+        onEvent,
         onUnavailable,
       },
     ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [config, onConflict, onError, getThreadId, getRevision, onStreamEnd, onInvalidate, onUnavailable],
+    [config, onConflict, onError, getThreadId, getRevision, onStreamEnd, onInvalidate, onEvent, onUnavailable],
   );
   const historyAdapter = useMemo(() => controller?.historyAdapter(), [controller, threadId]);
   const runtime = useAgUiRuntime({

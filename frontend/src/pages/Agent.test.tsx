@@ -9,21 +9,28 @@ const captured = vi.hoisted(() => ({
   onConflict: null as ((v: Record<string, unknown>) => void) | null,
   onStreamEnd: null as ((threadId?: string, runId?: string) => void) | null,
   onInvalidate: null as ((threadId: string, runId: string) => void) | null,
+  onEvent: null as ((event: Record<string, unknown>) => void) | null,
 }));
+const workspace = vi.hoisted(() => ({ applyEvent: vi.fn(), markRunStale: vi.fn() }));
 vi.mock("@/lib/agent/runtime", () => ({
-  AgentRuntimeProvider: ({ children, onError, onConflict, onStreamEnd, onInvalidate }: {
+  AgentRuntimeProvider: ({ children, onError, onConflict, onStreamEnd, onInvalidate, onEvent }: {
     children: React.ReactNode;
     onError: (e: Error) => void;
     onConflict: (v: Record<string, unknown>) => void;
     onStreamEnd?: (threadId?: string, runId?: string) => void;
     onInvalidate?: (threadId: string, runId: string) => void;
+    onEvent?: (event: Record<string, unknown>) => void;
   }) => {
     captured.onError = onError;
     captured.onConflict = onConflict;
     captured.onStreamEnd = onStreamEnd ?? null;
     captured.onInvalidate = onInvalidate ?? null;
+    captured.onEvent = onEvent ?? null;
     return <div data-testid="agent-runtime-stub">{children}</div>;
   },
+}));
+vi.mock("@/lib/agent/workspace", () => ({
+  createAgentWorkspaceStore: () => ({ getState: () => workspace }),
 }));
 vi.mock("@/components/agent/AgentThread", () => ({
   AgentThread: () => <div data-testid="agent-thread-stub" />,
@@ -63,6 +70,9 @@ describe("Agent 工作台页面", () => {
     vi.clearAllMocks();
     captured.onStreamEnd = null;
     captured.onInvalidate = null;
+    captured.onEvent = null;
+    workspace.applyEvent.mockReset();
+    workspace.markRunStale.mockReset();
     api.listThreads.mockResolvedValue({ threads: [], warnings: [] });
     api.createThread.mockResolvedValue(threadDoc("th-new", 0));
     api.getThread.mockImplementation(async (id: string) => threadDoc(id, 1));
@@ -210,6 +220,22 @@ describe("Agent 工作台页面", () => {
     captured.onInvalidate?.("th-origin", "run-origin");
 
     await waitFor(() => expect(api.getThread).toHaveBeenCalledWith("th-origin"));
+    expect(workspace.markRunStale).toHaveBeenCalledWith("th-origin", "run-origin");
+  });
+
+  it("forwards persisted scanner events to the mounted workspace", async () => {
+    const user = userEvent.setup();
+    render(<MemoryRouter><Agent /></MemoryRouter>);
+    await completeForm(user);
+    await waitFor(() => expect(captured.onEvent).not.toBeNull());
+    const event = {
+      name: "sources.updated",
+      value: { threadId: "th-new", runId: "run-1", controlRevision: 1, sourceCount: 1, sourcesTruncated: false },
+    };
+
+    captured.onEvent?.(event);
+
+    expect(workspace.applyEvent).toHaveBeenCalledWith(event);
   });
 
   it("stream end reloads the originating inactive thread", async () => {
