@@ -51,8 +51,14 @@ export type AgentThreadSummary = {
 };
 
 export type AgentRecoveryWarning = {
-  code: "DOCUMENT_CORRUPT";
-  document_type: "thread" | "run";
+  code:
+    | "DOCUMENT_CORRUPT"
+    | "ARTIFACT_ORPHAN"
+    | "ARTIFACT_MISSING_REF"
+    | "ARTIFACT_CHAIN_INVALID"
+    | "ARTIFACT_STAGING_LEFTOVER"
+    | "DELETE_TOMBSTONE_LEFTOVER";
+  document_type: "thread" | "run" | "artifact";
   filename: string;
 };
 

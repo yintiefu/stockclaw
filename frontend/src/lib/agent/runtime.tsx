@@ -27,12 +27,25 @@ export type AgentTransportOptions = {
   onUnavailable?: (detail: string) => void;
 };
 
-function parseSsePayload(line: string): Record<string, unknown> | null {
-  if (!line.startsWith("data: ")) return null;
+function parseSsePayload(line: string): Record<string, unknown> | null | undefined {
+  if (!line.startsWith("data: ")) return undefined;
   try {
     return JSON.parse(line.slice(6)) as Record<string, unknown>;
   } catch {
     return null;
+  }
+}
+
+function requestIdentity(init: RequestInit): { threadId?: string; runId?: string } {
+  if (typeof init.body !== "string") return {};
+  try {
+    const body = JSON.parse(init.body) as Record<string, unknown>;
+    return {
+      threadId: typeof body.threadId === "string" && body.threadId ? body.threadId : undefined,
+      runId: typeof body.runId === "string" && body.runId ? body.runId : undefined,
+    };
+  } catch {
+    return {};
   }
 }
 
@@ -53,7 +66,12 @@ async function scanStream(
   let buffer = "";
   let streamThreadId = handlers.threadId;
   let streamRunId = handlers.runId;
-  let pendingInvalidation = false;
+  let invalidated = false;
+  const invalidate = () => {
+    if (invalidated || !streamThreadId || !streamRunId) return;
+    invalidated = true;
+    handlers.onInvalidate?.(streamThreadId, streamRunId);
+  };
   try {
     for (;;) {
       const { done, value } = await reader.read();
@@ -63,13 +81,13 @@ async function scanStream(
       buffer = lines.pop() ?? "";
       for (const line of lines) {
         const event = parseSsePayload(line);
-        if (!event) continue;
+        if (event === undefined) continue;
+        if (event === null) {
+          invalidate();
+          continue;
+        }
         if (typeof event.threadId === "string" && event.threadId) streamThreadId = event.threadId;
         if (typeof event.runId === "string" && event.runId) streamRunId = event.runId;
-        if (pendingInvalidation && streamThreadId && streamRunId) {
-          handlers.onInvalidate?.(streamThreadId, streamRunId);
-          pendingInvalidation = false;
-        }
         if (event.type === "RUN_ERROR") {
           handlers.onRunError(String(event.message || "Agent 运行出错"));
         }
@@ -79,15 +97,13 @@ async function scanStream(
             try {
               value = JSON.parse(value);
             } catch {
-              if (streamThreadId && streamRunId) handlers.onInvalidate?.(streamThreadId, streamRunId);
-              else pendingInvalidation = true;
+              invalidate();
               continue;
             }
           }
           const custom = parsePersistedEvent(event.name, value);
           if (!custom) {
-            if (streamThreadId && streamRunId) handlers.onInvalidate?.(streamThreadId, streamRunId);
-            else pendingInvalidation = true;
+            invalidate();
             continue;
           }
           streamThreadId = custom.value.threadId;
@@ -102,9 +118,7 @@ async function scanStream(
   } catch {
     // 扫描失败不影响主流程
   } finally {
-    if (pendingInvalidation && streamThreadId && streamRunId) {
-      handlers.onInvalidate?.(streamThreadId, streamRunId);
-    }
+    invalidate();
     handlers.onStreamEnd?.(streamThreadId, streamRunId);
   }
 }
@@ -147,6 +161,7 @@ export class AgentHttpAgent extends HttpAgent {
     transportOptions: AgentTransportOptions = {},
   ) {
     const transportFetch = async (url: string, init: RequestInit) => {
+      const identity = requestIdentity(init);
       const response = await fetch(url, init);
       if (response.status === 409) {
         const payload = await response.clone().json().catch(() => ({})) as Conflict;
@@ -170,7 +185,8 @@ export class AgentHttpAgent extends HttpAgent {
           onEvent: transportOptions.onEvent,
           onInvalidate: transportOptions.onInvalidate,
           onStreamEnd: transportOptions.onStreamEnd,
-          threadId: transportOptions.getThreadId?.() ?? undefined,
+          threadId: identity.threadId ?? transportOptions.getThreadId?.() ?? undefined,
+          runId: identity.runId,
         });
         return new Response(forCaller, {
           status: response.status,

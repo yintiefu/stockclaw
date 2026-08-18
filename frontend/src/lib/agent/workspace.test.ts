@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { agentApi } from "./api";
 import { createAgentWorkspaceStore } from "./workspace";
-import type { AgentRunDetail, AgentThread } from "./types";
+import type { AgentRecoveryWarning, AgentRunDetail, AgentRunListItem, AgentThread } from "./types";
 
 const run = (id: string, threadId = "thread-1", controlRevision = 0): AgentRunDetail => ({
   schema_version: 1,
@@ -44,6 +44,16 @@ const thread = (lastRunId: string | null): AgentThread => ({
   last_run: lastRunId ? { id: lastRunId, status: "completed", updated_at: "2026-08-18T00:00:00Z", retry_of: null } : null,
 });
 
+const runItem = (id: string): AgentRunListItem => ({
+  id,
+  status: "completed",
+  started_at: "2026-08-18T00:00:00Z",
+  updated_at: "2026-08-18T00:00:00Z",
+  ended_at: null,
+  retry_of: null,
+  error_code: null,
+});
+
 describe("Agent workspace", () => {
   it("keeps a historical selected run per thread and falls back to last_run", () => {
     const store = createAgentWorkspaceStore();
@@ -54,6 +64,14 @@ describe("Agent workspace", () => {
     expect(store.getState().selectedRunId({ ...thread("run-new"), id: "thread-3" })).toBe("run-new");
     store.getState().selectRun("thread-1", null);
     expect(store.getState().selectedRunId(thread(null))).toBeNull();
+  });
+
+  it("drops a missing historical selection when the run list reloads", () => {
+    const store = createAgentWorkspaceStore();
+    store.getState().selectRun("thread-1", "run-old");
+    store.getState().replaceRunList("thread-1", [runItem("run-new")]);
+
+    expect(store.getState().selectedRunId(thread("run-new"))).toBe("run-new");
   });
 
   it("uses mutually exclusive drawers and keeps tab state in memory", () => {
@@ -129,7 +147,10 @@ it("uses the exact run REST shape and only derives artifact download names from 
     requests.push({ url, init });
     if (url.includes("/download")) {
       return new Response("artifact", {
-        headers: { "Content-Disposition": 'attachment; filename="artifact-1.json"' },
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Disposition": 'attachment; filename="artifact-1.json"',
+        },
       });
     }
     return new Response(JSON.stringify({ runs: [], next_before: null, warnings: [] }), {
@@ -144,4 +165,31 @@ it("uses the exact run REST shape and only derives artifact download names from 
   expect(requests[0]?.init?.method).toBe("GET");
   expect(download.filename).toBe("artifact-1.json");
   expect(download.filename).not.toContain("title");
+});
+
+it("rejects artifact downloads without the fixed media type and attachment disposition", async () => {
+  vi.stubGlobal("fetch", vi.fn()
+    .mockResolvedValueOnce(new Response("<html>", {
+      headers: { "Content-Type": "text/html", "Content-Disposition": 'attachment; filename="report.html"' },
+    }))
+    .mockResolvedValueOnce(new Response("artifact", {
+      headers: { "Content-Type": "application/json; charset=utf-8", "Content-Disposition": 'inline; filename="report.json"' },
+    })));
+
+  await expect(agentApi.downloadArtifact("thread-1", "artifact-1")).rejects.toMatchObject({
+    code: "ARTIFACT_DOWNLOAD_INVALID",
+  });
+  await expect(agentApi.downloadArtifact("thread-1", "artifact-1")).rejects.toMatchObject({
+    code: "ARTIFACT_DOWNLOAD_INVALID",
+  });
+});
+
+it("supports backend artifact recovery warnings", () => {
+  const warning: AgentRecoveryWarning = {
+    code: "ARTIFACT_ORPHAN",
+    document_type: "artifact",
+    filename: "thread-1/artifact-1.json.corrupt-1",
+  };
+
+  expect(warning.document_type).toBe("artifact");
 });

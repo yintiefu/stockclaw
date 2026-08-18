@@ -64,6 +64,16 @@ function downloadFilename(header: string | null): string | null {
   return /filename="([^"]+)"/i.exec(header)?.[1] ?? null;
 }
 
+function validArtifactDownload(response: Response): string | null {
+  const contentType = response.headers.get("Content-Type")?.toLowerCase();
+  const disposition = response.headers.get("Content-Disposition");
+  if (
+    (contentType !== "text/markdown; charset=utf-8" && contentType !== "application/json; charset=utf-8")
+    || !disposition?.startsWith("attachment;")
+  ) return null;
+  return downloadFilename(disposition);
+}
+
 async function agentRequest<T>(
   url: string,
   method: "GET" | "POST" | "PATCH" | "DELETE" = "GET",
@@ -132,7 +142,14 @@ export const agentApi = {
       const payload = await response.json().catch(() => ({})) as AgentManagementError;
       throw new AgentApiError(response.status, payload);
     }
-    return { blob: await response.blob(), filename: downloadFilename(response.headers.get("Content-Disposition")) };
+    const filename = validArtifactDownload(response);
+    if (!filename) {
+      throw new AgentApiError(response.status, {
+        code: "ARTIFACT_DOWNLOAD_INVALID",
+        detail: "Artifact 下载响应头不符合预期",
+      });
+    }
+    return { blob: await response.blob(), filename };
   },
   deleteArtifact: (threadId: string, artifactId: string, threadRevision: number) => agentRequest<{ thread_revision: number }>(
     `/api/agent/threads/${encodeURIComponent(threadId)}/artifacts/${encodeURIComponent(artifactId)}`,

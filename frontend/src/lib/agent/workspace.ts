@@ -1,6 +1,6 @@
 import { createStore } from "zustand/vanilla";
 
-import type { AgentRunDetail, AgentStreamEvent, AgentThread } from "./types";
+import type { AgentRunDetail, AgentRunListItem, AgentStreamEvent, AgentThread } from "./types";
 
 export type AgentDrawer = "threads" | "inspector" | "settings" | null;
 export type AgentWorkspaceTab = "runs" | "artifacts" | "sources";
@@ -10,11 +10,13 @@ type AgentWorkspaceState = {
   drawer: AgentDrawer;
   tab: AgentWorkspaceTab;
   selectedRunByThread: Record<string, string>;
+  runIdsByThread: Record<string, string[]>;
   watermarks: Record<string, number>;
   staleRunIds: Record<string, true>;
   openDrawer: (drawer: Exclude<AgentDrawer, null> | null) => void;
   setTab: (tab: AgentWorkspaceTab) => void;
   selectRun: (threadId: string, runId: string | null) => void;
+  replaceRunList: (threadId: string, runs: AgentRunListItem[]) => void;
   selectedRunId: (thread: AgentThread) => string | null;
   watermark: (event: WatermarkEvent, threadId: string, runId?: string) => number;
   replaceRunDetail: (detail: AgentRunDetail) => void;
@@ -43,6 +45,7 @@ export function createAgentWorkspaceStore() {
     drawer: null,
     tab: "runs",
     selectedRunByThread: {},
+    runIdsByThread: {},
     watermarks: {},
     staleRunIds: {},
     openDrawer: (drawer) => set({ drawer }),
@@ -53,7 +56,19 @@ export function createAgentWorkspaceStore() {
       else delete selectedRunByThread[threadId];
       return { selectedRunByThread };
     }),
-    selectedRunId: (thread) => get().selectedRunByThread[thread.id] ?? thread.last_run?.id ?? null,
+    replaceRunList: (threadId, runs) => set((state) => {
+      const runIdsByThread = { ...state.runIdsByThread, [threadId]: runs.map((run) => run.id) };
+      const selectedRunByThread = { ...state.selectedRunByThread };
+      if (selectedRunByThread[threadId] && !runIdsByThread[threadId].includes(selectedRunByThread[threadId])) {
+        delete selectedRunByThread[threadId];
+      }
+      return { runIdsByThread, selectedRunByThread };
+    }),
+    selectedRunId: (thread) => {
+      const selected = get().selectedRunByThread[thread.id];
+      const runIds = get().runIdsByThread[thread.id];
+      return selected && (!runIds || runIds.includes(selected)) ? selected : thread.last_run?.id ?? null;
+    },
     watermark: (event, threadId, runId) => get().watermarks[watermarkKey(event, threadId, runId)] ?? 0,
     replaceRunDetail: (detail) => set((state) => {
       const watermarks = { ...state.watermarks };

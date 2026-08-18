@@ -177,6 +177,57 @@ it("invalidates REST only for malformed persisted custom events", async () => {
   expect(invalidated).toEqual([["thread-1", "run-1"]]);
 });
 
+it("carries request identity through malformed SSE and stream end invalidation", async () => {
+  const invalidated: Array<[string, string]> = [];
+  const ended: Array<[string | undefined, string | undefined]> = [];
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(
+    "data: {malformed top-level SSE JSON}\n\n",
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  )));
+  const agent = new AgentHttpAgent(CONFIG, vi.fn(), vi.fn(), {
+    getThreadId: () => "thread-server",
+    onInvalidate: (threadId, runId) => invalidated.push([threadId, runId]),
+    onStreamEnd: (threadId, runId) => ended.push([threadId, runId]),
+  });
+  await new Promise<void>((resolve) => {
+    agent.run(INPUT).subscribe({ complete: resolve, error: () => resolve() });
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  expect(invalidated).toEqual([["thread-server", "run-1"]]);
+  expect(ended).toEqual([["thread-server", "run-1"]]);
+});
+
+it("invalidates the request run when an otherwise valid stream ends", async () => {
+  const invalidated: Array<[string, string]> = [];
+  vi.stubGlobal("fetch", vi.fn(async () => sseStream()));
+  const agent = new AgentHttpAgent(CONFIG, vi.fn(), vi.fn(), {
+    onInvalidate: (threadId, runId) => invalidated.push([threadId, runId]),
+  });
+  await new Promise<void>((resolve, reject) => {
+    agent.run(INPUT).subscribe({ complete: resolve, error: reject });
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  expect(invalidated).toEqual([["thread-1", "run-1"]]);
+});
+
+it("invalidates the same request identity again after a reconnect", async () => {
+  const invalidated: Array<[string, string]> = [];
+  vi.stubGlobal("fetch", vi.fn(async () => sseStream()));
+  const agent = new AgentHttpAgent(CONFIG, vi.fn(), vi.fn(), {
+    onInvalidate: (threadId, runId) => invalidated.push([threadId, runId]),
+  });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await new Promise<void>((resolve, reject) => {
+      agent.run(INPUT).subscribe({ complete: resolve, error: reject });
+    });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  expect(invalidated).toEqual([["thread-1", "run-1"], ["thread-1", "run-1"]]);
+});
+
 it("overrides the runtime thread id with the server thread id", async () => {
   let captured: RequestInit | undefined;
   vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
