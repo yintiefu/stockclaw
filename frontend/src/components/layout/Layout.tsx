@@ -46,7 +46,14 @@ export function Layout() {
   const { pathname } = useLocation();
   const navigate = useNavigate();
   const { dark, toggle } = useDarkMode();
-  const [collapsed, setCollapsed] = useState(() => storageGet("vr-sidebar") === "collapsed");
+  const [collapsed, setCollapsedState] = useState(() => storageGet("vr-sidebar") === "collapsed");
+  const setCollapsed = (next: boolean) => {
+    setCollapsedState(next);
+    storageSet("vr-sidebar", next ? "collapsed" : "expanded");
+  };
+  const [constrainedAgentWidth, setConstrainedAgentWidth] = useState(() =>
+    typeof window !== "undefined"
+      && window.matchMedia("(max-width: 1399px)").matches);
   // 板块中心的子菜单：未持久化过时默认按当前是否在板块页展开
   const [sectorsOpen, setSectorsOpen] = useState(() => {
     const stored = storageGet("vr-sidebar-sectors");
@@ -56,35 +63,42 @@ export function Layout() {
   });
 
   useEffect(() => {
-    storageSet("vr-sidebar", collapsed ? "collapsed" : "expanded");
-  }, [collapsed]);
-
-  useEffect(() => {
     storageSet("vr-sidebar-sectors", sectorsOpen ? "open" : "closed");
   }, [sectorsOpen]);
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 1399px)");
+    const update = (event: MediaQueryListEvent) => setConstrainedAgentWidth(event.matches);
+    setConstrainedAgentWidth(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  const agentRoute = pathname === "/agent" || pathname.startsWith("/agent/");
+  const effectiveCollapsed = collapsed || (agentRoute && constrainedAgentWidth);
 
   return (
     <div className="flex h-screen">
       {/* Sidebar */}
       <aside className={cn(
         "glass z-10 m-2 flex shrink-0 flex-col rounded-2xl transition-all duration-200",
-        collapsed ? "w-14" : "w-60",
+        effectiveCollapsed ? "w-14" : "w-60",
       )}>
         {/* Brand */}
-        <div className={cn("border-b border-border/50", collapsed ? "flex justify-center p-3" : "p-4")}>
-          <Link to="/daily-review" className={cn("flex items-center", collapsed ? "justify-center" : "gap-2")}>
+        <div className={cn("border-b border-border/50", effectiveCollapsed ? "flex justify-center p-3" : "p-4")}>
+          <Link to="/daily-review" className={cn("flex items-center", effectiveCollapsed ? "justify-center" : "gap-2")}>
             <LineChart className="h-6 w-6 shrink-0 text-primary text-glow" />
-            {!collapsed && (
+            {!effectiveCollapsed && (
               <span className="text-lg font-extrabold tracking-tight">
                 Vibe-<span className="text-primary">Research</span>
               </span>
             )}
           </Link>
-          {!collapsed && <p className="mt-1 text-[11px] text-muted-foreground">个人 AI 投研系统 · A股/美股/港股</p>}
+          {!effectiveCollapsed && <p className="mt-1 text-[11px] text-muted-foreground">个人 AI 投研系统 · A股/美股/港股</p>}
         </div>
 
         {/* Nav */}
-        <nav className={cn("flex-1 space-y-1 overflow-auto", collapsed ? "p-1.5" : "p-2.5")}>
+        <nav className={cn("flex-1 space-y-1 overflow-auto", effectiveCollapsed ? "p-1.5" : "p-2.5")}>
           {NAV.map(({ to, icon: Icon, label }) => {
             const active = pathname === to;
             // 板块中心：整行可点击展开/收起子菜单（同时保留跳转到板块总览）
@@ -94,7 +108,7 @@ export function Layout() {
               <div key={to}>
                 <Link
                   to={to}
-                  title={collapsed ? label : undefined}
+                  title={effectiveCollapsed ? label : undefined}
                   onClick={isSectors ? (e) => {
                     e.preventDefault();
                     setSectorsOpen((open) => !open);
@@ -105,15 +119,15 @@ export function Layout() {
                   } : undefined}
                   className={cn(
                     "flex items-center rounded-lg text-sm transition-colors",
-                    collapsed ? "justify-center p-2.5" : "gap-2.5 px-3 py-2.5",
+                    effectiveCollapsed ? "justify-center p-2.5" : "gap-2.5 px-3 py-2.5",
                     active || subOpen
                       ? "bg-primary/15 font-medium text-primary shadow-glow"
                       : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
                   )}
                 >
                   <Icon className="h-4 w-4 shrink-0" />
-                  {!collapsed && label}
-                  {!collapsed && isSectors && (
+                  {!effectiveCollapsed && label}
+                  {!effectiveCollapsed && isSectors && (
                     <ChevronDown
                       className={cn("ml-auto h-3.5 w-3.5 shrink-0 transition-transform duration-200", subOpen && "rotate-180")}
                       aria-label={subOpen ? "收起板块列表" : "展开板块列表"}
@@ -123,24 +137,24 @@ export function Layout() {
 
                 {/* 板块中心下方：常看板块的快捷入口（缩进，可展开/收起） */}
                 {isSectors && subOpen && (
-                  <div className={cn("mt-1 space-y-0.5", !collapsed && "ml-4 border-l border-border/40 pl-1.5")}>
+                  <div className={cn("mt-1 space-y-0.5", !effectiveCollapsed && "ml-4 border-l border-border/40 pl-1.5")}>
                     {SECTOR_LINKS.map(({ to: st, icon: SIcon, label: slabel }) => {
                       const sactive = pathname === st;
                       return (
                         <Link
                           key={st}
                           to={st}
-                          title={collapsed ? slabel : undefined}
+                          title={effectiveCollapsed ? slabel : undefined}
                           className={cn(
                             "flex items-center rounded-lg transition-colors",
-                            collapsed ? "justify-center p-2" : "gap-2 px-2.5 py-1.5 text-[13px]",
+                            effectiveCollapsed ? "justify-center p-2" : "gap-2 px-2.5 py-1.5 text-[13px]",
                             sactive
                               ? "bg-primary/10 font-medium text-primary"
                               : "text-muted-foreground/80 hover:bg-muted/40 hover:text-foreground",
                           )}
                         >
                           <SIcon className="h-3.5 w-3.5 shrink-0" />
-                          {!collapsed && slabel}
+                          {!effectiveCollapsed && slabel}
                         </Link>
                       );
                     })}
@@ -152,8 +166,8 @@ export function Layout() {
         </nav>
 
         {/* Footer */}
-        <div className={cn("border-t border-border/50", collapsed ? "flex flex-col items-center gap-2 p-2" : "space-y-2 p-3")}>
-          {collapsed ? (
+        <div className={cn("border-t border-border/50", effectiveCollapsed ? "flex flex-col items-center gap-2 p-2" : "space-y-2 p-3")}>
+          {effectiveCollapsed ? (
             <>
               <button onClick={toggle} className="rounded p-1.5 text-muted-foreground transition-colors hover:text-foreground" title={dark ? "亮色" : "暗色"}>
                 {dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
@@ -199,10 +213,12 @@ export function Layout() {
       </aside>
 
       {/* Main */}
-      <main className="flex-1 overflow-auto">
-        <div className="mx-auto max-w-6xl px-6 py-6">
-          <Outlet />
-        </div>
+      <main className={cn("min-w-0 flex-1", agentRoute ? "overflow-hidden" : "overflow-auto")}>
+        {agentRoute ? <Outlet /> : (
+          <div className="mx-auto max-w-6xl px-6 py-6">
+            <Outlet />
+          </div>
+        )}
       </main>
     </div>
   );

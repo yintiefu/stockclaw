@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { AgentThread } from "@/components/agent/AgentThread";
 import { AgentThreadList } from "@/components/agent/AgentThreadList";
+import { AgentWorkspace } from "@/components/agent/AgentWorkspace";
 import { ApprovalPanel } from "@/components/agent/ApprovalPanel";
 import { CapabilityBar } from "@/components/agent/CapabilityBar";
 import { CapabilityManagerDialog } from "@/components/agent/CapabilityManagerDialog";
@@ -17,10 +18,7 @@ import type { AgentStreamEvent, AgentThreadSummary, AgentThread as AgentThreadDo
 import { agentApi } from "@/lib/agent/api";
 import { ApiError } from "@/lib/api";
 
-const INPUT_CLASS =
-  "w-full rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50";
-
-/** Agent 工作台（1B）：服务端权威线程历史 + 最小线程管理控件。 */
+/** Agent 工作台：服务端权威线程历史 + 三栏操作壳。 */
 export function Agent() {
   const [saved, setSaved] = useState<AgentModelConfig | null>(() => loadAgentModelConfig());
   const [draft, setDraft] = useState<AgentModelConfig>(
@@ -34,6 +32,7 @@ export function Agent() {
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const [unavailable, setUnavailable] = useState<string | null>(null);
   const [statusNote, setStatusNote] = useState<string | null>(null);
+  const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
 
   const controllerRef = useRef<AgentHistoryController | null>(null);
   if (controllerRef.current === null) {
@@ -58,10 +57,7 @@ export function Agent() {
   const syncFromController = useCallback(async () => {
     setThreads(controller.getThreads());
     setWarnings(controller.getWarnings());
-    const active = controller.getActiveThread();
-    if (active) {
-      setActiveThread(active);
-    }
+    setActiveThread(controller.getActiveThread());
   }, [controller]);
 
   useEffect(() => {
@@ -116,6 +112,7 @@ export function Agent() {
   const handleSelect = async (threadId: string) => {
     try {
       await controller.switchTo(threadId);
+      setSelectedArtifactId(null);
       await syncFromController();
     } catch (error) {
       setConflict(error instanceof Error ? error.message : "切换线程失败");
@@ -130,6 +127,7 @@ export function Agent() {
       if (newest) {
         await controller.switchTo(newest.id);
       }
+      setSelectedArtifactId(null);
       await syncFromController();
     } catch (error) {
       setConflict(error instanceof Error ? error.message : "新建会话失败");
@@ -192,9 +190,24 @@ export function Agent() {
       } else {
         await controller.selectInitialThread();
       }
+      setSelectedArtifactId(null);
       await syncFromController();
     } catch (error) {
       setConflict(error instanceof Error ? error.message : "删除会话失败");
+      const selectedId = controller.getActiveThreadId();
+      await controller.refreshList().catch(() => undefined);
+      if (selectedId && controller.getThreads().some((thread) => thread.id === selectedId)) {
+        await controller.reload(selectedId).catch(() => undefined);
+      } else {
+        const remaining = controller.getThreads();
+        if (remaining.length > 0) {
+          await controller.switchTo(remaining[0].id);
+        } else {
+          await controller.selectInitialThread();
+        }
+        setSelectedArtifactId(null);
+      }
+      await syncFromController();
     }
   };
 
@@ -248,132 +261,105 @@ export function Agent() {
   const activeBusy = activeThread?.last_run?.status === "running"
     || activeThread?.last_run?.status === "awaiting_approval";
 
-  return (
-    <div className="mx-auto max-w-6xl space-y-4 p-4">
-      <header>
-        <h1 className="text-lg font-semibold">Agent 工作台</h1>
-        <p className="mt-1 text-xs text-muted-foreground">
-          客观数据 + 分析框架。不给出买卖建议。模型密钥只保存在本地浏览器，仅经请求头传输。
-        </p>
-      </header>
+  const openArtifact = useCallback((artifactId: string) => {
+    setSelectedArtifactId(artifactId);
+    workspace.getState().setTab("artifacts");
+    workspace.getState().openDrawer("inspector");
+  }, [workspace]);
 
-      <section className="glass-card rounded-xl p-4">
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <div>
-            <label htmlFor="agent-provider" className="mb-1.5 block text-xs font-medium text-muted-foreground">Provider</label>
-            <input id="agent-provider" value={draft.provider}
-              onChange={(e) => setDraft({ ...draft, provider: e.target.value })}
-              placeholder="deepseek / openai / …"
-              className={INPUT_CLASS} />
-          </div>
-          <div>
-            <label htmlFor="agent-base-url" className="mb-1.5 block text-xs font-medium text-muted-foreground">Base URL</label>
-            <input id="agent-base-url" value={draft.baseURL}
-              onChange={(e) => setDraft({ ...draft, baseURL: e.target.value })}
-              placeholder="https://api.deepseek.com/v1"
-              className={INPUT_CLASS} />
-          </div>
-          <div>
-            <label htmlFor="agent-model" className="mb-1.5 block text-xs font-medium text-muted-foreground">模型</label>
-            <input id="agent-model" value={draft.model}
-              onChange={(e) => setDraft({ ...draft, model: e.target.value })}
-              placeholder="模型名称"
-              className={INPUT_CLASS} />
-          </div>
-          <div>
-            <label htmlFor="agent-api-key" className="mb-1.5 block text-xs font-medium text-muted-foreground">API Key</label>
-            <input id="agent-api-key" type="password" value={draft.apiKey}
-              onChange={(e) => setDraft({ ...draft, apiKey: e.target.value })}
-              placeholder="sk-…"
-              className={INPUT_CLASS} />
-          </div>
-        </div>
-        <div className="mt-3 flex items-center gap-3">
-          <button onClick={save}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-4 py-2 text-sm font-medium text-primary shadow-glow hover:bg-primary/25">
-            保存（存本地）
-          </button>
-          {!complete && (
-            <span className="text-xs text-muted-foreground">填写完整配置后即可开始会话</span>
-          )}
-        </div>
-      </section>
-
-      {conflict && (
-        <div className="rounded-lg border border-border bg-black/20 px-3 py-2 text-sm text-muted-foreground">
-          {conflict}
-        </div>
-      )}
-      {runtimeError && (
-        <div className="rounded-lg border border-border bg-black/20 px-3 py-2 text-sm text-muted-foreground">
-          {runtimeError}
-        </div>
-      )}
-      {unavailable && (
-        <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm text-muted-foreground">
-          <span>MCP 服务不可用：{unavailable}（本次提问未发出，请修复连接后重试）</span>
-          <button type="button" onClick={() => setManagerOpen(true)}
-            className="shrink-0 rounded-md px-2 py-1 text-xs text-primary hover:bg-primary/10">
+  const alerts = conflict || runtimeError || unavailable ? (
+    <div className="space-y-1 text-xs text-muted-foreground">
+      {conflict ? <p className="truncate">{conflict}</p> : null}
+      {runtimeError ? <p className="truncate">{runtimeError}</p> : null}
+      {unavailable ? (
+        <div className="flex min-w-0 items-center justify-between gap-2">
+          <span className="truncate">MCP 服务不可用：{unavailable}（本次提问未发出）</span>
+          <button type="button" onClick={() => setManagerOpen(true)} className="shrink-0 rounded-md px-2 py-1 text-primary hover:bg-primary/10">
             管理 MCP
           </button>
         </div>
-      )}
+      ) : null}
+    </div>
+  ) : null;
 
-      <section className="glass-card space-y-3 rounded-xl p-4">
-        <AgentThreadList
-          threads={threads}
-          activeThreadId={activeThread?.id ?? null}
-          warnings={warnings}
-          canDeleteActive={!activeBusy}
-          onSelect={handleSelect}
-          onCreate={handleCreate}
-          onRename={handleRename}
-          onDelete={handleDelete}
-        />
-        {!loadingThread && activeThread && (
+  const threadList = (
+    <AgentThreadList
+      threads={threads}
+      activeThreadId={activeThread?.id ?? null}
+      warnings={warnings}
+      canDeleteActive={!activeBusy}
+      onSelect={handleSelect}
+      onCreate={handleCreate}
+      onRename={handleRename}
+      onDelete={handleDelete}
+    />
+  );
+
+  const chat = complete && !loadingThread && activeThread ? (
+    <AgentRuntimeProvider
+      key={`${activeThread.id}-${sessionEpoch}`}
+      config={saved ?? draft}
+      onConflict={onConflict}
+      onError={onError}
+      onUnavailable={onUnavailable}
+      onInvalidate={onInvalidate}
+      onEvent={onEvent}
+      controller={controller}
+      onRuntime={(refs) => { runtimeRefs.current = refs; }}
+      onStreamEnd={onStreamEnd}
+    >
+      <div data-testid="agent-runtime-content" className="flex h-full min-h-0 flex-col">
+        {activeThread.last_run?.status === "awaiting_approval" && activeThread.resume_available && (
+          <div className="max-h-[40%] shrink-0 overflow-y-auto py-2"><ApprovalPanel disabled={converging} /></div>
+        )}
+        <div data-testid="agent-thread-region" className="min-h-0 flex-1 overflow-hidden">
+          <AgentThread
+            activeThread={activeThread}
+            composerDisabled={converging}
+            pendingApproval={activeThread.last_run?.status === "awaiting_approval"
+              && activeThread.resume_available === true}
+            onRetry={handleRetry}
+            onOpenArtifact={openArtifact}
+            statusNote={statusNote ?? (activeThread.last_run?.status === "interrupted"
+              ? "后端重启导致上次运行中断，可重试本轮"
+              : null)}
+          />
+        </div>
+      </div>
+    </AgentRuntimeProvider>
+  ) : (
+    <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+      {complete ? "正在加载会话历史…" : "开始前请先完成模型配置"}
+    </div>
+  );
+
+  return (
+    <div className="h-full min-h-0">
+      <AgentWorkspace
+        threadTitle={activeThread?.title ?? "新会话"}
+        modelConfig={draft}
+        modelLabel={(saved ?? draft).model}
+        configured={complete}
+        capabilityLabel={activeThread?.selected_skills.length
+          ? `${activeThread.selected_skills.length} 个 Skill`
+          : "未选择 Skill"}
+        onModelConfigChange={setDraft}
+        onSaveModel={save}
+        onOpenThreads={() => workspace.getState().openDrawer("threads")}
+        onOpenInspector={() => workspace.getState().openDrawer("inspector")}
+        onOpenSettings={() => workspace.getState().openDrawer("settings")}
+        threads={threadList}
+        chat={chat}
+        alerts={alerts}
+        selectedArtifactId={selectedArtifactId}
+        inspector={!loadingThread && activeThread ? (
           <CapabilityBar
             thread={activeThread}
             onOpenManager={() => setManagerOpen(true)}
             disabled={activeBusy || converging}
           />
-        )}
-        {complete && !loadingThread && activeThread ? (
-          <AgentRuntimeProvider
-            key={`${activeThread.id}-${sessionEpoch}`}
-            config={saved ?? draft}
-            onConflict={onConflict}
-            onError={onError}
-            onUnavailable={onUnavailable}
-            onInvalidate={onInvalidate}
-            onEvent={onEvent}
-            controller={controller}
-            onRuntime={(refs) => {
-              runtimeRefs.current = refs;
-            }}
-            onStreamEnd={onStreamEnd}
-          >
-            {activeThread.last_run?.status === "awaiting_approval" && activeThread.resume_available && (
-              <div className="mb-3">
-                <ApprovalPanel disabled={converging} />
-              </div>
-            )}
-            <AgentThread
-              activeThread={activeThread}
-              composerDisabled={converging}
-              pendingApproval={activeThread.last_run?.status === "awaiting_approval"
-                && activeThread.resume_available === true}
-              onRetry={handleRetry}
-              statusNote={statusNote ?? (activeThread.last_run?.status === "interrupted"
-                ? "后端重启导致上次运行中断，可重试本轮"
-                : null)}
-            />
-          </AgentRuntimeProvider>
-        ) : (
-          <div className="flex min-h-[560px] items-center justify-center text-sm text-muted-foreground">
-            {complete ? "正在加载会话历史…" : "开始前请先完成模型配置"}
-          </div>
-        )}
-      </section>
+        ) : null}
+      />
       {!loadingThread && activeThread && (
         <CapabilityManagerDialog
           open={managerOpen}

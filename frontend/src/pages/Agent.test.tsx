@@ -10,30 +10,45 @@ const captured = vi.hoisted(() => ({
   onStreamEnd: null as ((threadId?: string, runId?: string) => void) | null,
   onInvalidate: null as ((threadId: string, runId: string) => void) | null,
   onEvent: null as ((event: Record<string, unknown>) => void) | null,
+  onOpenArtifact: null as ((artifactId: string) => void) | null,
+  onUnavailable: null as ((detail: string) => void) | null,
 }));
-const workspace = vi.hoisted(() => ({ applyEvent: vi.fn(), markRunStale: vi.fn() }));
+const workspace = vi.hoisted(() => ({
+  applyEvent: vi.fn(),
+  markRunStale: vi.fn(),
+  openDrawer: vi.fn(),
+  setTab: vi.fn(),
+}));
 vi.mock("@/lib/agent/runtime", () => ({
-  AgentRuntimeProvider: ({ children, onError, onConflict, onStreamEnd, onInvalidate, onEvent }: {
+  AgentRuntimeProvider: ({ children, onError, onConflict, onStreamEnd, onInvalidate, onEvent, onUnavailable }: {
     children: React.ReactNode;
     onError: (e: Error) => void;
     onConflict: (v: Record<string, unknown>) => void;
     onStreamEnd?: (threadId?: string, runId?: string) => void;
     onInvalidate?: (threadId: string, runId: string) => void;
     onEvent?: (event: Record<string, unknown>) => void;
+    onUnavailable?: (detail: string) => void;
   }) => {
     captured.onError = onError;
     captured.onConflict = onConflict;
     captured.onStreamEnd = onStreamEnd ?? null;
     captured.onInvalidate = onInvalidate ?? null;
     captured.onEvent = onEvent ?? null;
+    captured.onUnavailable = onUnavailable ?? null;
     return <div data-testid="agent-runtime-stub">{children}</div>;
   },
+}));
+vi.mock("@/components/agent/ApprovalPanel", () => ({
+  ApprovalPanel: () => <div data-testid="approval-panel-stub" />,
 }));
 vi.mock("@/lib/agent/workspace", () => ({
   createAgentWorkspaceStore: () => ({ getState: () => workspace }),
 }));
 vi.mock("@/components/agent/AgentThread", () => ({
-  AgentThread: () => <div data-testid="agent-thread-stub" />,
+  AgentThread: ({ onOpenArtifact }: { onOpenArtifact?: (artifactId: string) => void }) => {
+    captured.onOpenArtifact = onOpenArtifact ?? null;
+    return <div data-testid="agent-thread-stub" />;
+  },
 }));
 
 const api = vi.hoisted(() => ({
@@ -68,11 +83,16 @@ describe("Agent 工作台页面", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
     captured.onStreamEnd = null;
     captured.onInvalidate = null;
     captured.onEvent = null;
+    captured.onOpenArtifact = null;
+    captured.onUnavailable = null;
     workspace.applyEvent.mockReset();
     workspace.markRunStale.mockReset();
+    workspace.openDrawer.mockReset();
+    workspace.setTab.mockReset();
     api.listThreads.mockResolvedValue({ threads: [], warnings: [] });
     api.createThread.mockResolvedValue(threadDoc("th-new", 0));
     api.getThread.mockImplementation(async (id: string) => threadDoc(id, 1));
@@ -89,6 +109,7 @@ describe("Agent 工作台页面", () => {
 
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
   });
 
   const completeForm = async (user: userEvent.UserEvent) => {
@@ -99,12 +120,14 @@ describe("Agent 工作台页面", () => {
     await user.click(screen.getByRole("button", { name: /保存/ }));
   };
 
-  it("渲染模型表单与会话输入区", () => {
+  it("渲染紧凑工作台设置与会话输入区", () => {
     render(<MemoryRouter><Agent /></MemoryRouter>);
     expect(screen.getByLabelText("Provider")).toBeInTheDocument();
     expect(screen.getByLabelText("Base URL")).toBeInTheDocument();
     expect(screen.getByLabelText("模型")).toBeInTheDocument();
     expect(screen.getByText("开始前请先完成模型配置")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-workspace")).toHaveClass("h-full", "min-h-0");
+    expect(screen.queryByText("Agent 工作台")).toBeNull();
   });
 
   it("保存只写入 vr-agent-model，不碰 vr-llm", async () => {
@@ -114,7 +137,7 @@ describe("Agent 工作台页面", () => {
     await user.type(screen.getByLabelText("Base URL"), "https://api.deepseek.com/v1");
     await user.type(screen.getByLabelText("模型"), "deepseek-chat");
     await user.type(screen.getByLabelText("API Key"), "page-secret");
-    await user.click(screen.getByRole("button", { name: /保存/ }));
+    await user.click(screen.getByRole("button", { name: "保存模型配置" }));
     expect(localStorage.getItem("vr-llm")).toBeNull();
     expect(loadAgentModelConfig()).toEqual({
       provider: "deepseek",
@@ -122,6 +145,25 @@ describe("Agent 工作台页面", () => {
       model: "deepseek-chat",
       apiKey: "page-secret",
     });
+  });
+
+  it("未保存模型草稿不改变当前 runtime 的头部模型", async () => {
+    localStorage.setItem("vr-agent-model", JSON.stringify({
+      provider: "openai",
+      baseURL: "https://api.openai.com/v1",
+      model: "gpt-saved",
+      apiKey: "sk-saved-secret",
+    }));
+    const user = userEvent.setup();
+    render(<MemoryRouter><Agent /></MemoryRouter>);
+    await waitFor(() => expect(screen.getByText("gpt-saved")).toBeInTheDocument());
+
+    await user.clear(screen.getByLabelText("模型"));
+    await user.type(screen.getByLabelText("模型"), "gpt-draft");
+
+    expect(screen.getByLabelText("模型")).toHaveValue("gpt-draft");
+    expect(screen.getByText("gpt-saved")).toBeInTheDocument();
+    expect(document.body.textContent ?? "").not.toContain("sk-saved-secret");
   });
 
   it("表单不完整时不挂载 runtime", () => {
@@ -177,10 +219,44 @@ describe("Agent 工作台页面", () => {
     await user.click(screen.getByLabelText("重命名会话"));
     await user.clear(screen.getByLabelText("新会话标题"));
     await user.type(screen.getByLabelText("新会话标题"), "改名后的会话");
-    await user.click(screen.getByRole("button", { name: "确认" }));
+    await user.click(screen.getByRole("button", { name: "确认重命名" }));
     await waitFor(() => expect(api.patchThread).toHaveBeenCalledWith("th-1", 3, { title: "改名后的会话" }));
     await user.click(screen.getByLabelText("删除会话"));
     await waitFor(() => expect(api.deleteThread).toHaveBeenCalledWith("th-1", expect.any(Number)));
+  });
+
+  it("删除失败且原线程已消失时切换到权威首项并清除 artifact", async () => {
+    const initial = {
+      threads: [
+        { id: "th-1", title: "第一线程", updated_at: "2026-08-19T12:00:00Z", revision: 1, last_run: null },
+        { id: "th-2", title: "第二线程", updated_at: "2026-08-18T12:00:00Z", revision: 1, last_run: null },
+      ],
+      warnings: [],
+    };
+    api.listThreads
+      .mockResolvedValueOnce(initial)
+      .mockResolvedValueOnce(initial)
+      .mockResolvedValue({
+        threads: [{ id: "th-2", title: "第二线程", updated_at: "2026-08-18T12:00:00Z", revision: 1, last_run: null }],
+        warnings: [],
+      });
+    api.getThread.mockImplementation(async (id: string) => threadDoc(id, 1, {
+      title: id === "th-1" ? "第一线程" : "第二线程",
+    }));
+    api.deleteThread.mockRejectedValueOnce(new Error("线程已不存在"));
+    const user = userEvent.setup();
+    render(<MemoryRouter><Agent /></MemoryRouter>);
+    await completeForm(user);
+    await waitFor(() => expect(captured.onOpenArtifact).not.toBeNull());
+    captured.onOpenArtifact?.("artifact-1");
+    await waitFor(() => expect(screen.getByText("Artifact · artifact-1")).toBeInTheDocument());
+    api.getThread.mockClear();
+
+    await user.click(screen.getByLabelText("删除会话"));
+
+    await waitFor(() => expect(api.getThread).toHaveBeenCalledWith("th-2"));
+    expect(screen.getByRole("button", { name: /第二线程/ })).toHaveAttribute("aria-current", "true");
+    expect(screen.queryByText("Artifact · artifact-1")).toBeNull();
   });
 
   it("结构化 409 触发一次权威重载并显示中文 detail", async () => {
@@ -195,6 +271,93 @@ describe("Agent 工作台页面", () => {
     captured.onConflict?.({ code: "THREAD_REVISION_CONFLICT", detail: "线程 revision 已变化，已恢复服务器历史" });
     await waitFor(() => expect(screen.getByText(/已恢复服务器历史/)).toBeInTheDocument());
     await waitFor(() => expect(api.getThread).toHaveBeenCalledWith("th-1"));
+  });
+
+  it("线程重命名 revision 冲突时丢弃本地动作并权威重载", async () => {
+    api.listThreads.mockResolvedValue({
+      threads: [{ id: "th-1", title: "服务器标题", updated_at: "2026-08-15T12:00:00Z", revision: 4, last_run: null }],
+      warnings: [],
+    });
+    api.patchThread.mockRejectedValueOnce(Object.assign(new Error("revision 已变化"), { status: 409 }));
+    const user = userEvent.setup();
+    render(<MemoryRouter><Agent /></MemoryRouter>);
+    await completeForm(user);
+    await waitFor(() => expect(screen.getByLabelText("重命名会话")).toBeInTheDocument());
+    api.getThread.mockClear();
+    await user.click(screen.getByLabelText("重命名会话"));
+    await user.clear(screen.getByLabelText("新会话标题"));
+    await user.type(screen.getByLabelText("新会话标题"), "本地草稿");
+    await user.click(screen.getByRole("button", { name: "确认重命名" }));
+    await waitFor(() => expect(api.getThread).toHaveBeenCalledWith("th-1"));
+    expect(screen.queryByText("本地草稿")).toBeNull();
+    expect(screen.getByRole("button", { name: /服务器标题/ })).toHaveAttribute("aria-current", "true");
+  });
+
+  it("成功 artifact 动作映射到 Inspector artifacts 并保留选中 ID", async () => {
+    const user = userEvent.setup();
+    render(<MemoryRouter><Agent /></MemoryRouter>);
+    await completeForm(user);
+    await waitFor(() => expect(captured.onOpenArtifact).not.toBeNull());
+
+    captured.onOpenArtifact?.("artifact-1");
+
+    expect(workspace.openDrawer).toHaveBeenCalledWith("inspector");
+    expect(workspace.setTab).toHaveBeenCalledWith("artifacts");
+    await waitFor(() => expect(screen.getByText("Artifact · artifact-1")).toBeInTheDocument());
+  });
+
+  it("切换线程时清除上一线程的 artifact 选择", async () => {
+    api.listThreads.mockResolvedValue({
+      threads: [
+        { id: "th-1", title: "第一线程", updated_at: "2026-08-19T12:00:00Z", revision: 1, last_run: null },
+        { id: "th-2", title: "第二线程", updated_at: "2026-08-18T12:00:00Z", revision: 1, last_run: null },
+      ],
+      warnings: [],
+    });
+    api.getThread.mockImplementation(async (id: string) => threadDoc(id, 1, { title: id === "th-1" ? "第一线程" : "第二线程" }));
+    const user = userEvent.setup();
+    render(<MemoryRouter><Agent /></MemoryRouter>);
+    await completeForm(user);
+    await waitFor(() => expect(captured.onOpenArtifact).not.toBeNull());
+    captured.onOpenArtifact?.("artifact-1");
+    await waitFor(() => expect(screen.getByText("Artifact · artifact-1")).toBeInTheDocument());
+
+    await user.click(screen.getByRole("button", { name: /第二线程/ }));
+
+    await waitFor(() => expect(screen.queryByText("Artifact · artifact-1")).toBeNull());
+  });
+
+  it("审批面板与 steer thread 共享有界 flex 高度", async () => {
+    api.listThreads.mockResolvedValue({
+      threads: [{ id: "th-await", title: "待审批", updated_at: "2026-08-19T12:00:00Z", revision: 1,
+        last_run: { id: "run-1", status: "awaiting_approval", updated_at: "t", retry_of: null } }],
+      warnings: [],
+    });
+    api.getThread.mockResolvedValue(threadDoc("th-await", 1, {
+      resume_available: true,
+      last_run: { id: "run-1", status: "awaiting_approval", updated_at: "t", retry_of: null },
+    }));
+    const user = userEvent.setup();
+    render(<MemoryRouter><Agent /></MemoryRouter>);
+    await completeForm(user);
+    await waitFor(() => expect(screen.getByTestId("approval-panel-stub")).toBeInTheDocument());
+    expect(screen.getByTestId("agent-runtime-content")).toHaveClass("flex", "h-full", "min-h-0", "flex-col");
+    expect(screen.getByTestId("agent-thread-region")).toHaveClass("min-h-0", "flex-1", "overflow-hidden");
+  });
+
+  it("后续运行与 MCP 错误不会被旧冲突提示遮挡", async () => {
+    const user = userEvent.setup();
+    render(<MemoryRouter><Agent /></MemoryRouter>);
+    await completeForm(user);
+    await waitFor(() => expect(captured.onConflict).not.toBeNull());
+    captured.onConflict?.({ detail: "旧 revision 冲突" });
+    captured.onError?.(new Error("后续运行错误"));
+    captured.onUnavailable?.("连接已断开");
+
+    await waitFor(() => expect(screen.getByText("旧 revision 冲突")).toBeInTheDocument());
+    expect(screen.getByText("后续运行错误")).toBeInTheDocument();
+    expect(screen.getByText(/MCP 服务不可用：连接已断开/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "管理 MCP" })).toBeInTheDocument();
   });
 
   it("runtime onError 触发后错误可见且不暴露密钥", async () => {
