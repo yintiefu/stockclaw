@@ -290,6 +290,13 @@ export function Agent() {
     workspace.getState().openDrawer("inspector");
   }, [workspace]);
 
+  const reloadArtifactThread = useCallback(async () => {
+    const threadId = controller.getActiveThreadId();
+    if (!threadId) return;
+    await controller.reload(threadId);
+    await syncFromController();
+  }, [controller, syncFromController]);
+
   const alerts = conflict || runtimeError || unavailable ? (
     <div className="space-y-1 text-xs text-muted-foreground">
       {conflict ? <p className="truncate">{conflict}</p> : null}
@@ -378,6 +385,8 @@ export function Agent() {
               approvalConnected={runtimeReady && desktopViewport}
               selectedArtifactId={selectedArtifactId}
               artifactActivationKey={artifactActivationKey}
+              onSelectArtifact={setSelectedArtifactId}
+              onReloadThread={reloadArtifactThread}
             />
           </div>
         ) : null}

@@ -71,6 +71,10 @@ const api = vi.hoisted(() => ({
   listSkills: vi.fn(),
   listRuns: vi.fn(),
   getRun: vi.fn(),
+  listArtifacts: vi.fn(),
+  getArtifact: vi.fn(),
+  downloadArtifact: vi.fn(),
+  deleteArtifact: vi.fn(),
 }));
 vi.mock("@/lib/agent/api", () => ({ agentApi: api }));
 
@@ -130,6 +134,10 @@ describe("Agent 工作台页面", () => {
     workspace.staleRunIds = {};
     api.listRuns.mockReset();
     api.getRun.mockReset();
+    api.listArtifacts.mockReset().mockResolvedValue({ artifacts: [], warnings: [] });
+    api.getArtifact.mockReset();
+    api.downloadArtifact.mockReset();
+    api.deleteArtifact.mockReset();
     api.listThreads.mockResolvedValue({ threads: [], warnings: [] });
     api.createThread.mockResolvedValue(threadDoc("th-new", 0));
     api.getThread.mockImplementation(async (id: string) => threadDoc(id, 1));

@@ -132,4 +132,53 @@
 
   /* 暖橙光文字 */
   .text-glow { text-shadow: 0 0 18px hsl(var(--primary) / 0.45); }
+
+  .agent-inspector-command {
+    @apply inline-flex min-h-8 items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted/60 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .agent-artifact-markdown {
+    @apply break-words text-foreground prose-headings:text-foreground prose-p:text-foreground prose-strong:text-foreground prose-code:text-foreground prose-a:text-primary;
+  }
+
+  .agent-blocked-image {
+    @apply inline-block rounded border border-dashed border-border px-1.5 py-0.5 text-xs text-muted-foreground;
+  }
+
+  .agent-artifact-table-wrap {
+    @apply max-w-full overflow-x-auto rounded-md border border-border;
+  }
+
+  .agent-artifact-table {
+    @apply min-w-full border-collapse text-left text-xs;
+  }
+
+  .agent-artifact-table th {
+    @apply whitespace-nowrap border-b border-border bg-muted/50 px-2 py-1.5 font-medium text-muted-foreground;
+  }
+
+  .agent-artifact-table td {
+    @apply max-w-64 break-words border-b border-border/60 px-2 py-1.5 align-top text-foreground;
+  }
+
+  .agent-json-root {
+    @apply overflow-x-auto rounded-md border border-border bg-black/10 p-2 font-mono text-xs;
+  }
+
+  .agent-json-tree,
+  .agent-json-list {
+    @apply ml-3 space-y-1 border-l border-border pl-2;
+  }
+
+  .agent-json-entry > dt {
+    @apply break-all text-muted-foreground;
+  }
+
+  .agent-json-entry > dd {
+    @apply ml-3 break-all text-foreground;
+  }
+
+  .agent-data-scalar {
+    @apply break-all whitespace-pre-wrap text-foreground;
+  }
 }
