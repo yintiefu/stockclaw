@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
@@ -14,10 +14,17 @@ const captured = vi.hoisted(() => ({
   onUnavailable: null as ((detail: string) => void) | null,
 }));
 const workspace = vi.hoisted(() => ({
+  tab: "runs",
+  selectedRunByThread: {} as Record<string, string>,
+  staleRunIds: {} as Record<string, true>,
   applyEvent: vi.fn(),
   markRunStale: vi.fn(),
   openDrawer: vi.fn(),
   setTab: vi.fn(),
+  selectRun: vi.fn(),
+  replaceRunList: vi.fn(),
+  replaceRunDetail: vi.fn(),
+  subscribe: vi.fn(() => () => {}),
 }));
 vi.mock("@/lib/agent/runtime", () => ({
   AgentRuntimeProvider: ({ children, onError, onConflict, onStreamEnd, onInvalidate, onEvent, onUnavailable }: {
@@ -39,10 +46,14 @@ vi.mock("@/lib/agent/runtime", () => ({
   },
 }));
 vi.mock("@/components/agent/ApprovalPanel", () => ({
-  ApprovalPanel: () => <div data-testid="approval-panel-stub" />,
+  ApprovalPanel: ({ actionable = true }: { actionable?: boolean }) => (
+    <form data-testid="approval-panel-stub">
+      <button type="submit" disabled={!actionable}>提交审批</button>
+    </form>
+  ),
 }));
 vi.mock("@/lib/agent/workspace", () => ({
-  createAgentWorkspaceStore: () => ({ getState: () => workspace }),
+  createAgentWorkspaceStore: () => ({ getState: () => workspace, subscribe: workspace.subscribe }),
 }));
 vi.mock("@/components/agent/AgentThread", () => ({
   AgentThread: ({ onOpenArtifact }: { onOpenArtifact?: (artifactId: string) => void }) => {
@@ -58,12 +69,17 @@ const api = vi.hoisted(() => ({
   patchThread: vi.fn(),
   deleteThread: vi.fn(),
   listSkills: vi.fn(),
+  listRuns: vi.fn(),
+  getRun: vi.fn(),
 }));
 vi.mock("@/lib/agent/api", () => ({ agentApi: api }));
 
 import { Agent } from "./Agent";
 import { loadAgentModelConfig } from "@/lib/agent/model-config";
 import type { AgentThread } from "@/lib/agent/types";
+
+let desktopViewport = true;
+const viewportListeners = new Set<(event: MediaQueryListEvent) => void>();
 
 const threadDoc = (id: string, revision: number, extra: Partial<AgentThread> = {}): AgentThread => ({
   schema_version: 1,
@@ -84,6 +100,18 @@ describe("Agent 工作台页面", () => {
     localStorage.clear();
     vi.clearAllMocks();
     vi.spyOn(window, "confirm").mockReturnValue(true);
+    desktopViewport = true;
+    viewportListeners.clear();
+    vi.stubGlobal("matchMedia", vi.fn().mockImplementation((query: string) => ({
+      matches: query === "(min-width: 1280px)" && desktopViewport,
+      media: query,
+      onchange: null,
+      addEventListener: (_: string, listener: (event: MediaQueryListEvent) => void) => viewportListeners.add(listener),
+      removeEventListener: (_: string, listener: (event: MediaQueryListEvent) => void) => viewportListeners.delete(listener),
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => true,
+    })));
     captured.onStreamEnd = null;
     captured.onInvalidate = null;
     captured.onEvent = null;
@@ -93,6 +121,15 @@ describe("Agent 工作台页面", () => {
     workspace.markRunStale.mockReset();
     workspace.openDrawer.mockReset();
     workspace.setTab.mockReset();
+    workspace.selectRun.mockReset();
+    workspace.replaceRunList.mockReset();
+    workspace.replaceRunDetail.mockReset();
+    workspace.subscribe.mockReset().mockImplementation(() => () => {});
+    workspace.tab = "runs";
+    workspace.selectedRunByThread = {};
+    workspace.staleRunIds = {};
+    api.listRuns.mockReset();
+    api.getRun.mockReset();
     api.listThreads.mockResolvedValue({ threads: [], warnings: [] });
     api.createThread.mockResolvedValue(threadDoc("th-new", 0));
     api.getThread.mockImplementation(async (id: string) => threadDoc(id, 1));
@@ -110,6 +147,7 @@ describe("Agent 工作台页面", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   const completeForm = async (user: userEvent.UserEvent) => {
@@ -293,7 +331,7 @@ describe("Agent 工作台页面", () => {
     expect(screen.getByRole("button", { name: /服务器标题/ })).toHaveAttribute("aria-current", "true");
   });
 
-  it("成功 artifact 动作映射到 Inspector artifacts 并保留选中 ID", async () => {
+  it("重复 artifact 动作会从本地 Approval 重新激活 Inspector Artifact", async () => {
     const user = userEvent.setup();
     render(<MemoryRouter><Agent /></MemoryRouter>);
     await completeForm(user);
@@ -304,6 +342,15 @@ describe("Agent 工作台页面", () => {
     expect(workspace.openDrawer).toHaveBeenCalledWith("inspector");
     expect(workspace.setTab).toHaveBeenCalledWith("artifacts");
     await waitFor(() => expect(screen.getByText("Artifact · artifact-1")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("tab", { name: /Artifact/ })).toHaveAttribute("aria-selected", "true"));
+
+    await user.click(screen.getByRole("tab", { name: /Approval/ }));
+    expect(screen.getByRole("tab", { name: /Approval/ })).toHaveAttribute("aria-selected", "true");
+    captured.onOpenArtifact?.("artifact-1");
+
+    await waitFor(() => expect(screen.getByRole("tab", { name: /Artifact/ })).toHaveAttribute("aria-selected", "true"));
+    expect(workspace.setTab).toHaveBeenCalledTimes(2);
+    expect(workspace.openDrawer).toHaveBeenCalledTimes(2);
   });
 
   it("切换线程时清除上一线程的 artifact 选择", async () => {
@@ -327,7 +374,7 @@ describe("Agent 工作台页面", () => {
     await waitFor(() => expect(screen.queryByText("Artifact · artifact-1")).toBeNull());
   });
 
-  it("审批面板与 steer thread 共享有界 flex 高度", async () => {
+  it("待审批运行只有 Inspector 中一个审批面板", async () => {
     api.listThreads.mockResolvedValue({
       threads: [{ id: "th-await", title: "待审批", updated_at: "2026-08-19T12:00:00Z", revision: 1,
         last_run: { id: "run-1", status: "awaiting_approval", updated_at: "t", retry_of: null } }],
@@ -337,12 +384,67 @@ describe("Agent 工作台页面", () => {
       resume_available: true,
       last_run: { id: "run-1", status: "awaiting_approval", updated_at: "t", retry_of: null },
     }));
+    workspace.selectedRunByThread["th-await"] = "run-1";
+    api.listRuns.mockResolvedValue({
+      runs: [{
+        id: "run-1",
+        status: "awaiting_approval",
+        started_at: "t",
+        updated_at: "t",
+        ended_at: null,
+        retry_of: null,
+        error_code: null,
+      }],
+      next_before: null,
+      warnings: [],
+    });
+    api.getRun.mockImplementation(() => new Promise(() => {}));
     const user = userEvent.setup();
     render(<MemoryRouter><Agent /></MemoryRouter>);
     await completeForm(user);
-    await waitFor(() => expect(screen.getByTestId("approval-panel-stub")).toBeInTheDocument());
+    await user.click(await screen.findByRole("tab", { name: /Approval/ }));
+    await waitFor(() => expect(screen.getAllByTestId("approval-panel-stub")).toHaveLength(1));
+    expect(screen.getByRole("button", { name: "提交审批" })).toBeEnabled();
     expect(screen.getByTestId("agent-runtime-content")).toHaveClass("flex", "h-full", "min-h-0", "flex-col");
     expect(screen.getByTestId("agent-thread-region")).toHaveClass("min-h-0", "flex-1", "overflow-hidden");
+  });
+
+  it("窄屏将唯一可操作审批面板交给聊天区并随视口切回 Inspector", async () => {
+    api.listThreads.mockResolvedValue({
+      threads: [{ id: "th-await", title: "待审批", updated_at: "2026-08-19T12:00:00Z", revision: 1,
+        last_run: { id: "run-1", status: "awaiting_approval", updated_at: "t", retry_of: null } }],
+      warnings: [],
+    });
+    api.getThread.mockResolvedValue(threadDoc("th-await", 1, {
+      resume_available: true,
+      last_run: { id: "run-1", status: "awaiting_approval", updated_at: "t", retry_of: null },
+    }));
+    workspace.selectedRunByThread["th-await"] = "run-1";
+    api.listRuns.mockResolvedValue({
+      runs: [{
+        id: "run-1", status: "awaiting_approval", started_at: "t", updated_at: "t", ended_at: null,
+        retry_of: null, error_code: null,
+      }],
+      next_before: null,
+      warnings: [],
+    });
+    api.getRun.mockImplementation(() => new Promise(() => {}));
+    const user = userEvent.setup();
+    render(<MemoryRouter><Agent /></MemoryRouter>);
+    await completeForm(user);
+    await user.click(await screen.findByRole("tab", { name: /Approval/ }));
+    expect(screen.getAllByRole("button", { name: "提交审批" }).filter((button) => !button.hasAttribute("disabled"))).toHaveLength(1);
+    expect(within(screen.getByTestId("agent-runtime-content")).queryByTestId("approval-panel-stub")).toBeNull();
+
+    desktopViewport = false;
+    act(() => viewportListeners.forEach((listener) => listener({ matches: false } as MediaQueryListEvent)));
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "提交审批" }).filter((button) => !button.hasAttribute("disabled"))).toHaveLength(1));
+    expect(within(screen.getByTestId("agent-runtime-content")).getByTestId("approval-panel-stub")).toBeInTheDocument();
+
+    desktopViewport = true;
+    act(() => viewportListeners.forEach((listener) => listener({ matches: true } as MediaQueryListEvent)));
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "提交审批" }).filter((button) => !button.hasAttribute("disabled"))).toHaveLength(1));
+    expect(within(screen.getByTestId("agent-runtime-content")).queryByTestId("approval-panel-stub")).toBeNull();
   });
 
   it("后续运行与 MCP 错误不会被旧冲突提示遮挡", async () => {

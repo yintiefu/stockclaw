@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { AgentThread } from "@/components/agent/AgentThread";
 import { AgentThreadList } from "@/components/agent/AgentThreadList";
+import { AgentInspector } from "@/components/agent/AgentInspector";
 import { AgentWorkspace } from "@/components/agent/AgentWorkspace";
 import { ApprovalPanel } from "@/components/agent/ApprovalPanel";
 import { CapabilityBar } from "@/components/agent/CapabilityBar";
@@ -33,6 +34,10 @@ export function Agent() {
   const [unavailable, setUnavailable] = useState<string | null>(null);
   const [statusNote, setStatusNote] = useState<string | null>(null);
   const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
+  const [artifactActivationKey, setArtifactActivationKey] = useState(0);
+  const [inspectorInvalidation, setInspectorInvalidation] = useState(0);
+  const [desktopViewport, setDesktopViewport] = useState(() =>
+    typeof window !== "undefined" && window.matchMedia("(min-width: 1280px)").matches);
 
   const controllerRef = useRef<AgentHistoryController | null>(null);
   if (controllerRef.current === null) {
@@ -46,6 +51,14 @@ export function Agent() {
   const workspace = workspaceRef.current;
   const [, forceRefresh] = useState(0);
   const bump = useCallback(() => forceRefresh((n) => n + 1), []);
+
+  useEffect(() => {
+    const media = window.matchMedia("(min-width: 1280px)");
+    const update = (event: MediaQueryListEvent) => setDesktopViewport(event.matches);
+    setDesktopViewport(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
 
   const [threads, setThreads] = useState<AgentThreadSummary[]>([]);
   const [skills, setSkills] = useState<SkillSummary[]>([]);
@@ -105,9 +118,9 @@ export function Agent() {
     setUnavailable(detail);
   }, []);
 
-  const complete = Boolean(
-    draft.provider && draft.baseURL && draft.model && draft.apiKey,
-  ) || Boolean(saved?.provider && saved?.baseURL && saved?.model && saved?.apiKey);
+  const runtimeReady = Boolean(
+    saved?.provider && saved.baseURL && saved.model && saved.apiKey,
+  );
 
   const handleSelect = async (threadId: string) => {
     try {
@@ -225,16 +238,25 @@ export function Agent() {
   // 停止时后端还在落盘 partial，先等一拍再重载；若仍在运行则再补一次。
   const onInvalidate = useCallback((threadId: string, _runId: string) => {
     workspace.getState().markRunStale(threadId, _runId);
+    setInspectorInvalidation((value) => value + 1);
     void controller.reload(threadId).then(syncFromController).catch(() => undefined);
   }, [controller, syncFromController, workspace]);
 
   const onEvent = useCallback((event: AgentStreamEvent) => {
     workspace.getState().applyEvent(event);
+    if (event.name !== "thread.revision.updated") {
+      workspace.getState().markRunStale(event.value.threadId, event.value.runId);
+      setInspectorInvalidation((value) => value + 1);
+    }
   }, [workspace]);
 
   const onStreamEnd = useCallback((streamThreadId?: string, _runId?: string) => {
     const threadId = streamThreadId ?? controller.getActiveThreadId();
     if (!threadId) return;
+    if (_runId) {
+      workspace.getState().markRunStale(threadId, _runId);
+      setInspectorInvalidation((value) => value + 1);
+    }
     const isCurrentThread = () => controller.getActiveThreadId() === threadId;
     if (isCurrentThread()) setConverging(true); // Stop/终态后先禁用输入，等待取消持久化 + 权威 reload
     const reloadOnce = async (bumpEpoch: boolean) => {
@@ -256,13 +278,14 @@ export function Agent() {
     };
     // 后端 Stop 后仍在落盘 partial：先等一拍再重载
     setTimeout(() => { void reloadOnce(true); }, 1200);
-  }, [controller, syncFromController]);
+  }, [controller, syncFromController, workspace]);
 
   const activeBusy = activeThread?.last_run?.status === "running"
     || activeThread?.last_run?.status === "awaiting_approval";
 
   const openArtifact = useCallback((artifactId: string) => {
     setSelectedArtifactId(artifactId);
+    setArtifactActivationKey((value) => value + 1);
     workspace.getState().setTab("artifacts");
     workspace.getState().openDrawer("inspector");
   }, [workspace]);
@@ -295,51 +318,37 @@ export function Agent() {
     />
   );
 
-  const chat = complete && !loadingThread && activeThread ? (
-    <AgentRuntimeProvider
-      key={`${activeThread.id}-${sessionEpoch}`}
-      config={saved ?? draft}
-      onConflict={onConflict}
-      onError={onError}
-      onUnavailable={onUnavailable}
-      onInvalidate={onInvalidate}
-      onEvent={onEvent}
-      controller={controller}
-      onRuntime={(refs) => { runtimeRefs.current = refs; }}
-      onStreamEnd={onStreamEnd}
-    >
-      <div data-testid="agent-runtime-content" className="flex h-full min-h-0 flex-col">
-        {activeThread.last_run?.status === "awaiting_approval" && activeThread.resume_available && (
-          <div className="max-h-[40%] shrink-0 overflow-y-auto py-2"><ApprovalPanel disabled={converging} /></div>
-        )}
-        <div data-testid="agent-thread-region" className="min-h-0 flex-1 overflow-hidden">
-          <AgentThread
-            activeThread={activeThread}
-            composerDisabled={converging}
-            pendingApproval={activeThread.last_run?.status === "awaiting_approval"
-              && activeThread.resume_available === true}
-            onRetry={handleRetry}
-            onOpenArtifact={openArtifact}
-            statusNote={statusNote ?? (activeThread.last_run?.status === "interrupted"
-              ? "后端重启导致上次运行中断，可重试本轮"
-              : null)}
-          />
-        </div>
+  const chat = runtimeReady && !loadingThread && activeThread ? (
+    <div data-testid="agent-runtime-content" className="flex h-full min-h-0 flex-col">
+      {!desktopViewport && activeThread.last_run?.status === "awaiting_approval" && activeThread.resume_available ? (
+        <div className="max-h-[40%] shrink-0 overflow-y-auto py-2"><ApprovalPanel disabled={converging} /></div>
+      ) : null}
+      <div data-testid="agent-thread-region" className="min-h-0 flex-1 overflow-hidden">
+        <AgentThread
+          activeThread={activeThread}
+          composerDisabled={converging}
+          pendingApproval={activeThread.last_run?.status === "awaiting_approval"
+            && activeThread.resume_available === true}
+          onRetry={handleRetry}
+          onOpenArtifact={openArtifact}
+          statusNote={statusNote ?? (activeThread.last_run?.status === "interrupted"
+            ? "后端重启导致上次运行中断，可重试本轮"
+            : null)}
+        />
       </div>
-    </AgentRuntimeProvider>
+    </div>
   ) : (
     <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-      {complete ? "正在加载会话历史…" : "开始前请先完成模型配置"}
+      {runtimeReady ? "正在加载会话历史…" : "开始前请先完成模型配置"}
     </div>
   );
 
-  return (
-    <div className="h-full min-h-0">
-      <AgentWorkspace
+  const workspaceContent = (
+    <AgentWorkspace
         threadTitle={activeThread?.title ?? "新会话"}
         modelConfig={draft}
         modelLabel={(saved ?? draft).model}
-        configured={complete}
+        configured={runtimeReady}
         capabilityLabel={activeThread?.selected_skills.length
           ? `${activeThread.selected_skills.length} 个 Skill`
           : "未选择 Skill"}
@@ -353,13 +362,46 @@ export function Agent() {
         alerts={alerts}
         selectedArtifactId={selectedArtifactId}
         inspector={!loadingThread && activeThread ? (
-          <CapabilityBar
-            thread={activeThread}
-            onOpenManager={() => setManagerOpen(true)}
-            disabled={activeBusy || converging}
-          />
+          <div className="flex min-h-full flex-col">
+            <div className="border-b border-border/70 px-3 py-1">
+              <CapabilityBar
+                thread={activeThread}
+                onOpenManager={() => setManagerOpen(true)}
+                disabled={activeBusy || converging}
+              />
+            </div>
+            <AgentInspector
+              thread={activeThread}
+              store={workspace}
+              invalidationKey={inspectorInvalidation}
+              approvalDisabled={converging}
+              approvalConnected={runtimeReady && desktopViewport}
+              selectedArtifactId={selectedArtifactId}
+              artifactActivationKey={artifactActivationKey}
+            />
+          </div>
         ) : null}
-      />
+    />
+  );
+
+  return (
+    <div className="h-full min-h-0">
+      {runtimeReady && !loadingThread && activeThread ? (
+        <AgentRuntimeProvider
+          key={`${activeThread.id}-${sessionEpoch}`}
+          config={saved ?? draft}
+          onConflict={onConflict}
+          onError={onError}
+          onUnavailable={onUnavailable}
+          onInvalidate={onInvalidate}
+          onEvent={onEvent}
+          controller={controller}
+          onRuntime={(refs) => { runtimeRefs.current = refs; }}
+          onStreamEnd={onStreamEnd}
+        >
+          {workspaceContent}
+        </AgentRuntimeProvider>
+      ) : workspaceContent}
       {!loadingThread && activeThread && (
         <CapabilityManagerDialog
           open={managerOpen}

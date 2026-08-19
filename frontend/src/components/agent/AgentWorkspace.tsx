@@ -117,7 +117,7 @@ export function AgentWorkspace({
             <p className="mt-1 text-xs text-muted-foreground">运行、产物与来源</p>
           )}
         </div>
-        <div className="px-3 py-2">{inspector}</div>
+        <div className="min-h-0 flex-1">{inspector}</div>
         <form
           data-testid="agent-settings"
           className="mt-auto space-y-3 border-t border-border/70 p-3"

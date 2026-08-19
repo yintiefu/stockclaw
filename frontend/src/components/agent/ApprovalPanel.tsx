@@ -15,12 +15,20 @@ const LABELS: Record<Choice, (name: string) => string> = {
 
 const ARGS_CHAR_LIMIT = 8000;
 
-export function ApprovalPanel({ disabled }: { disabled: boolean }) {
+export function ApprovalPanel({ disabled, actionable = true }: { disabled: boolean; actionable?: boolean }) {
   const { pending, resolveAll } = useApprovalBridge();
   const [choices, setChoices] = useState<Record<string, Choice>>({});
   const [submitting, setSubmitting] = useState(false);
 
-  if (pending.length === 0) return null;
+  if (!actionable || pending.length === 0) {
+    return (
+      <section aria-label="MCP 工具审批" className="flex min-h-24 items-center justify-center rounded-md border border-dashed border-border px-3 text-center">
+        <p role="status" className="text-xs text-muted-foreground">
+          {actionable ? "当前没有待审批的工具调用" : "所选历史运行没有可操作的审批"}
+        </p>
+      </section>
+    );
+  }
 
   const complete = pending.every((item) => choices[item.id]);
 
@@ -43,7 +51,7 @@ export function ApprovalPanel({ disabled }: { disabled: boolean }) {
   };
 
   return (
-    <section className="glass-card space-y-3 rounded-xl p-4" aria-label="MCP 工具审批">
+    <section className="space-y-3 rounded-md border border-border p-3" aria-label="MCP 工具审批">
       <h2 className="flex items-center gap-1.5 text-sm font-semibold">
         <ShieldAlert className="size-4 text-primary" aria-hidden />
         MCP 工具调用需要审批（{pending.length} 项）

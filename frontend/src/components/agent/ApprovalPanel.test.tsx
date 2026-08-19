@@ -9,17 +9,18 @@ import { exportRepositoryOf } from "@/lib/agent/history";
 const hooks = vi.hoisted(() => ({
   resolveAll: vi.fn(),
   steerAway: vi.fn(),
+  pending: [
+    { id: "i-1", toolCallId: "c-1", message: "echo", serverId: "fixture",
+      serverName: "夹具", toolName: "echo", toolAlias: "mcp__fixture__echo",
+      arguments: { value: "hi" } },
+    { id: "i-2", toolCallId: "c-2", message: "lookup", serverId: "fixture",
+      serverName: "夹具", toolName: "lookup", toolAlias: "mcp__fixture__lookup",
+      arguments: {} },
+  ],
 }));
 vi.mock("@/lib/agent/approval", () => ({
   useApprovalBridge: () => ({
-    pending: [
-      { id: "i-1", toolCallId: "c-1", message: "echo", serverId: "fixture",
-        serverName: "夹具", toolName: "echo", toolAlias: "mcp__fixture__echo",
-        arguments: { value: "hi" } },
-      { id: "i-2", toolCallId: "c-2", message: "lookup", serverId: "fixture",
-        serverName: "夹具", toolName: "lookup", toolAlias: "mcp__fixture__lookup",
-        arguments: {} },
-    ],
+    pending: hooks.pending,
     resolveAll: hooks.resolveAll,
     steerAway: hooks.steerAway,
   }),
@@ -30,10 +31,33 @@ import { SteerAwayComposer } from "./SteerAwayComposer";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  hooks.pending = [
+    { id: "i-1", toolCallId: "c-1", message: "echo", serverId: "fixture",
+      serverName: "夹具", toolName: "echo", toolAlias: "mcp__fixture__echo",
+      arguments: { value: "hi" } },
+    { id: "i-2", toolCallId: "c-2", message: "lookup", serverId: "fixture",
+      serverName: "夹具", toolName: "lookup", toolAlias: "mcp__fixture__lookup",
+      arguments: {} },
+  ];
 });
 afterEach(cleanup);
 
 describe("ApprovalPanel", () => {
+  it("renders a stable bounded empty state", () => {
+    hooks.pending = [];
+    render(<ApprovalPanel disabled={false} />);
+
+    expect(screen.getByRole("status")).toHaveTextContent("当前没有待审批的工具调用");
+    expect(screen.getByLabelText("MCP 工具审批")).toHaveClass("min-h-24");
+  });
+
+  it("keeps historical runs non-actionable even when the live bridge has interrupts", () => {
+    render(<ApprovalPanel disabled={false} actionable={false} />);
+
+    expect(screen.getByRole("status")).toHaveTextContent("所选历史运行没有可操作的审批");
+    expect(screen.queryByRole("button", { name: "提交全部决定" })).toBeNull();
+  });
+
   it("submits all scoped decisions exactly once", async () => {
     const user = userEvent.setup();
     render(<ApprovalPanel disabled={false} />);
