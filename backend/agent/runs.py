@@ -1363,13 +1363,71 @@ class RunCoordinator:
             return
         if thread.last_run == summary:
             return
-        expected = handle.thread_revision if handle.thread_revision is not None else thread.revision
-        updated = self._threads.update(
-            handle.runtime.thread_id,
-            expected,
-            lambda doc: doc.model_copy(update={"last_run": summary}),
-        )
-        handle.thread_revision = updated.revision
+        # CAS 容错：并发写使 revision 前进时，重读后若 last_run 仍指向本 run 再补一次，
+        # 避免取消/终局兜底路径因冲突而丢掉终态
+        for expected in (handle.thread_revision, thread.revision):
+            if expected is None:
+                continue
+            try:
+                updated = self._threads.update(
+                    handle.runtime.thread_id,
+                    expected,
+                    lambda doc: doc if doc.last_run is not None and doc.last_run.id != run.id
+                    else doc.model_copy(update={"last_run": summary}),
+                )
+            except RevisionConflict:
+                try:
+                    thread = self._threads.get(handle.runtime.thread_id)
+                except DocumentNotFound:
+                    return
+                continue
+            handle.thread_revision = updated.revision
+            return
+
+    async def ensure_run_terminal(
+        self, thread_id: str, product_run_id: str | None, phase: str,
+        error_code: str | None = None, error_message: str | None = None,
+    ) -> None:
+        """兜底终态落盘：句柄已被移除但 run 文档仍非终态时补写。
+
+        覆盖取消/终局持久化竞争失败后句柄先被摘除的窗口——否则 run 文档会
+        永远停留在 running（线程语义被占死）。幂等；线程仍有活动句柄时不触碰。
+        """
+        threads, runs = self._require_stores()
+        if product_run_id is None:
+            return
+        for _ in range(3):
+            async with self._lock(thread_id):
+                if self._handles.get(thread_id) is not None:
+                    return
+                try:
+                    run = await asyncio.to_thread(runs.get, product_run_id)
+                except DocumentNotFound:
+                    return
+                if run.status in ("completed", "failed", "cancelled", "interrupted"):
+                    return
+                now = utc_now()
+                await asyncio.to_thread(runs.replace, run.model_copy(update={
+                    "status": phase,
+                    "updated_at": now,
+                    "ended_at": now,
+                    "error_code": error_code if error_code is not None else run.error_code,
+                    "error_message": error_message if error_message is not None else run.error_message,
+                }))
+                summary = RunSummary(id=run.id, status=phase, updated_at=now, retry_of=run.retry_of)
+                try:
+                    current = await asyncio.to_thread(threads.get, thread_id)
+                except DocumentNotFound:
+                    return
+                try:
+                    await asyncio.to_thread(
+                        threads.update, thread_id, current.revision,
+                        lambda doc: doc if doc.last_run is not None and doc.last_run.id != run.id
+                        else doc.model_copy(update={"last_run": summary}),
+                    )
+                    return
+                except RevisionConflict:
+                    continue  # revision 前进：重读后仍指向本 run 再补一次
 
     def clear_allowances(self, thread_id: str) -> int:
         """清空线程的 thread_session 许可；不改 thread revision。"""
@@ -1478,7 +1536,12 @@ class RunCoordinator:
             self._handles.pop(thread_id, None)
             self._release_handle(handle)  # 释放 Graph 与能力租约（与 cancel_sync 一致）
             if journal is not None and not journal.closed:
-                await asyncio.to_thread(journal.persist_partial_cancel)
+                try:
+                    await asyncio.to_thread(journal.persist_partial_cancel)
+                except Exception:
+                    # journal 取消落盘失败（revision 竞争等）：直接终态落盘兜底，
+                    # 绝不让 run 文档永远停留在 running
+                    await asyncio.to_thread(self._persist_run_terminal, handle, "cancelled")
             return product_run_id
 
     # ---- 1B：线程 CRUD 走与 run 准入相同的每线程锁 ----

@@ -445,3 +445,60 @@ def test_governance_error_code_preserved_in_run_and_event(services, client, monk
     assert len(source_events) == 1
     assert json.loads(source_events[0]["value"])["sourceCount"] == 8
     assert not [e for e in events if e.get("name") == "artifact.created"]
+
+
+def test_cancel_persistence_failure_falls_back_to_terminal_write(services, client, monkeypatch):
+    """断连取消的 journal 落盘失败时，run 文档仍必须落到 cancelled（不得永远 running）。"""
+    from langchain.agents.middleware import HumanInTheLoopMiddleware
+    monkeypatch.setattr("agent.router.build_middleware", lambda: (
+        HumanInTheLoopMiddleware(interrupt_on={
+            "echo_tool": {"allowed_decisions": ["approve", "reject"]}}),))
+    monkeypatch.setattr("agent.router.build_chat_model", lambda ref, sec: ScriptedChatModel([
+        AIMessage(content="", tool_calls=[{"id": "c1", "name": "echo_tool",
+                                           "args": {"code": "600519"}}])]))
+    assert client.post("/api/agent/run", json=start_payload(), headers=HEADERS).status_code == 200
+    handle = services.coordinator.active("thread-1d")
+    run_id = handle.product_run_id
+
+    def _boom():
+        raise RuntimeError("journal 取消落盘失败（fixture）")
+
+    monkeypatch.setattr(handle.journal, "persist_partial_cancel", _boom)
+    cancelled = client.post(f"/api/agent/runs/{run_id}/cancel")
+    assert cancelled.status_code == 200
+
+    # 兜底路径：journal 失败 → 直接终态落盘，run/线程摘要都不得停留在 running
+    run = services.runs.get(run_id)
+    assert run.status == "cancelled"
+    assert services.threads.get("thread-1d").last_run.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_ensure_run_terminal_recovers_stuck_running_document(services):
+    """流式 finally 的兜底：句柄已移除但 run 文档仍 running 时补写终态。"""
+    from agent.models import ModelRef, RunDocument, RunSummary, ThreadDocument
+    from agent.stores import utc_now
+
+    thread_id = "th-stuck"
+    services.threads.create(ThreadDocument.new(thread_id, "stuck", now=utc_now()))
+    now = utc_now()
+    run = RunDocument(
+        id="run-stuck", thread_id=thread_id, protocol_run_ids=["p-stuck"],
+        trigger_message_id="u-stuck", status="running",
+        started_at=now, updated_at=now,
+        model_ref=ModelRef(provider="fixture", baseURL="https://example.com/v1", model="fixture"),
+    )
+    services.runs.replace(run)
+    current = services.threads.get(thread_id)
+    services.threads.update(thread_id, current.revision, lambda doc: doc.model_copy(update={
+        "last_run": RunSummary(id="run-stuck", status="running", updated_at=now, retry_of=None)}))
+
+    await services.coordinator.ensure_run_terminal(
+        thread_id, "run-stuck", "cancelled", "CLIENT_CANCELLED", "用户停止或断开连接")
+
+    assert services.runs.get("run-stuck").status == "cancelled"
+    assert services.runs.get("run-stuck").error_code == "CLIENT_CANCELLED"
+    assert services.threads.get(thread_id).last_run.status == "cancelled"
+    # 幂等：重复调用不改写已终态文档
+    await services.coordinator.ensure_run_terminal(thread_id, "run-stuck", "failed")
+    assert services.runs.get("run-stuck").status == "cancelled"

@@ -245,3 +245,21 @@ it("overrides the runtime thread id with the server thread id", async () => {
   expect(body.threadId).toBe("th-server-1");
   expect(body.threadId).not.toBe("runtime-internal-id");
 });
+
+it("notifies onStreamEnd when Stop aborts before response headers arrive", async () => {
+  // Stop 打在响应头之前：fetch 本身抛 AbortError，scanStream 从未启动。
+  // 收敛通知不能只挂在 scanStream 的 finally 上，否则 UI 永远停在 running。
+  const ended: Array<[string | undefined, string | undefined]> = [];
+  vi.stubGlobal("fetch", vi.fn(async () => {
+    throw new DOMException("The user aborted a request.", "AbortError");
+  }));
+  const agent = new AgentHttpAgent(CONFIG, vi.fn(), vi.fn(), {
+    onStreamEnd: (threadId, runId) => ended.push([threadId, runId]),
+  });
+  await new Promise<void>((resolve) => {
+    agent.run(INPUT).subscribe({ complete: resolve, error: () => resolve() });
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  expect(ended).toEqual([["thread-1", "run-1"]]);
+});

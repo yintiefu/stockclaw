@@ -217,12 +217,51 @@ portfolio_manager 角色，产出「买 / 卖 / 仓位多少」。**本项目刻
 
 开销小得多——**只有 1 次模型调用**，输入就是你选中的那段文本（超过 1.2 万字会自动截断并提示）。
 
+## Agent 工作台
+
+「Agent 工作台」是把上述能力串成一个**多步研究任务运行时**：你配置自己的模型（OpenAI 兼容 API），
+Agent 按轮调用模型与工具（内置行情/资讯工具 + 你接入的 MCP 服务器），中途产出 Markdown 研究产物，
+每一步都有预算治理与审批控制。它和整个产品一样**只整理客观数据与分析框架，不给买卖结论**——
+辩论止于分歧点，工作台的产物止于「可核对的事实与来源」。
+
+要点：
+
+- **模型密钥只在你本地**：配置存在浏览器 `localStorage`（`vr-agent-model`），每次请求经请求头转发、
+  服务端不落盘。服务端日志与产物中的密钥引用一律脱敏。
+- **Policy 快照治理**：每次运行从当前 Policy 生成不可变预算快照（模型调用 / 工具调用 / 超时 / 上下文上限），
+  运行中改 Policy 不影响进行中的 run。Policy 保存走 CAS（带 revision 的乐观锁）；文件损坏时接口
+  fail-closed，界面显示原因并要求**二次确认**后才能重置。
+- **MCP 工具审批**：外部 MCP 工具默认逐次审批，可选择「本次允许 / 本会话允许 / 拒绝」；
+  被拒的工具调用以拒绝结果进入对话，不会静默失败。
+- **Artifact 与来源标签**：产物固定为 Markdown（不可执行内容），支持版本链（同主题多版演进、
+  只能删叶子版本）；每个事实来源标注「执行记录」（工具实际执行所得）或「模型提供，未验证」，
+  永远不把模型的话当成数据。
+- **可恢复与可收敛**：所有运行/消息/产物落盘在本地数据根；刷新或断线后前端从 REST 权威状态收敛，
+  失败/取消的运行可一键重试（严格重试：回到触发消息边界，不改写原运行）。
+
 ## 测试
 
 ```bash
 cd backend && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest -m "not live"   # 离线单测 + API 校验（快、稳，无需联网）
 .venv/bin/pytest -m live          # 联网核对数据源 shape（升级 / 发布前跑一遍）
+
+# 前端
+cd ../frontend && npm install
+npm test          # node --test 页面冒烟
+npm run test:unit # vitest 组件/逻辑单测
+npm run build     # tsc -b && vite build
+```
+
+### Agent 工作台浏览器测试（Playwright）
+
+后端为生产路由 + 三处确定性接缝（模型 / MCP 会话 / 本地工具），数据根是临时目录，
+**不触碰 8900 端口的常规服务，也不读你的 `~/.vibe-research/`**：
+
+```bash
+cd frontend
+npm run test:e2e:install   # 首次：安装 Chromium（受限网络可设 PLAYWRIGHT_DOWNLOAD_HOST 指向可达镜像）
+npm run test:e2e          # 串行跑完整交互矩阵 + 三视口×双主题截图 + 网络安全断言
 ```
 
 ## 更新日志

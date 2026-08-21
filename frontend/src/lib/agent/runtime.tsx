@@ -162,7 +162,20 @@ export class AgentHttpAgent extends HttpAgent {
   ) {
     const transportFetch = async (url: string, init: RequestInit) => {
       const identity = requestIdentity(init);
-      const response = await fetch(url, init);
+      let response: Response;
+      try {
+        response = await fetch(url, init);
+      } catch (error) {
+        // Stop 打在响应头到达之前：scanStream 从未启动，其 finally 不会触发。
+        // 这里补一次收敛通知，否则页面永远停在 running（后端已可靠落 cancelled）。
+        if (error instanceof DOMException && error.name === "AbortError") {
+          transportOptions.onStreamEnd?.(
+            identity.threadId ?? transportOptions.getThreadId?.() ?? undefined,
+            identity.runId,
+          );
+        }
+        throw error;
+      }
       if (response.status === 409) {
         const payload = await response.clone().json().catch(() => ({})) as Conflict;
         onConflict(payload);

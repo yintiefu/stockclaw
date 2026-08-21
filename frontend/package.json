@@ -8,7 +8,9 @@
     "test": "node --test tests/*.test.mjs",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test:unit": "vitest run"
+    "test:unit": "vitest run",
+    "test:e2e": "playwright test",
+    "test:e2e:install": "playwright install chromium"
   },
   "dependencies": {
     "@ag-ui/client": "0.0.58",
@@ -27,6 +29,7 @@
     "zustand": "^5.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "1.56.1",
     "@tailwindcss/typography": "^0.5.0",
     "@testing-library/jest-dom": "6.6.3",
     "@testing-library/react": "16.3.0",

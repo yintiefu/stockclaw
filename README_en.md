@@ -204,12 +204,56 @@ The same idea applied to writing you already have: audit the reasoning and surfa
 
 Much cheaper — **a single model call** over the text you selected.
 
+## Agent Workspace
+
+The **Agent Workspace** turns those pieces into a multi-step research-task runtime: you plug in your own
+OpenAI-compatible model, and the agent runs rounds of model + tool calls (built-in market/news tools plus MCP
+servers you connect), producing Markdown research artifacts along the way, with budget governance and
+approval control on every step. Like the rest of the product it **organizes objective data and analysis
+frameworks — it never gives buy/sell conclusions**. The debate stops at points of disagreement; workspace
+artifacts stop at "verifiable facts and their sources".
+
+Highlights:
+
+- **Your model key never leaves your machine**: it lives in browser `localStorage` (`vr-agent-model`), is
+  forwarded per request as a header, and is never persisted server-side. Key references in server logs and
+  artifacts are always redacted.
+- **Policy snapshot governance**: every run snapshots the current Policy into an immutable budget
+  (model calls / tool calls / timeouts / context caps); editing Policy mid-run doesn't affect running runs.
+  Policy saves use CAS (revision-based optimistic locking); a corrupted policy file fails closed — the UI
+  shows why and requires **explicit double confirmation** before reset.
+- **MCP tool approval**: external MCP tools are approved per call — allow once / allow for this thread /
+  reject. Rejected calls enter the conversation as rejections, never silently failing.
+- **Artifacts & source labels**: artifacts are plain Markdown (nothing executable) with version chains
+  (only the leaf version can be deleted). Every fact is labeled either "execution record" (from an actual
+  tool run) or "model-provided, unverified" — the model's word is never treated as data.
+- **Recoverable & convergent**: runs/messages/artifacts persist to the local data root; after a refresh or
+  disconnect the frontend converges on the authoritative REST state, and failed/cancelled runs can be
+  retried (strict retry: back to the trigger-message boundary, original runs are never rewritten).
+
 ## Tests
 
 ```bash
 cd backend && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest -m "not live"   # offline unit + API tests (fast, no network)
 .venv/bin/pytest -m live         # verifies live data source shapes (run before releases)
+
+# frontend
+cd ../frontend && npm install
+npm test          # node --test page smoke tests
+npm run test:unit # vitest component/unit tests
+npm run build     # tsc -b && vite build
+```
+
+### Agent Workspace browser tests (Playwright)
+
+The backend runs the production routes with three deterministic seams (model / MCP session / local tools)
+against a temp data root — **it never touches the regular service on port 8900 or your `~/.vibe-research/`**:
+
+```bash
+cd frontend
+npm run test:e2e:install   # first time: install Chromium (on restricted networks set PLAYWRIGHT_DOWNLOAD_HOST to a reachable mirror)
+npm run test:e2e          # serial run: full interaction matrix + 3 viewports × 2 themes screenshots + network-safety assertions
 ```
 
 ## Changelog

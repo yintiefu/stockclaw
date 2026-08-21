@@ -518,6 +518,7 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
         try:
             async for event in adapter.run(adapter_input):
                 if await request.is_disconnected():
+                    terminal = "cancelled"
                     await services.coordinator.cancel_run(thread_id, handle.product_run_id)
                     return
                 if handle.phase == "cancelled" or (handle.journal is not None and handle.journal.closed):
@@ -617,6 +618,7 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                     pending_initial = []
         except asyncio.CancelledError:
             # anyio 取消作用域里不能普通 await：独立的持久化任务 + 限时 shield 汇合
+            terminal = "cancelled"
             persistence = asyncio.create_task(services.coordinator.cancel_run(thread_id, handle.product_run_id))
             # coordinator 级强引用：2 秒汇合超时后任务也不会被回收，直到完成回调观察结果
             _BACKGROUND_PERSISTENCE.add(persistence)
@@ -667,10 +669,19 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
                     code="PERSISTENCE_FAILED",
                 ))
             yield encoder.encode(_error_event(message, error_code))
-            terminal = "failed"
+            # 取消过程中（断连检测分支）的失败保持 cancelled 语义，不改判 failed
+            terminal = "failed" if terminal != "cancelled" else terminal
         finally:
             if terminal != "awaiting_approval":
-                await services.coordinator.finish_if_terminal(thread_id, terminal)
+                net_run_id = handle.product_run_id
+                try:
+                    await services.coordinator.finish_if_terminal(thread_id, terminal)
+                except asyncio.CancelledError:
+                    # 取消展开中不能再 await：落盘由 cancel_run 后台任务负责
+                    raise
+                # 兜底：取消/终局持久化竞争失败而句柄已被摘除时，run 文档不得
+                # 永远停留在 running（会占死线程语义）；幂等，已终态时无操作
+                await services.coordinator.ensure_run_terminal(thread_id, net_run_id, terminal)
 
     return StreamingResponse(event_generator(), media_type=encoder.get_content_type())
 
