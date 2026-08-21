@@ -312,13 +312,15 @@ describe("Agent 工作台页面", () => {
     const user = userEvent.setup();
     render(<MemoryRouter><Agent /></MemoryRouter>);
     await completeForm(user);
-    await waitFor(() => expect(screen.getByLabelText("重命名会话")).toBeInTheDocument());
-    await user.click(screen.getByLabelText("重命名会话"));
+    await waitFor(() => expect(screen.getByLabelText("会话操作")).toBeInTheDocument());
+    await user.click(screen.getByLabelText("会话操作"));
+    await user.click(screen.getByRole("menuitem", { name: "重命名" }));
     await user.clear(screen.getByLabelText("新会话标题"));
     await user.type(screen.getByLabelText("新会话标题"), "改名后的会话");
     await user.click(screen.getByRole("button", { name: "确认重命名" }));
     await waitFor(() => expect(api.patchThread).toHaveBeenCalledWith("th-1", 3, { title: "改名后的会话" }));
-    await user.click(screen.getByLabelText("删除会话"));
+    await user.click(screen.getByLabelText("会话操作"));
+    await user.click(screen.getByRole("menuitem", { name: "删除" }));
     await waitFor(() => expect(api.deleteThread).toHaveBeenCalledWith("th-1", expect.any(Number)));
   });
 
@@ -349,7 +351,11 @@ describe("Agent 工作台页面", () => {
     await waitFor(() => expect(screen.getByText("Artifact · artifact-1")).toBeInTheDocument());
     api.getThread.mockClear();
 
-    await user.click(screen.getByLabelText("删除会话"));
+    // 删除第一线程（列表首项，当前激活）：经行内三点菜单触发
+    const firstRow = screen.getByRole("button", { name: /第一线程/ }).closest("[data-thread-row]");
+    expect(firstRow).not.toBeNull();
+    await user.click(within(firstRow as HTMLElement).getByLabelText("会话操作"));
+    await user.click(screen.getByRole("menuitem", { name: "删除" }));
 
     await waitFor(() => expect(api.getThread).toHaveBeenCalledWith("th-2"));
     expect(screen.getByRole("button", { name: /第二线程/ })).toHaveAttribute("aria-current", "true");
@@ -379,9 +385,10 @@ describe("Agent 工作台页面", () => {
     const user = userEvent.setup();
     render(<MemoryRouter><Agent /></MemoryRouter>);
     await completeForm(user);
-    await waitFor(() => expect(screen.getByLabelText("重命名会话")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText("会话操作")).toBeInTheDocument());
     api.getThread.mockClear();
-    await user.click(screen.getByLabelText("重命名会话"));
+    await user.click(screen.getByLabelText("会话操作"));
+    await user.click(screen.getByRole("menuitem", { name: "重命名" }));
     await user.clear(screen.getByLabelText("新会话标题"));
     await user.type(screen.getByLabelText("新会话标题"), "本地草稿");
     await user.click(screen.getByRole("button", { name: "确认重命名" }));

@@ -305,7 +305,6 @@ export function Agent() {
       threads={threads}
       activeThreadId={activeThread?.id ?? null}
       warnings={warnings}
-      canDeleteActive={!activeBusy}
       onSelect={handleSelect}
       onCreate={handleCreate}
       onRename={handleRename}

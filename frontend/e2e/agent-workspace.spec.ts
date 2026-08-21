@@ -194,7 +194,9 @@ test.describe("桌面工作台交互", () => {
       data: { revision: active.revision, title: "服务器标题" },
     });
 
-    await page.getByLabel("重命名会话").click();
+    // 列表第一项即当前激活线程：行内三点菜单 → 重命名
+    await page.getByLabel("会话操作").first().click();
+    await page.getByRole("menuitem", { name: "重命名" }).click();
     await page.getByLabel("新会话标题", { exact: true }).fill("本地草稿标题");
     await page.getByRole("button", { name: "确认重命名" }).click();
 
