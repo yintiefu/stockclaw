@@ -3,7 +3,7 @@ import { createStore } from "zustand/vanilla";
 import type { AgentRunDetail, AgentRunListItem, AgentStreamEvent, AgentThread } from "./types";
 
 export type AgentDrawer = "threads" | "inspector" | "settings" | null;
-export type AgentWorkspaceTab = "runs" | "artifacts" | "sources";
+export type AgentWorkspaceTab = "runs" | "approval" | "artifacts" | "sources";
 type WatermarkEvent = AgentStreamEvent["name"];
 
 type AgentWorkspaceState = {

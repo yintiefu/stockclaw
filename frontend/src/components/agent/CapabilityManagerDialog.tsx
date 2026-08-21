@@ -1,4 +1,8 @@
-/** 能力管理弹窗：桌面 modal / 移动端全屏 sheet；一次提交的草稿生命周期。 */
+/** 能力管理弹窗：桌面 modal / 移动端全屏 sheet；一次提交的草稿生命周期。
+
+1D 起线程 Skill 选择由共享 `ThreadSkillSection` 提供（设置抽屉 Skills 页签复用），
+本组件保留为独立弹窗形态。
+ */
 import { useEffect, useState } from "react";
 
 import { agentApi } from "@/lib/agent/api";
@@ -6,32 +10,23 @@ import type { AgentThread, SkillSummary } from "@/lib/agent/types";
 import { McpManager } from "./McpManager";
 import { SkillManager } from "./SkillManager";
 
-type Props = {
-  open: boolean;
-  thread: AgentThread | null;
+type SectionProps = {
+  thread: AgentThread;
   skills: SkillSummary[];
+  disabled: boolean;
   onApplied: (thread: AgentThread) => void;
   onConflict: () => void;
-  onClose: () => void;
-  disabled: boolean;
 };
 
-export function CapabilityManagerDialog({
-  open, thread, skills, onApplied, onConflict, onClose, disabled,
-}: Props) {
-  const [draft, setDraft] = useState<string[]>([]);
+/** 本会话 Skill 选择：本地 set 草稿 + 恰好一次 PATCH；409 丢弃草稿交给上层权威刷新。 */
+export function ThreadSkillSection({ thread, skills, disabled, onApplied, onConflict }: SectionProps) {
+  const [draft, setDraft] = useState<string[]>(thread.selected_skills);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (open) {
-      // 每次打开以服务端线程为准重建草稿
-      setDraft(thread?.selected_skills ?? []);
-      setError(null);
-    }
-  }, [open, thread]);
-
-  if (!open || !thread) return null;
+    setDraft(thread.selected_skills);
+  }, [thread.id, thread.revision, thread.selected_skills]);
 
   const toggle = (name: string) => {
     setDraft((prev) => prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]);
@@ -49,7 +44,7 @@ export function CapabilityManagerDialog({
     } catch (e) {
       const status = (e as { status?: number }).status;
       if (status === 409) {
-        // 丢弃草稿：权威状态已变化，交给上层刷新后重开
+        // 丢弃草稿：权威状态已变化，交给上层刷新后重置
         setDraft(thread.selected_skills);
         onConflict();
         return;
@@ -59,6 +54,52 @@ export function CapabilityManagerDialog({
       setBusy(false);
     }
   };
+
+  return (
+    <fieldset className="space-y-1" disabled={disabled || busy}>
+      <legend className="mb-1 text-xs text-muted-foreground">选择要启用的 Skill（应用到本会话）</legend>
+      {skills.filter((s) => s.valid).map((skill) => (
+        <label key={skill.directory} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 hover:bg-black/20">
+          <input
+            type="checkbox"
+            aria-label={skill.name ?? skill.directory}
+            checked={draft.includes(skill.name ?? "")}
+            onChange={() => toggle(skill.name ?? "")}
+          />
+          <span className="text-sm">{skill.name}</span>
+          <span className="truncate text-xs text-muted-foreground">{skill.description}</span>
+        </label>
+      ))}
+      {skills.filter((s) => s.valid).length === 0 && (
+        <p className="px-2 py-3 text-xs text-muted-foreground">尚无可选 Skill，先在下方导入</p>
+      )}
+
+      {error && <p className="text-xs text-red-400">{error}</p>}
+
+      <div className="flex justify-end">
+        <button type="button" onClick={apply} disabled={disabled || busy}
+          className="rounded-lg bg-primary/20 px-4 py-1.5 text-xs font-medium text-primary hover:bg-primary/30 disabled:cursor-not-allowed disabled:opacity-50">
+          应用到本会话
+        </button>
+      </div>
+    </fieldset>
+  );
+}
+
+type Props = {
+  open: boolean;
+  thread: AgentThread | null;
+  skills: SkillSummary[];
+  onApplied: (thread: AgentThread) => void;
+  onConflict: () => void;
+  onClose: () => void;
+  disabled: boolean;
+};
+
+export function CapabilityManagerDialog({
+  open, thread, skills, onApplied, onConflict, onClose, disabled,
+}: Props) {
+  if (!open || !thread) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/50 sm:items-center"
@@ -71,44 +112,22 @@ export function CapabilityManagerDialog({
           </button>
         </div>
 
-        <fieldset className="mb-4 space-y-1" disabled={disabled || busy}>
-          <legend className="mb-1 text-xs text-muted-foreground">选择要启用的 Skill（应用到本会话）</legend>
-          {skills.filter((s) => s.valid).map((skill) => (
-            <label key={skill.directory} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 hover:bg-black/20">
-              <input
-                type="checkbox"
-                aria-label={skill.name ?? skill.directory}
-                checked={draft.includes(skill.name ?? "")}
-                onChange={() => toggle(skill.name ?? "")}
-              />
-              <span className="text-sm">{skill.name}</span>
-              <span className="truncate text-xs text-muted-foreground">{skill.description}</span>
-            </label>
-          ))}
-          {skills.filter((s) => s.valid).length === 0 && (
-            <p className="px-2 py-3 text-xs text-muted-foreground">尚无可选 Skill，先在下方导入</p>
-          )}
-        </fieldset>
-
-        {error && <p className="mb-3 text-xs text-red-400">{error}</p>}
-
-        <div className="mb-4 flex justify-end gap-2">
-          <button type="button" onClick={onClose} disabled={busy}
-            className="rounded-lg px-3 py-1.5 text-xs text-muted-foreground hover:bg-black/20 disabled:opacity-50">
-            取消
-          </button>
-          <button type="button" onClick={apply} disabled={disabled || busy}
-            className="rounded-lg bg-primary/20 px-4 py-1.5 text-xs font-medium text-primary hover:bg-primary/30 disabled:cursor-not-allowed disabled:opacity-50">
-            应用到本会话
-          </button>
+        <div className="mb-4">
+          <ThreadSkillSection
+            thread={thread}
+            skills={skills}
+            disabled={disabled}
+            onApplied={onApplied}
+            onConflict={onConflict}
+          />
         </div>
 
         <div className="border-t border-border pt-3">
           <h3 className="mb-2 text-xs font-semibold text-muted-foreground">导入 / 管理 Skill</h3>
-          <SkillManager skills={skills} disabled={disabled || busy} onChanged={onConflict} />
+          <SkillManager skills={skills} disabled={disabled} onChanged={onConflict} />
         </div>
         <div className="mt-4 border-t border-border pt-3">
-          <McpManager disabled={disabled || busy} onReload={() => onConflict()} />
+          <McpManager disabled={disabled} onReload={() => onConflict()} />
         </div>
       </div>
     </div>

@@ -67,7 +67,7 @@ describe("CapabilityManagerDialog", () => {
     await waitFor(() => expect(onApplied).toHaveBeenCalledTimes(1));
   });
 
-  it("取消草稿不提交任何 PATCH", async () => {
+  it("关闭丢弃草稿不提交任何 PATCH", async () => {
     const user = userEvent.setup();
     render(
       <CapabilityManagerDialog
@@ -75,7 +75,7 @@ describe("CapabilityManagerDialog", () => {
       />,
     );
     await user.click(screen.getByRole("checkbox", { name: /macro/ }));
-    await user.click(screen.getByRole("button", { name: /取消/ }));
+    await user.click(screen.getByRole("button", { name: /关闭/ }));
     expect(api.patchThread).not.toHaveBeenCalled();
   });
 

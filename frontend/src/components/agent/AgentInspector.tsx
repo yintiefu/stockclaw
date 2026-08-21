@@ -579,7 +579,8 @@ export function AgentInspector({
 
   const selectTab = (tab: InspectorTab) => {
     setActiveTab(tab);
-    if (tab !== "approval") store.getState().setTab(tab);
+    // approval 也写入 store：移动端视口切换会在列/抽屉间重挂载 Inspector
+    store.getState().setTab(tab);
   };
 
   const handleTabKey = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {

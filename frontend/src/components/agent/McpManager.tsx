@@ -120,7 +120,7 @@ export function McpManager({ onReload, disabled }: Props) {
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
-        <h3 className="text-xs font-semibold text-muted-foreground">MCP 服务器（切片 2：仅管理，不进会话）</h3>
+        <h3 className="text-xs font-semibold text-muted-foreground">MCP 服务器（全局配置，工具按 server 启用）</h3>
         <button type="button" className={BTN} onClick={() => setAdding((v) => !v)} disabled={disabled || busy}>
           <Plus className="size-3.5" aria-hidden />
           新增 server

@@ -13,19 +13,56 @@ const captured = vi.hoisted(() => ({
   onOpenArtifact: null as ((artifactId: string) => void) | null,
   onUnavailable: null as ((detail: string) => void) | null,
 }));
-const workspace = vi.hoisted(() => ({
-  tab: "runs",
-  selectedRunByThread: {} as Record<string, string>,
-  staleRunIds: {} as Record<string, true>,
-  applyEvent: vi.fn(),
-  markRunStale: vi.fn(),
-  openDrawer: vi.fn(),
-  setTab: vi.fn(),
-  selectRun: vi.fn(),
-  replaceRunList: vi.fn(),
-  replaceRunDetail: vi.fn(),
-  subscribe: vi.fn(() => () => {}),
-}));
+const workspaceListeners = vi.hoisted(() => new Set<() => void>());
+const workspace = vi.hoisted(() => {
+  const state = {
+    tab: "runs" as string,
+    drawer: null as string | null,
+    selectedRunByThread: {} as Record<string, string>,
+    staleRunIds: {} as Record<string, true>,
+  };
+  const emit = () => workspaceListeners.forEach((listener) => listener());
+  const openDrawer = vi.fn((drawer: string | null) => {
+    state.drawer = drawer;
+    emit();
+  });
+  const setTab = vi.fn((tab: string) => {
+    state.tab = tab;
+    emit();
+  });
+  const applyEvent = vi.fn();
+  const markRunStale = vi.fn();
+  const selectRun = vi.fn();
+  const replaceRunList = vi.fn();
+  const replaceRunDetail = vi.fn();
+  const subscribe = vi.fn((listener: () => void) => {
+    workspaceListeners.add(listener);
+    return () => { workspaceListeners.delete(listener); };
+  });
+  // 与真实 zustand vanilla store 一致：getState() 返回含动作方法的完整状态
+  const stateWithActions = () => ({
+    ...state,
+    applyEvent,
+    markRunStale,
+    openDrawer,
+    setTab,
+    selectRun,
+    replaceRunList,
+    replaceRunDetail,
+  });
+  return {
+    state,
+    stateWithActions,
+    applyEvent,
+    markRunStale,
+    openDrawer,
+    setTab,
+    selectRun,
+    replaceRunList,
+    replaceRunDetail,
+    subscribe,
+  };
+});
 vi.mock("@/lib/agent/runtime", () => ({
   AgentRuntimeProvider: ({ children, onError, onConflict, onStreamEnd, onInvalidate, onEvent, onUnavailable }: {
     children: React.ReactNode;
@@ -53,7 +90,10 @@ vi.mock("@/components/agent/ApprovalPanel", () => ({
   ),
 }));
 vi.mock("@/lib/agent/workspace", () => ({
-  createAgentWorkspaceStore: () => ({ getState: () => workspace, subscribe: workspace.subscribe }),
+  createAgentWorkspaceStore: () => ({
+    getState: () => workspace.stateWithActions(),
+    subscribe: workspace.subscribe,
+  }),
 }));
 vi.mock("@/components/agent/AgentThread", () => ({
   AgentThread: ({ onOpenArtifact }: { onOpenArtifact?: (artifactId: string) => void }) => {
@@ -75,6 +115,7 @@ const api = vi.hoisted(() => ({
   getArtifact: vi.fn(),
   downloadArtifact: vi.fn(),
   deleteArtifact: vi.fn(),
+  getPolicy: vi.fn(),
 }));
 vi.mock("@/lib/agent/api", () => ({ agentApi: api }));
 
@@ -121,17 +162,11 @@ describe("Agent 工作台页面", () => {
     captured.onEvent = null;
     captured.onOpenArtifact = null;
     captured.onUnavailable = null;
-    workspace.applyEvent.mockReset();
-    workspace.markRunStale.mockReset();
-    workspace.openDrawer.mockReset();
-    workspace.setTab.mockReset();
-    workspace.selectRun.mockReset();
-    workspace.replaceRunList.mockReset();
-    workspace.replaceRunDetail.mockReset();
-    workspace.subscribe.mockReset().mockImplementation(() => () => {});
-    workspace.tab = "runs";
-    workspace.selectedRunByThread = {};
-    workspace.staleRunIds = {};
+    workspace.state.tab = "runs";
+    workspace.state.drawer = null;
+    workspace.state.selectedRunByThread = {};
+    workspace.state.staleRunIds = {};
+    workspaceListeners.clear();
     api.listRuns.mockReset();
     api.getRun.mockReset();
     api.listArtifacts.mockReset().mockResolvedValue({ artifacts: [], warnings: [] });
@@ -150,6 +185,17 @@ describe("Agent 工作台页面", () => {
           error_code: null, error_detail: null },
       ],
     });
+    api.getPolicy.mockResolvedValue({
+      schema_version: 1,
+      revision: 1,
+      updated_at: "2026-08-20T00:00:00Z",
+      persisted: true,
+      max_model_calls: 8,
+      max_tool_calls: 16,
+      tool_timeout_seconds: 30,
+      max_active_seconds: 300,
+      max_context_chars: 120_000,
+    });
   });
 
   afterEach(() => {
@@ -159,18 +205,21 @@ describe("Agent 工作台页面", () => {
   });
 
   const completeForm = async (user: userEvent.UserEvent) => {
+    await user.click(screen.getByRole("button", { name: "模型设置" }));
     await user.type(screen.getByLabelText("Provider"), "openai");
     await user.type(screen.getByLabelText("Base URL"), "https://api.openai.com/v1");
-    await user.type(screen.getByLabelText("模型"), "gpt-5-mini");
+    await user.type(screen.getByLabelText("模型名称"), "gpt-5-mini");
     await user.type(screen.getByLabelText("API Key"), "sk-page-key");
-    await user.click(screen.getByRole("button", { name: /保存/ }));
+    await user.click(screen.getByRole("button", { name: "保存模型配置" }));
+    await user.click(screen.getByRole("button", { name: "关闭" }));
   };
 
-  it("渲染紧凑工作台设置与会话输入区", () => {
+  it("渲染紧凑工作台设置与会话输入区", async () => {
+    const user = userEvent.setup();
     render(<MemoryRouter><Agent /></MemoryRouter>);
+    await user.click(screen.getByRole("button", { name: "模型设置" }));
     expect(screen.getByLabelText("Provider")).toBeInTheDocument();
     expect(screen.getByLabelText("Base URL")).toBeInTheDocument();
-    expect(screen.getByLabelText("模型")).toBeInTheDocument();
     expect(screen.getByText("开始前请先完成模型配置")).toBeInTheDocument();
     expect(screen.getByTestId("agent-workspace")).toHaveClass("h-full", "min-h-0");
     expect(screen.queryByText("Agent 工作台")).toBeNull();
@@ -179,9 +228,10 @@ describe("Agent 工作台页面", () => {
   it("保存只写入 vr-agent-model，不碰 vr-llm", async () => {
     const user = userEvent.setup();
     render(<MemoryRouter><Agent /></MemoryRouter>);
+    await user.click(screen.getByRole("button", { name: "模型设置" }));
     await user.type(screen.getByLabelText("Provider"), "deepseek");
     await user.type(screen.getByLabelText("Base URL"), "https://api.deepseek.com/v1");
-    await user.type(screen.getByLabelText("模型"), "deepseek-chat");
+    await user.type(screen.getByLabelText("模型名称"), "deepseek-chat");
     await user.type(screen.getByLabelText("API Key"), "page-secret");
     await user.click(screen.getByRole("button", { name: "保存模型配置" }));
     expect(localStorage.getItem("vr-llm")).toBeNull();
@@ -204,10 +254,11 @@ describe("Agent 工作台页面", () => {
     render(<MemoryRouter><Agent /></MemoryRouter>);
     await waitFor(() => expect(screen.getByText("gpt-saved")).toBeInTheDocument());
 
-    await user.clear(screen.getByLabelText("模型"));
-    await user.type(screen.getByLabelText("模型"), "gpt-draft");
+    await user.click(screen.getByRole("button", { name: "模型设置" }));
+    await user.clear(screen.getByLabelText("模型名称"));
+    await user.type(screen.getByLabelText("模型名称"), "gpt-draft");
 
-    expect(screen.getByLabelText("模型")).toHaveValue("gpt-draft");
+    expect(screen.getByLabelText("模型名称")).toHaveValue("gpt-draft");
     expect(screen.getByText("gpt-saved")).toBeInTheDocument();
     expect(document.body.textContent ?? "").not.toContain("sk-saved-secret");
   });
@@ -357,8 +408,10 @@ describe("Agent 工作台页面", () => {
     captured.onOpenArtifact?.("artifact-1");
 
     await waitFor(() => expect(screen.getByRole("tab", { name: /Artifact/ })).toHaveAttribute("aria-selected", "true"));
-    expect(workspace.setTab).toHaveBeenCalledTimes(2);
-    expect(workspace.openDrawer).toHaveBeenCalledTimes(2);
+    // 两次 artifact 激活各恰一次 setTab("artifacts")；点 Approval 也会同步 tab
+    expect(workspace.setTab.mock.calls.filter((call) => call[0] === "artifacts")).toHaveLength(2);
+    // completeForm 打开/关闭设置抽屉不计入 Inspector 激活
+    expect(workspace.openDrawer.mock.calls.filter((call) => call[0] === "inspector")).toHaveLength(2);
   });
 
   it("切换线程时清除上一线程的 artifact 选择", async () => {
@@ -392,7 +445,7 @@ describe("Agent 工作台页面", () => {
       resume_available: true,
       last_run: { id: "run-1", status: "awaiting_approval", updated_at: "t", retry_of: null },
     }));
-    workspace.selectedRunByThread["th-await"] = "run-1";
+    workspace.state.selectedRunByThread["th-await"] = "run-1";
     api.listRuns.mockResolvedValue({
       runs: [{
         id: "run-1",
@@ -407,9 +460,12 @@ describe("Agent 工作台页面", () => {
       warnings: [],
     });
     api.getRun.mockImplementation(() => new Promise(() => {}));
+    // 待审批线程会锁定模型身份，直接预置已保存配置
+    localStorage.setItem("vr-agent-model", JSON.stringify({
+      provider: "openai", baseURL: "https://api.openai.com/v1", model: "gpt-5", apiKey: "sk-approval",
+    }));
     const user = userEvent.setup();
     render(<MemoryRouter><Agent /></MemoryRouter>);
-    await completeForm(user);
     await user.click(await screen.findByRole("tab", { name: /Approval/ }));
     await waitFor(() => expect(screen.getAllByTestId("approval-panel-stub")).toHaveLength(1));
     expect(screen.getByRole("button", { name: "提交审批" })).toBeEnabled();
@@ -427,7 +483,7 @@ describe("Agent 工作台页面", () => {
       resume_available: true,
       last_run: { id: "run-1", status: "awaiting_approval", updated_at: "t", retry_of: null },
     }));
-    workspace.selectedRunByThread["th-await"] = "run-1";
+    workspace.state.selectedRunByThread["th-await"] = "run-1";
     api.listRuns.mockResolvedValue({
       runs: [{
         id: "run-1", status: "awaiting_approval", started_at: "t", updated_at: "t", ended_at: null,
@@ -437,9 +493,12 @@ describe("Agent 工作台页面", () => {
       warnings: [],
     });
     api.getRun.mockImplementation(() => new Promise(() => {}));
+    // 待审批线程会锁定模型身份，直接预置已保存配置
+    localStorage.setItem("vr-agent-model", JSON.stringify({
+      provider: "openai", baseURL: "https://api.openai.com/v1", model: "gpt-5", apiKey: "sk-narrow",
+    }));
     const user = userEvent.setup();
     render(<MemoryRouter><Agent /></MemoryRouter>);
-    await completeForm(user);
     await user.click(await screen.findByRole("tab", { name: /Approval/ }));
     expect(screen.getAllByRole("button", { name: "提交审批" }).filter((button) => !button.hasAttribute("disabled"))).toHaveLength(1);
     expect(within(screen.getByTestId("agent-runtime-content")).queryByTestId("approval-panel-stub")).toBeNull();

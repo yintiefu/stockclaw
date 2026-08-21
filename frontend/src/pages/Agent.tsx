@@ -4,14 +4,10 @@ import { AgentThread } from "@/components/agent/AgentThread";
 import { AgentThreadList } from "@/components/agent/AgentThreadList";
 import { AgentInspector } from "@/components/agent/AgentInspector";
 import { AgentWorkspace } from "@/components/agent/AgentWorkspace";
+import { AgentSettingsDrawer, type AgentSettingsTab } from "@/components/agent/AgentSettingsDrawer";
 import { ApprovalPanel } from "@/components/agent/ApprovalPanel";
 import { CapabilityBar } from "@/components/agent/CapabilityBar";
-import { CapabilityManagerDialog } from "@/components/agent/CapabilityManagerDialog";
-import {
-  loadAgentModelConfig,
-  saveAgentModelConfig,
-  type AgentModelConfig,
-} from "@/lib/agent/model-config";
+import { loadAgentModelConfig, type AgentModelConfig } from "@/lib/agent/model-config";
 import { AgentHistoryController } from "@/lib/agent/history";
 import { AgentRuntimeProvider, type AgentHttpAgent } from "@/lib/agent/runtime";
 import { createAgentWorkspaceStore } from "@/lib/agent/workspace";
@@ -22,9 +18,6 @@ import { ApiError } from "@/lib/api";
 /** Agent 工作台：服务端权威线程历史 + 三栏操作壳。 */
 export function Agent() {
   const [saved, setSaved] = useState<AgentModelConfig | null>(() => loadAgentModelConfig());
-  const [draft, setDraft] = useState<AgentModelConfig>(
-    () => loadAgentModelConfig() ?? { provider: "", baseURL: "", model: "", apiKey: "" },
-  );
   const [conflict, setConflict] = useState<string | null>(null);
   // 409 权威重载后递增，强制 runtime 重建并从服务端重新水合消息
   const [sessionEpoch, setSessionEpoch] = useState(0);
@@ -38,6 +31,7 @@ export function Agent() {
   const [inspectorInvalidation, setInspectorInvalidation] = useState(0);
   const [desktopViewport, setDesktopViewport] = useState(() =>
     typeof window !== "undefined" && window.matchMedia("(min-width: 1280px)").matches);
+  const [settingsTab, setSettingsTab] = useState<AgentSettingsTab>("model");
 
   const controllerRef = useRef<AgentHistoryController | null>(null);
   if (controllerRef.current === null) {
@@ -62,7 +56,6 @@ export function Agent() {
 
   const [threads, setThreads] = useState<AgentThreadSummary[]>([]);
   const [skills, setSkills] = useState<SkillSummary[]>([]);
-  const [managerOpen, setManagerOpen] = useState(false);
   const [warnings, setWarnings] = useState<Awaited<ReturnType<typeof agentApi.listThreads>>["warnings"]>([]);
   const [activeThread, setActiveThread] = useState<AgentThreadDoc | null>(null);
   const [loadingThread, setLoadingThread] = useState(true);
@@ -91,10 +84,8 @@ export function Agent() {
     };
   }, [controller, syncFromController]);
 
-  const save = () => {
-    saveAgentModelConfig(draft);
-    setSaved(loadAgentModelConfig());
-  };
+  // 抽屉等 workspace 状态驱动页面重渲染
+  useEffect(() => workspace.subscribe(bump), [workspace, bump]);
 
   // 结构化 409：展示中文 detail + 恰好一次权威重载（不自动重放被拒变更）
   const onConflict = useCallback(async (value: { code?: string; detail?: string }) => {
@@ -174,25 +165,19 @@ export function Agent() {
 
   useEffect(() => { void loadSkills(); }, [loadSkills]);
 
-  const applySkills = useCallback(async (updated: AgentThreadDoc) => {
-    try {
-      await controller.reload(updated.id);
-      await syncFromController();
-      setManagerOpen(false);
-    } catch {
-      setManagerOpen(false);
-    }
+  const reloadActiveThread = useCallback(async () => {
+    const threadId = controller.getActiveThreadId();
+    if (!threadId) return;
+    await controller.reload(threadId).catch(() => undefined);
+    await syncFromController();
   }, [controller, syncFromController]);
 
-  const handleSkillConflict = useCallback(async () => {
-    // 409：丢弃草稿并刷新一次（Skill 列表 + 权威线程）
-    await loadSkills();
-    const threadId = controller.getActiveThreadId();
-    if (threadId) {
-      await controller.reload(threadId).catch(() => undefined);
-      await syncFromController();
-    }
-  }, [controller, syncFromController, loadSkills]);
+  const openSettings = useCallback((tab: AgentSettingsTab) => {
+    setSettingsTab(tab);
+    workspace.getState().openDrawer("settings");
+  }, [workspace]);
+
+  const handleModelSaved = useCallback(() => setSaved(loadAgentModelConfig()), []);
 
   const handleDelete = async (threadId: string) => {
     try {
@@ -282,6 +267,9 @@ export function Agent() {
 
   const activeBusy = activeThread?.last_run?.status === "running"
     || activeThread?.last_run?.status === "awaiting_approval";
+  // 任一已知线程运行/待审批时锁定模型身份（正在运行的会话依赖打开时的身份）
+  const threadsBusy = threads.some((thread) =>
+    thread.last_run?.status === "running" || thread.last_run?.status === "awaiting_approval");
 
   const openArtifact = useCallback((artifactId: string) => {
     setSelectedArtifactId(artifactId);
@@ -304,7 +292,7 @@ export function Agent() {
       {unavailable ? (
         <div className="flex min-w-0 items-center justify-between gap-2">
           <span className="truncate">MCP 服务不可用：{unavailable}（本次提问未发出）</span>
-          <button type="button" onClick={() => setManagerOpen(true)} className="shrink-0 rounded-md px-2 py-1 text-primary hover:bg-primary/10">
+          <button type="button" onClick={() => openSettings("mcp")} className="shrink-0 rounded-md px-2 py-1 text-primary hover:bg-primary/10">
             管理 MCP
           </button>
         </div>
@@ -353,17 +341,12 @@ export function Agent() {
   const workspaceContent = (
     <AgentWorkspace
         threadTitle={activeThread?.title ?? "新会话"}
-        modelConfig={draft}
-        modelLabel={(saved ?? draft).model}
-        configured={runtimeReady}
+        modelLabel={saved?.model ?? ""}
         capabilityLabel={activeThread?.selected_skills.length
           ? `${activeThread.selected_skills.length} 个 Skill`
           : "未选择 Skill"}
-        onModelConfigChange={setDraft}
-        onSaveModel={save}
-        onOpenThreads={() => workspace.getState().openDrawer("threads")}
-        onOpenInspector={() => workspace.getState().openDrawer("inspector")}
-        onOpenSettings={() => workspace.getState().openDrawer("settings")}
+        desktop={desktopViewport}
+        store={workspace}
         threads={threadList}
         chat={chat}
         alerts={alerts}
@@ -373,7 +356,7 @@ export function Agent() {
             <div className="border-b border-border/70 px-3 py-1">
               <CapabilityBar
                 thread={activeThread}
-                onOpenManager={() => setManagerOpen(true)}
+                onOpenManager={() => openSettings("skills")}
                 disabled={activeBusy || converging}
               />
             </div>
@@ -390,6 +373,20 @@ export function Agent() {
             />
           </div>
         ) : null}
+        settings={(
+          <AgentSettingsDrawer
+            open={workspace.getState().drawer === "settings"}
+            onClose={() => { workspace.getState().openDrawer(null); setUnavailable(null); }}
+            focusTab={settingsTab}
+            thread={activeThread}
+            skills={skills}
+            modelBusy={threadsBusy}
+            selectionDisabled={activeBusy || converging}
+            onModelSaved={handleModelSaved}
+            onThreadReloaded={reloadActiveThread}
+            onSkillsChanged={loadSkills}
+          />
+        )}
     />
   );
 
@@ -398,7 +395,7 @@ export function Agent() {
       {runtimeReady && !loadingThread && activeThread ? (
         <AgentRuntimeProvider
           key={`${activeThread.id}-${sessionEpoch}`}
-          config={saved ?? draft}
+          config={saved ?? { provider: "", baseURL: "", model: "", apiKey: "" }}
           onConflict={onConflict}
           onError={onError}
           onUnavailable={onUnavailable}
@@ -411,17 +408,6 @@ export function Agent() {
           {workspaceContent}
         </AgentRuntimeProvider>
       ) : workspaceContent}
-      {!loadingThread && activeThread && (
-        <CapabilityManagerDialog
-          open={managerOpen}
-          thread={activeThread}
-          skills={skills}
-          onApplied={applySkills}
-          onConflict={handleSkillConflict}
-          onClose={() => { setManagerOpen(false); setUnavailable(null); }}
-          disabled={activeBusy || converging}
-        />
-      )}
     </div>
   );
 }
