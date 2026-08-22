@@ -161,7 +161,7 @@ function ImagePreview({
   containerClassName,
   onLoad,
   onError,
-  alt = "Image content",
+  alt = "图片内容",
   src,
   ...props
 }: ImagePreviewProps) {
@@ -253,7 +253,7 @@ type ImageZoomProps = PropsWithChildren<{
   alt?: string;
 }>;
 
-function ImageZoom({ src, alt = "Image preview", children }: ImageZoomProps) {
+function ImageZoom({ src, alt = "图片预览", children }: ImageZoomProps) {
   const [isMounted, setIsMounted] = useState(false);
   const [isOpen, setIsOpen] = useState(false);
 
@@ -354,7 +354,7 @@ function ImageContentFilterError({
       )}
     >
       <ShieldAlertIcon className="text-muted-foreground size-8" />
-      <p className="text-sm font-medium">Image could not be generated</p>
+      <p className="text-sm font-medium">图片生成失败</p>
       {reason && <p className="text-muted-foreground text-xs">{reason}</p>}
     </div>
   );
@@ -389,7 +389,7 @@ function RegenerateButton({
       }}
       disabled={isRegenerating}
       data-slot="image-regenerate"
-      aria-label="Regenerate image"
+      aria-label="重新生成图片"
       className="hover:bg-muted inline-flex size-7 items-center justify-center rounded disabled:opacity-50"
     >
       <RefreshCwIcon
@@ -445,15 +445,15 @@ const ImageImpl: ImageMessagePartComponent = (props) => {
   if (status?.type === "incomplete" && status.reason === "content-filter") {
     return (
       <ImageRoot>
-        <ImageContentFilterError reason="The provider blocked this image." />
+        <ImageContentFilterError reason="提供方拦截了此图片。" />
       </ImageRoot>
     );
   }
 
   return (
     <ImageRoot>
-      <ImageZoom src={image} alt={filename || "Image content"}>
-        <ImagePreview src={image} alt={filename || "Image content"} />
+      <ImageZoom src={image} alt={filename || "图片内容"}>
+        <ImagePreview src={image} alt={filename || "图片内容"} />
       </ImageZoom>
       <ImageFilename>{filename}</ImageFilename>
     </ImageRoot>

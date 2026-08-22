@@ -82,7 +82,7 @@ const AttachmentPreview: FC<AttachmentPreviewProps> = ({ src }) => {
   return (
     <img
       src={src}
-      alt="Attachment preview"
+      alt="附件预览"
       className={cn(
         "block h-auto max-h-[80vh] w-auto max-w-full rounded-sm object-contain transition-opacity duration-300 motion-reduce:transition-none",
         isLoaded
@@ -125,7 +125,7 @@ const AttachmentThumb: FC = () => {
     <Avatar className="aui-attachment-tile-avatar h-full w-full rounded-none after:hidden">
       <AvatarImage
         src={src}
-        alt="Attachment preview"
+        alt="附件预览"
         className="aui-attachment-tile-image rounded-none object-cover"
       />
       <AvatarFallback>
@@ -144,11 +144,11 @@ const AttachmentUI: FC = () => {
     const type = s.attachment.type;
     switch (type) {
       case "image":
-        return "Image";
+        return "图片";
       case "document":
-        return "Document";
+        return "文档";
       case "file":
-        return "File";
+        return "文件";
       default:
         return type;
     }
@@ -168,7 +168,7 @@ const AttachmentUI: FC = () => {
   const errorMessage = useAuiState((s) =>
     s.attachment.status.type === "incomplete" &&
     s.attachment.status.reason === "error"
-      ? (s.attachment.status.message ?? "Upload failed")
+      ? (s.attachment.status.message ?? "上传失败")
       : undefined,
   );
 
@@ -196,11 +196,11 @@ const AttachmentUI: FC = () => {
                   )}
                   role="button"
                   tabIndex={0}
-                  aria-label={`${typeLabel} attachment${
+                  aria-label={`${typeLabel}附件${
                     isError
-                      ? ", upload failed"
+                      ? "，上传失败"
                       : isUploading
-                        ? ", uploading"
+                        ? "，上传中"
                         : ""
                   }`}
                 />

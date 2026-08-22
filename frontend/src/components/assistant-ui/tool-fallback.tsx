@@ -311,8 +311,8 @@ function ToolFallbackError({
   );
 }
 
-const APPROVED_RESULT = "Approved by user";
-const DENIED_RESULT = "User denied tool execution";
+const APPROVED_RESULT = "用户已允许";
+const DENIED_RESULT = "用户已拒绝，未执行工具";
 
 const APPROVAL_OPTION_DEFAULT_LABELS: Record<string, string> = {
   "allow-once": "允许",
