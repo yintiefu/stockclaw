@@ -133,6 +133,13 @@ git commit -m "build(frontend): pin @assistant-ui/react 0.15.16 and add tw-shimm
   --color-input: hsl(var(--input));
 ```
 
+同时在 `--radius-*` 一组(约 40-42 行)补两档——demo 复制件大量使用 `rounded-xl`(更多菜单、代码块、气泡),未声明时 Tailwind v4 回落默认 `0.75rem`(12px),会小于本项目 `--radius-lg` 的 16px,造成圆角阶梯倒挂:
+
+```css
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+```
+
 - [ ] **Step 4: `:root`(暗色)补原始变量**
 
 在 `--border: 210 30% 22%;` 行之后插入:
@@ -234,6 +241,7 @@ git commit -m "feat(agent): copy demo base-ui primitives, fix secondary color-mi
 
 ```bash
 cd /vol2/1000/code/stockclaw
+mkdir -p frontend/src/components/assistant-ui
 for f in thread markdown-text tool-fallback tool-group reasoning tooltip-icon-button follow-up-suggestions attachment file image; do
   cp "/vol2/1000/code/assistant-ui-demo/components/assistant-ui/$f.tsx" "frontend/src/components/assistant-ui/$f.tsx"
 done
@@ -276,17 +284,19 @@ done
 1. `const label = isCancelled ? "Cancelled tool" : "Used tool";` → `const label = isCancelled ? "已取消的工具" : "调用工具";`(shimmer 处用的也是同一变量,无需另改)
 2. `Result:` 段落文本 → `执行结果:`
 3. `const headerText = isCancelled ? "Cancelled reason:" : "Error:";` → `const headerText = isCancelled ? "取消原因:" : "执行错误:";`
-4. `APPROVAL_OPTION_DEFAULT_LABELS` 四项:`"allow-once": "允许"`、`"allow-always": "始终允许"`、`"reject-once": "拒绝"`、`"reject-always": "始终拒绝"`;以及 confirm 视图的默认标题 fallback `${approvalOptionLabel(confirming)}?` 保持不变,按钮文本 `Confirm` → `确认`、`Back` → `返回`(两处 Button)。
+4. `APPROVAL_OPTION_DEFAULT_LABELS` 四项:`"allow-once": "允许"`、`"allow-always": "始终允许"`、`"reject-once": "拒绝"`、`"reject-always": "始终拒绝"`;confirm 视图的默认标题 fallback `${approvalOptionLabel(confirming)}?` 保持不变,按钮文本 `Confirm` → `确认`、`Back` → `返回`(两处 Button)。
+5. **JSX 硬编码按钮文本 3 处**(不走 labels map,demo 原文 512 / 534 / 543 行):options 分支拒绝兜底 `Deny` → `拒绝`;非 options 兜底分支 `Allow` → `允许`、`Deny` → `拒绝`。
 
 - [ ] **Step 5: tool-group.tsx / reasoning.tsx 中文化**
 
 - tool-group.tsx:`const label = \`${count} tool ${count === 1 ? "call" : "calls"}\`;` → `const label = \`${count} 次工具调用\`;`
 - reasoning.tsx:两处 `Reasoning{durationText}`(正常 + shimmer 重复文本)→ `思考过程{durationText}`
 
-- [ ] **Step 6: image.tsx / attachment.tsx 中文化**
+- [ ] **Step 6: image.tsx / attachment.tsx / file.tsx 中文化**
 
-- image.tsx:`aria-label="Download image"` → `aria-label="下载图片"`;`aria-label="Copy image"` → `aria-label="复制图片"`;sr-only `Generating image…` → `正在生成图片…`
-- attachment.tsx:`DialogTitle` 的 `Image Attachment Preview` → `图片附件预览`;`tooltip="Add Attachment"` 与 `aria-label="Add Attachment"` → `添加附件`
+- image.tsx:`aria-label="Download image"` → `aria-label="下载图片"`;`aria-label="Copy image"` → `aria-label="复制图片"`;sr-only `Generating image…` → `正在生成图片…`;`aria-label="Click to zoom image"` → `aria-label="点击放大图片"`;`aria-label="Close zoomed image"` → `aria-label="关闭放大图片"`
+- attachment.tsx:`DialogTitle` 的 `Image Attachment Preview` → `图片附件预览`;`tooltip="Add Attachment"` 与 `aria-label="Add Attachment"` → `添加附件`;`tooltip="Remove file"` → `移除文件`
+- file.tsx:`{children || "Unnamed file"}` → `{children || "未命名文件"}`
 
 - [ ] **Step 7: 类型检查**
 
@@ -313,61 +323,67 @@ git commit -m "feat(agent): copy demo assistant-ui components with localization 
 
 以下编辑全部基于 Task 4 复制进来的文件(demo 原文行号仅供参考,以内容匹配为准)。
 
-- [ ] **Step 1: ThreadComponents 增加两个 slot**
+- [ ] **Step 1: ThreadProps 增加 composer / footerExtra(ReactNode,不走 ThreadComponents 组件槽)**
 
-把:
+> 为什么不用 `ThreadComponents.Composer?: ComponentType`:工作台侧的 Composer/FooterExtra 必然携带闭包状态(pendingApproval、statusNote、activeThread 等),只能以内联函数提供——函数身份随流式重渲染变化,React 会按"不同组件类型"卸载重挂子树,导致输入焦点丢失、SteerAwayComposer 草稿清空、工具折叠面板状态抖动。元素(ReactNode)按类型协调,天然免疫该问题;`ThreadComponents` 保持 demo 原样零改动。
+
+react 导入增加 `type ReactNode,`(thread.tsx 头部 `import { createContext, useContext, type ComponentType, type FC, type PropsWithChildren } from "react";`)。
+
+把 demo 原文的:
 
 ```tsx
-export type ThreadComponents = {
-  AssistantMessage?: ComponentType | undefined;
-  Welcome?: ComponentType | undefined;
-  ToolFallback?: ToolCallMessagePartComponent | undefined;
-  ToolGroup?:
-    | ComponentType<PropsWithChildren<{ group: ThreadGroupPart }>>
-    | undefined;
-  ReasoningGroup?:
-    | ComponentType<PropsWithChildren<{ group: ThreadGroupPart }>>
-    | undefined;
+export type ThreadProps = {
+  components?: ThreadComponents | undefined;
 };
 ```
 
 改为:
 
 ```tsx
-export type ThreadComponents = {
-  AssistantMessage?: ComponentType | undefined;
-  Welcome?: ComponentType | undefined;
-  ToolFallback?: ToolCallMessagePartComponent | undefined;
-  ToolGroup?:
-    | ComponentType<PropsWithChildren<{ group: ThreadGroupPart }>>
-    | undefined;
-  ReasoningGroup?:
-    | ComponentType<PropsWithChildren<{ group: ThreadGroupPart }>>
-    | undefined;
-  /** 覆写整个 Composer(工作台用于禁用态与 SteerAway 换装) */
-  Composer?: ComponentType | undefined;
+export type ThreadProps = {
+  components?: ThreadComponents | undefined;
+  /** 覆写整个 Composer(工作台用于禁用态与 SteerAway 换装);传元素而非组件类型 */
+  composer?: ReactNode | undefined;
   /** 渲染在 ViewportFooter 内 Composer 之前的附加区(statusNote / 重试) */
-  FooterExtra?: ComponentType | undefined;
+  footerExtra?: ReactNode | undefined;
 };
 ```
 
-- [ ] **Step 2: 内部 Composer 改名 ThreadComposer 并接入 slot**
+`Thread` 组件本体改为(透传给 ThreadRoot):
+
+```tsx
+export const Thread: FC<ThreadProps> = ({
+  components = EMPTY_COMPONENTS,
+  composer,
+  footerExtra,
+}) => {
+  const isEmpty = useAuiState(isNewChatView);
+
+  return (
+    <ThreadComponentsContext.Provider value={components}>
+      <ThreadRoot isEmpty={isEmpty} composer={composer} footerExtra={footerExtra} />
+    </ThreadComponentsContext.Provider>
+  );
+};
+```
+
+- [ ] **Step 2: 内部 Composer 改名 ThreadComposer 并在 footer 消费元素 props**
 
 1. 把 `const Composer: FC = () => {` 改为 `const ThreadComposer: FC = () => {`
-2. 在 `ThreadRoot` 中,把解构:
+2. `ThreadRoot` 签名,把 demo 原文的:
 
 ```tsx
-  const { Welcome = ThreadWelcome } = useContext(ThreadComponentsContext);
+const ThreadRoot: FC<{ isEmpty: boolean }> = ({ isEmpty }) => {
 ```
 
 改为:
 
 ```tsx
-  const {
-    Welcome = ThreadWelcome,
-    Composer: ComposerComponent = ThreadComposer,
-    FooterExtra,
-  } = useContext(ThreadComponentsContext);
+const ThreadRoot: FC<{
+  isEmpty: boolean;
+  composer?: ReactNode;
+  footerExtra?: ReactNode;
+}> = ({ isEmpty, composer, footerExtra }) => {
 ```
 
 3. 同一个 `ThreadRoot` 的 ViewportFooter 内,把:
@@ -383,8 +399,8 @@ export type ThreadComponents = {
 ```tsx
             <ThreadScrollToBottom />
             <ThreadFollowupSuggestions />
-            {FooterExtra ? <FooterExtra /> : null}
-            <ComposerComponent />
+            {footerExtra ?? null}
+            {composer ?? <ThreadComposer />}
 ```
 
 - [ ] **Step 3: 能力守卫(Reload / Edit;Dictation demo 已自带守卫)**
@@ -439,6 +455,7 @@ export type ThreadComponents = {
 | `tooltip="More"` | `tooltip="更多"` |
 | `Export as Markdown`(Item 内文本) | `导出 Markdown` |
 | BranchPicker `tooltip="Previous"` / `tooltip="Next"` | `tooltip="上一个"` / `tooltip="下一个"` |
+| 消息流式指示符 `aria-label="Assistant is working"` | `aria-label="Agent 正在处理"` |
 
 - [ ] **Step 5: 类型检查**
 
@@ -618,11 +635,13 @@ cd /vol2/1000/code/stockclaw/frontend && npx vitest run src/components/agent/Age
 完整替换 `frontend/src/components/agent/AgentThread.tsx`:
 
 ```tsx
-import { useMemo } from "react";
+import { createContext, useContext } from "react";
 import {
   AuiIf,
   ComposerPrimitive,
   useAuiState,
+  type ToolCallMessagePartComponent,
+  type ToolCallMessagePartStatus,
 } from "@assistant-ui/react";
 import { ArrowUpIcon, ExternalLink, RotateCcw, SquareIcon } from "lucide-react";
 
@@ -674,7 +693,7 @@ export function ToolFallback({
   argsText?: string;
   args?: unknown;
   result?: unknown;
-  status?: Parameters<typeof DemoToolFallback>[0]["status"];
+  status?: ToolCallMessagePartStatus;
   onOpenArtifact?: (artifactId: string) => void;
 }) {
   const artifactId = artifactIdFromResult(toolName, result);
@@ -695,8 +714,23 @@ export function ToolFallback({
   );
 }
 
-/** 工作台 Composer：demo 结构 + 收敛禁用态 + 运行中锁输入。 */
-function WorkspaceComposer({ disabled }: { disabled?: boolean }) {
+const NOOP_OPEN_ARTIFACT = () => {};
+
+/** 工作台上下文：向静态 ToolFallback 提供 onOpenArtifact（组件身份稳定，不随重渲染卸载子树）。 */
+const OnOpenArtifactContext = createContext<(artifactId: string) => void>(NOOP_OPEN_ARTIFACT);
+
+/** ThreadComponents.ToolFallback 的静态实现：模块级稳定身份 + Context 取回调。 */
+const WorkspaceToolFallback: ToolCallMessagePartComponent = (props) => {
+  const onOpenArtifact = useContext(OnOpenArtifactContext);
+  return <ToolFallback {...props} onOpenArtifact={onOpenArtifact} />;
+};
+
+/** 静态组件表：所有引用为模块级身份，流式重渲染不会触发消息子树卸载。 */
+const STATIC_COMPONENTS: ThreadComponents = {
+  ToolFallback: WorkspaceToolFallback,
+};
+
+/** 工作台 Composer：demo 结构 + 收敛禁用态 + 运行中锁输入。 */function WorkspaceComposer({ disabled }: { disabled?: boolean }) {
   const isRunning = useAuiState((s) => s.thread.isRunning);
   return (
     <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
@@ -800,44 +834,38 @@ export function AgentThread({
     || activeThread?.last_run?.status === "cancelled"
     || activeThread?.last_run?.status === "interrupted";
 
-  const components = useMemo<ThreadComponents>(
-    () => ({
-      ToolFallback: (props) => (
-        <ToolFallback {...props} onOpenArtifact={onOpenArtifact} />
-      ),
-      Composer: () =>
-        pendingApproval ? (
-          <SteerAwayComposer disabled={composerDisabled} />
-        ) : (
-          <WorkspaceComposer disabled={composerDisabled} />
-        ),
-      ...(statusNote || retryable
-        ? {
-            FooterExtra: () => (
-              <div className="space-y-2">
-                <div data-testid="agent-status-area" className="min-h-8">
-                  {statusNote ? (
-                    <div className="rounded-md border border-border bg-black/20 px-3 py-1.5 text-xs text-muted-foreground">
-                      {statusNote}
-                    </div>
-                  ) : null}
+  // 组件身份稳定性：composer/footerExtra 传「元素」而非组件类型——元素按类型协调，
+  // activeThread/statusNote 等流式高频变化只会触发普通重渲染，不会卸载 Composer 子树
+  // （否则输入焦点丢失、SteerAway 草稿清空、工具折叠状态抖动）。
+  // components 表是模块级常量 STATIC_COMPONENTS，同样稳定。
+  return (
+    <OnOpenArtifactContext.Provider value={onOpenArtifact ?? NOOP_OPEN_ARTIFACT}>
+      <Thread
+        components={STATIC_COMPONENTS}
+        composer={pendingApproval
+          ? <SteerAwayComposer disabled={composerDisabled} />
+          : <WorkspaceComposer disabled={composerDisabled} />}
+        footerExtra={statusNote || retryable ? (
+          <div className="space-y-2">
+            <div data-testid="agent-status-area" className="min-h-8">
+              {statusNote ? (
+                <div className="rounded-md border border-border bg-black/20 px-3 py-1.5 text-xs text-muted-foreground">
+                  {statusNote}
                 </div>
-                <RetryAction activeThread={activeThread} onRetry={onRetry} />
-              </div>
-            ),
-          }
-        : {}),
-    }),
-    [pendingApproval, composerDisabled, statusNote, retryable, activeThread, onRetry, onOpenArtifact],
+              ) : null}
+            </div>
+            <RetryAction activeThread={activeThread} onRetry={onRetry} />
+          </div>
+        ) : null}
+      />
+    </OnOpenArtifactContext.Provider>
   );
-
-  return <Thread components={components} />;
 }
 ```
 
 要点:
 - `ToolFallback` 同时兼容 demo 的 part props(`argsText`/`status`)与现有测试的直接调用(`result` 字符串)。
-- `status` 的类型写法 `Parameters<typeof DemoToolFallback>[0]["status"]` 若 tsc 报错(memo 包装后的签名),改为从 `@assistant-ui/react` 导入 `type ToolCallMessagePartStatus` 并直接使用。
+- **组件身份稳定性(评审 Critical 修正)**:`components` 是模块级常量,`composer`/`footerExtra` 是元素而非组件类型;`onOpenArtifact` 经 Context 注入静态 ToolFallback。任何 props 高频变化都只触发重渲染,不触发子树卸载。pendingApproval 切换时 SteerAwayComposer ↔ WorkspaceComposer 的类型切换是**有意的换装**(与现状一致)。
 - 运行中锁输入(`disabled={disabled || isRunning}`)对应测试「运行中:输入禁用」。
 
 - [ ] **Step 4: 运行测试确认通过**
@@ -966,4 +994,5 @@ git commit -m "chore(agent): visual pass and localization sweep for demo chat su
 
 - **Spec 覆盖**:§3 依赖→Task 1;§4/§6 CSS→Task 2;§6 ui 基件→Task 3;§6/§7.2/§7.1(3)(除 thread)→Task 4;§7.1→Task 5;§7.3→Task 6;§9→Task 6/7;§8 验证点→Task 7 Step 2;「AddAttachment 自隐藏验证」→Task 6 Step 1 的显式断言;视觉抽查→Task 8。
 - **占位符扫描**:无 TBD/TODO;所有代码步骤含完整代码或精确 old/new。
-- **类型一致性**:`ThreadComponents.Composer/FooterExtra`(Task 5 定义)与 `AgentThread.tsx`(Task 6 使用)一致;`ToolFallback` 导出签名与测试调用一致;`DemoToolFallback` 导入名与 tool-fallback.tsx 导出一致。
+- **类型一致性**:`ThreadProps.composer/footerExtra`(ReactNode,Task 5 定义)与 `AgentThread.tsx`(Task 6 传入元素)一致;`STATIC_COMPONENTS: ThreadComponents`(demo 原类型,无 slot 扩展)与 `WorkspaceToolFallback: ToolCallMessagePartComponent` 匹配;`ToolFallback` 导出签名(`status?: ToolCallMessagePartStatus`)与测试调用及 `WorkspaceToolFallback` 的 spread 兼容。
+- **评审修正(第三轮)**:①composer/footerExtra 从 ThreadComponents 组件槽改为 ThreadProps 的 ReactNode 元素 props + Context 注入回调,消除组件身份抖动(Critical);②Task 4 补 `mkdir -p`;③Task 2 补 `--radius-xl/2xl` 防圆角倒挂;④Task 4 补 3 处硬编码 Allow/Deny 中文化;⑤指示符 aria-label、file/attachment/image 微文案、status 具名类型导入。
