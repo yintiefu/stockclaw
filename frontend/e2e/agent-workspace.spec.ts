@@ -65,6 +65,10 @@ test.describe("桌面工作台交互", () => {
     await expect(page.getByRole("heading", { name: "交互会话" })).toBeVisible();
 
     await send(page, "查一下行情");
+    // demo 工具折叠组：折叠条可见；展开后工具名可见（工具文本在展开后可见）
+    const toolGroup = page.getByRole("button", { name: /次工具调用/ }).first();
+    await expect(toolGroup).toBeVisible({ timeout: 30_000 });
+    await toolGroup.click();
     await expect(page.getByText("fetch_quote").first()).toBeVisible({ timeout: 30_000 });
     await expect(page.getByText(/收盘价 1500\.0/).first()).toBeVisible({ timeout: 30_000 });
     await waitForComposerBack(page);
@@ -100,7 +104,8 @@ test.describe("桌面工作台交互", () => {
 
     // 切到第 2 版（叶子）→ 可删除；删除后回到第 1 版且第 1 版成为叶子
     await page.getByRole("button", { name: /查看版本：客观数据整理（第 2 版）/ }).click();
-    await expect(page.getByText("第 2 版", { exact: false }).first()).toBeVisible();
+    // 用第 2 版正文独有文案断言（「第 2 版」字样也出现在下拉 option 与聊天折叠 JSON 中）
+    await expect(page.getByText("在第一版基础上补充客观记录").first()).toBeVisible();
     await page.getByLabel("删除 Artifact").click();
     await expect(page.getByRole("button", { name: /查看版本：客观数据整理（第 2 版）/ })).toHaveCount(0);
     await expect(page.getByText("存在后续版本，不能删除")).toHaveCount(0);
