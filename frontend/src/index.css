@@ -1,9 +1,32 @@
 @import 'tailwindcss';
 @import 'tw-animate-css';
+@import 'tw-shimmer';
 
 @plugin '@tailwindcss/typography';
 
 @custom-variant dark (&:is(.dark *));
+@custom-variant data-open (&:where([data-state="open"], [data-open]:not([data-open="false"])));
+@custom-variant data-closed (&:where([data-state="closed"], [data-closed]:not([data-closed="false"])));
+
+/* 覆盖 tw-animate-css 的同名 keyframes：加入 base-ui 的 --collapsible-panel-height */
+@theme inline {
+  @keyframes collapsible-down {
+    from {
+      height: 0;
+    }
+    to {
+      height: var(--radix-collapsible-content-height, var(--collapsible-panel-height, auto));
+    }
+  }
+  @keyframes collapsible-up {
+    from {
+      height: var(--radix-collapsible-content-height, var(--collapsible-panel-height, auto));
+    }
+    to {
+      height: 0;
+    }
+  }
+}
 
 @theme {
   --font-sans: Inter, system-ui, sans-serif;
@@ -32,6 +55,15 @@
   --color-card: hsl(var(--card));
   --color-card-foreground: hsl(var(--card-foreground));
 
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+
+  --color-ring: hsl(var(--ring));
+  --color-input: hsl(var(--input));
+
   --color-success: hsl(var(--success));
   --color-danger: hsl(var(--danger));
   --color-warning: hsl(var(--warning));
@@ -40,6 +72,8 @@
   --radius-lg: var(--radius);
   --radius-md: calc(var(--radius) - 4px);
   --radius-sm: calc(var(--radius) - 8px);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
 
   --shadow-glass:
     0 12px 30px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.06);
@@ -188,6 +222,12 @@
     --destructive: 0 72% 58%;
     --destructive-foreground: 0 0% 100%;
     --border: 210 30% 22%;             /* surface-3 边框 */
+    --popover: 222 40% 9%;             /* 对齐 card 档 */
+    --popover-foreground: 210 30% 92%;
+    --secondary: 220 28% 15%;          /* 对齐 muted 档 */
+    --secondary-foreground: 210 30% 92%;
+    --ring: 210 30% 22%;               /* 对齐 border 档 */
+    --input: 210 30% 18%;
     --radius: 1rem;
 
     /* 语义色（涨跌配色由页面按 A股红涨绿跌自行选用 success/danger） */
@@ -224,6 +264,12 @@
     --destructive: 0 74% 55%;
     --destructive-foreground: 0 0% 100%;
     --border: 214 20% 84%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 40% 12%;
+    --secondary: 210 20% 92%;
+    --secondary-foreground: 222 40% 12%;
+    --ring: 214 20% 84%;
+    --input: 214 20% 80%;
 
     --success: 145 62% 40%;
     --danger: 0 74% 52%;
