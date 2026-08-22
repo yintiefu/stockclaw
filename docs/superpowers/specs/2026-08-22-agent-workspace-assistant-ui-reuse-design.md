@@ -82,7 +82,7 @@ AgentThread.tsx 重写为薄适配层 —— 对外 props 契约不变，Agent.t
 - `assistant-ui/`：`thread.tsx`、`markdown-text.tsx`、`tool-fallback.tsx`、`tool-group.tsx`、`reasoning.tsx`、`tooltip-icon-button.tsx`、`follow-up-suggestions.tsx`、`attachment.tsx`、`file.tsx`、`image.tsx`
 - `ui/`：`button.tsx`、`tooltip.tsx`、`collapsible.tsx`、`dialog.tsx`、`skeleton.tsx`、`avatar.tsx`
 
-复制优先逐字保留（含 `aui-*` data-slot 类名与注释），适配仅限第 7 节列出的点。
+复制优先逐字保留（含 `aui-*` data-slot 类名与注释），适配仅限第 7 节列出的点。demo 中的 deprecated 兼容导出（`reasoning.tsx` 的 `ReasoningGroup`、`tool-group.tsx` 的 `ToolGroup`）原样保留——它们是 `export`，不会触发 `noUnusedLocals`，保留可降低后续 registry 升级的合并成本；仅清理复制件中真正未被引用的 import（`noUnusedLocals` 会在 build 时强制）。
 
 ### 修改
 
@@ -91,7 +91,8 @@ AgentThread.tsx 重写为薄适配层 —— 对外 props 契约不变，Agent.t
   - `@import 'tw-shimmer'`
   - 移植 `@custom-variant data-open` / `data-closed`（base-ui 组件的 data 属性变体）
   - 移植 collapsible-down/up `@keyframes`（fallback 链 `--radix-collapsible-content-height, --collapsible-panel-height, auto`）
-  - `@theme inline` 与 `:root` / `.light` 补缺失变量（具体取值：暗色 `--popover: 222 40% 9%`、`--popover-foreground: 210 30% 92%`、`--ring: 210 30% 22%`、`--input: 210 30% 18%`；亮色 `--popover: 0 0% 100%`、`--popover-foreground: 222 40% 12%`、`--ring: 214 20% 84%`、`--input: 214 20% 80%`——popover 对齐 card 档、ring/input 对齐 border 档，保持暖橙体系）
+  - `@theme inline` 新增 6 个颜色映射（Tailwind v4 只为 `--color-*` 命名空间生成工具类，`:root` 裸变量不会让 `bg-popover` 等类生效）：`--color-popover: hsl(var(--popover))`、`--color-popover-foreground: hsl(var(--popover-foreground))`、`--color-ring: hsl(var(--ring))`、`--color-input: hsl(var(--input))`、`--color-secondary: hsl(var(--secondary))`、`--color-secondary-foreground: hsl(var(--secondary-foreground))`
+  - `:root` / `.light` 补原始变量（具体取值：暗色 `--popover: 222 40% 9%`、`--popover-foreground: 210 30% 92%`、`--ring: 210 30% 22%`、`--input: 210 30% 18%`、`--secondary: 220 28% 15%`、`--secondary-foreground: 210 30% 92%`；亮色 `--popover: 0 0% 100%`、`--popover-foreground: 222 40% 12%`、`--ring: 214 20% 84%`、`--input: 214 20% 80%`、`--secondary: 210 20% 92%`、`--secondary-foreground: 222 40% 12%`——popover 对齐 card 档、secondary 对齐 muted 档、ring/input 对齐 border 档，保持暖橙体系）
 - `frontend/src/components/agent/AgentThread.tsx`：重写为适配层（见 7.3）
 
 ## 7. 关键适配点
@@ -103,8 +104,10 @@ AgentThread.tsx 重写为薄适配层 —— 对外 props 契约不变，Agent.t
    - `FooterExtra?: ComponentType`——渲染在 ViewportFooter 内 Composer 之前的区块
 2. 能力守卫：`ActionBarPrimitive.Reload` / `.Edit` 与 Dictation 相关节点包 `AuiIf condition={s => s.thread.capabilities.reload / edit / dictation}`；AG-UI 运行时不具备这些能力时按钮自动隐藏，具备时自然出现。
 3. 文案中文化：composer placeholder（「输入投研问题」）、Welcome 欢迎语（投研语境）、tooltips（复制 / 刷新 / 编辑 / 导出 Markdown / 滚动到底 / 发送 / 停止）、ToolFallback 的「调用工具 / 已取消」、ToolGroup 的「N 次工具调用」、Reasoning 的「思考过程」。`aui-*` 类名与 data-slot 保持不变。
-4. 附件 UI 验证：确认无 attachment adapter 时 `ComposerPrimitive.AddAttachment` 自隐藏；若不自隐藏，则从 Composer 中移除 `ComposerAddAttachment` / `ComposerAttachments` / `AttachmentDropzone` 三处引用（attachment.tsx 仍复制保留，接 adapter 时再启用）。
-5. 44rem 居中为 demo 默认，不改。
+4. **可访问名契约（测试依赖，不可漂移）**：现有 vitest 与 e2e 依赖以下可访问名——输入框 `aria-label="Agent 消息"`（e2e 33/41/305 行、vitest 49/56/74 行）；发送按钮 `title="发送"`（e2e 36 行）；停止按钮 `title="停止"`（e2e 155 行）；SteerAwayComposer 的「转向新问题」与「发送新问题（取消当前审批）」；「在 Inspector 打开」与「重试本轮」按钮名。因此：`TooltipIconButton` 必须把 `title={tooltip}` 透传给底层 `<Button>`（demo 版只有 sr-only span，无原生 title）；`ComposerPrimitive.Input` 的 aria-label 用「Agent 消息」而非 demo 的「Message input」；Cancel 按钮同时写 `aria-label` 与 `title`（demo 版 Cancel 走 `Button aria-label`，无 title）。
+5. **button.tsx secondary 变体的非法 color-mix**：demo 原文 `hover:bg-[color-mix(in_oklch,var(--secondary),var(--foreground)_5%)]` 把无单位 HSL 三元组直接传入 `color-mix()`，在本项目变量体系下是非法 CSS。改为标准工具类 `hover:bg-secondary/80`；其余变体逐字保留。
+6. 附件 UI 验证：确认无 attachment adapter 时 `ComposerPrimitive.AddAttachment` 自隐藏；若不自隐藏，则从 Composer 中移除 `ComposerAddAttachment` / `ComposerAttachments` / `AttachmentDropzone` 三处引用（attachment.tsx 仍复制保留，接 adapter 时再启用）。
+7. 44rem 居中为 demo 默认，不改。
 
 ### 7.2 markdown-text.tsx（复制后）
 
@@ -115,7 +118,7 @@ AgentThread.tsx 重写为薄适配层 —— 对外 props 契约不变，Agent.t
 对外 props 契约不变（`activeThread` / `onRetry` / `statusNote` / `composerDisabled` / `pendingApproval` / `onOpenArtifact`），`Agent.tsx` 零改动：
 
 - 内部渲染 demo `<Thread components={...}>`
-- `ToolFallback` slot：demo ToolFallback + 现有 `artifactIdFromResult` 解析，`create_artifact` 结果附「在 Inspector 打开」按钮（放在 ToolFallback 折叠内容之后，e2e 依赖此入口）
+- `ToolFallback` slot：demo ToolFallback + 现有 `artifactIdFromResult` 解析，`create_artifact` 结果附「在 Inspector 打开」按钮。**按钮渲染在折叠面板外部**（ToolFallback 折叠条下方独立一行，不随折叠隐藏）——demo ToolFallback 对 complete 状态默认折叠，e2e（83-85 / 362-364 行）直接按角色名点击该按钮，不先展开
 - `Composer` slot：demo Composer 结构 + `composerDisabled` 透传到 Input/Send；`pendingApproval` 时渲染 `SteerAwayComposer`（原逻辑）
 - `FooterExtra` slot：statusNote 区（保留 `data-testid="agent-status-area"`）+ RetryAction（failed/cancelled/interrupted 最新 run 可重试，原逻辑迁移）
 - 外层保留 `data-testid="agent-thread-region"` 由父级容器承担（现状即如此，不改）
@@ -128,7 +131,7 @@ AgentThread.tsx 重写为薄适配层 —— 对外 props 契约不变，Agent.t
 
 ## 9. 测试策略
 
-1. **vitest**：更新 `AgentThread.test.tsx` 及受影响组件套件——新 DOM 结构（markdown 元素、折叠工具面板、shimmer 类）；`src/test/setup.ts` 已 stub ResizeObserver，base-ui Tooltip/Dialog 若需再补 stub。
+1. **vitest**：更新 `AgentThread.test.tsx` 及受影响组件套件——新 DOM 结构（markdown 元素、折叠工具面板、shimmer 类）；`src/test/setup.ts` 已 stub ResizeObserver，base-ui Tooltip/Dialog 若需再补 stub。按钮数量类断言（如 `getAllByRole("button")).toHaveLength(1)`）改为语义断言（`getByTitle("停止")` / `queryByTitle("发送")` 为空）——demo Thread 会引入滚动到底等新按钮，数量断言必然误报。
 2. **构建**：`npm run build`（tsc strict + noUnusedLocals / noUnusedParameters）必须零错误——复制件中的未用导入需清理。
 3. **e2e**：`agent-workspace.spec.ts` 全量 20 条回归——流式、工具文本、artifact 打开（依赖「在 Inspector 打开」按钮）、审批、Stop/Retry、409 收敛、390/1280/1440 × 双主题截图无横向溢出；必要时仅调整选择器。
 4. **视觉抽查**：dev-host 配方（createRequire frontend + headless chromium）对空态 / 欢迎页 / 工具折叠态 / markdown 消息截图，双主题。
