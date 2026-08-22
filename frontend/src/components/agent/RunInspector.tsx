@@ -27,7 +27,7 @@ function Fact({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0">
       <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="mt-0.5 break-words text-sm tabular-nums">{value}</dd>
+      <dd className="mt-0.5 wrap-break-word text-sm tabular-nums">{value}</dd>
     </div>
   );
 }
@@ -101,7 +101,7 @@ export function RunInspector({ run }: { run: AgentRunDetail }) {
         <section className="border-t border-border/70 pt-3" aria-labelledby="run-error-title">
           <h3 id="run-error-title" className="text-xs font-semibold text-muted-foreground">终态错误</h3>
           {run.error_code ? <p className="mt-2 font-mono text-xs text-destructive">{run.error_code}</p> : null}
-          {run.error_message ? <p className="mt-1 break-words text-sm">{run.error_message}</p> : null}
+          {run.error_message ? <p className="mt-1 wrap-break-word text-sm">{run.error_message}</p> : null}
         </section>
       ) : null}
     </div>

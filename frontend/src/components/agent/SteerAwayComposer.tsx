@@ -31,7 +31,7 @@ export function SteerAwayComposer({ disabled }: { disabled: boolean }) {
         onChange={(e) => setText(e.target.value)}
         placeholder="待审批中：发送新问题将取消本次工具调用并转向（旧运行会被取消）"
         rows={2}
-        className="min-h-[44px] flex-1 resize-none rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50"
+        className="min-h-[44px] flex-1 resize-none rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-hidden focus:border-primary/50"
       />
       <button
         type="button"

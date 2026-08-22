@@ -327,11 +327,11 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI", scope
                           </div>
                         )}
                         {m.role === "assistant" ? (
-                          <div className="prose prose-sm dark:prose-invert max-w-none break-words text-foreground">
+                          <div className="prose prose-sm dark:prose-invert max-w-none wrap-break-word text-foreground">
                             <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
                           </div>
                         ) : (
-                          <p className="whitespace-pre-wrap break-words">{m.content}</p>
+                          <p className="whitespace-pre-wrap wrap-break-word">{m.content}</p>
                         )}
                         {m.role === "assistant" && m.content && !(loading && i === msgs.length - 1) && (
                           <div className="mt-1.5"><SaveNoteButton kind="问AI" title={`问 AI · ${msgs[i - 1]?.content?.slice(0, 24) || "对话"}`} content={m.content} /></div>
@@ -368,7 +368,7 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI", scope
                       onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); } }}
                       rows={1}
                       placeholder="就本页内容提问…"
-                      className="flex-1 resize-none rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50"
+                      className="flex-1 resize-none rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-hidden focus:border-primary/50"
                     />
                     <button onClick={() => send(input)} disabled={loading || !input.trim()}
                       className="rounded-lg bg-primary/15 p-2 text-primary hover:bg-primary/25 disabled:opacity-40">

@@ -28,8 +28,8 @@ function ExecutionGroup({ sources }: { sources: ToolExecutionSource[] }) {
               <span className="truncate font-medium text-foreground">{source.tool_name}</span>
               <span className="shrink-0 text-[10px] text-muted-foreground">{source.origin}</span>
             </div>
-            <p className="mt-1 whitespace-pre-wrap break-words text-muted-foreground">参数：{source.arguments_summary || "无摘要"}</p>
-            <p className="mt-1 whitespace-pre-wrap break-words text-foreground">结果：{source.result_summary || "无摘要"}</p>
+            <p className="mt-1 whitespace-pre-wrap wrap-break-word text-muted-foreground">参数：{source.arguments_summary || "无摘要"}</p>
+            <p className="mt-1 whitespace-pre-wrap wrap-break-word text-foreground">结果：{source.result_summary || "无摘要"}</p>
           </li>
         ))}
       </ul>

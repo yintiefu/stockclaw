@@ -19,10 +19,10 @@ interface StageBox {
 // 多方用品牌橙、空方用蓝灰、主持用中性——刻意不用红绿，
 // 免得和 A 股「红涨绿跌」撞车被读成涨跌信号。
 const STAGE_TONE: Record<DebateStage, string> = {
-  bull: "border-primary/50 bg-primary/[0.06]",
-  bull_rebut: "border-primary/30 bg-primary/[0.03]",
-  bear: "border-sky-500/40 bg-sky-500/[0.06]",
-  bear_rebut: "border-sky-500/25 bg-sky-500/[0.03]",
+  bull: "border-primary/50 bg-primary/6",
+  bull_rebut: "border-primary/30 bg-primary/3",
+  bear: "border-sky-500/40 bg-sky-500/6",
+  bear_rebut: "border-sky-500/25 bg-sky-500/3",
   referee: "border-border bg-background/40",
 };
 
@@ -107,7 +107,7 @@ export function Debate() {
               onKeyDown={(e) => { if (e.key === "Enter" && !running) start(); }}
               placeholder="6 位代码，如 600519"
               disabled={running}
-              className="w-44 rounded-lg border border-border/60 bg-background/60 px-3 py-2 font-mono text-sm outline-none focus:border-primary/60"
+              className="w-44 rounded-lg border border-border/60 bg-background/60 px-3 py-2 font-mono text-sm outline-hidden focus:border-primary/60"
             />
           </div>
           <div>
@@ -116,7 +116,7 @@ export function Debate() {
               value={rounds}
               onChange={(e) => setRounds(Number(e.target.value))}
               disabled={running}
-              className="rounded-lg border border-border/60 bg-background/60 px-3 py-2 text-sm outline-none focus:border-primary/60"
+              className="rounded-lg border border-border/60 bg-background/60 px-3 py-2 text-sm outline-hidden focus:border-primary/60"
             >
               <option value={1}>一轮 · 各自陈述</option>
               <option value={2}>两轮 · 加交叉反驳</option>

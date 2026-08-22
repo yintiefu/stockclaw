@@ -144,17 +144,17 @@ export function Portfolio() {
           <div>
             <label className="mb-1 block text-xs text-muted-foreground">股票代码</label>
             <input value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="6 位代码"
-              className="w-28 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50" />
+              className="w-28 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-hidden focus:border-primary/50" />
           </div>
           <div>
             <label className="mb-1 block text-xs text-muted-foreground">数量（股）</label>
             <input value={shares} onChange={(e) => setShares(e.target.value.replace(/[^\d.]/g, ""))} placeholder="如 100"
-              className="w-28 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50" />
+              className="w-28 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-hidden focus:border-primary/50" />
           </div>
           <div>
             <label className="mb-1 block text-xs text-muted-foreground">成本价</label>
             <input value={cost} onChange={(e) => setCost(e.target.value.replace(/[^\d.-]/g, "").replace(/(?!^)-/g, ""))} placeholder="如 12.5，可负"
-              className="w-28 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50" />
+              className="w-28 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-hidden focus:border-primary/50" />
           </div>
           <button onClick={add} disabled={adding}
             className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-4 py-2 text-sm font-medium text-primary shadow-glow hover:bg-primary/25 disabled:opacity-50">
@@ -221,27 +221,27 @@ export function Portfolio() {
           <div>
             <label className="mb-1 block text-xs text-muted-foreground">股票代码</label>
             <input value={cCode} onChange={(e) => setCCode(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="6 位代码"
-              className="w-24 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50" />
+              className="w-24 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-hidden focus:border-primary/50" />
           </div>
           <div>
             <label className="mb-1 block text-xs text-muted-foreground">清仓日期</label>
             <input type="date" value={cDate} onChange={(e) => setCDate(e.target.value)}
-              className="rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50" />
+              className="rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-hidden focus:border-primary/50" />
           </div>
           <div>
             <label className="mb-1 block text-xs text-muted-foreground">清仓价</label>
             <input value={cPrice} onChange={(e) => setCPrice(e.target.value.replace(/[^\d.]/g, ""))} placeholder="卖出价"
-              className="w-24 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50" />
+              className="w-24 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-hidden focus:border-primary/50" />
           </div>
           <div>
             <label className="mb-1 block text-xs text-muted-foreground">股数</label>
             <input value={cShares} onChange={(e) => setCShares(e.target.value.replace(/[^\d.]/g, ""))} placeholder="如 100"
-              className="w-24 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50" />
+              className="w-24 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-hidden focus:border-primary/50" />
           </div>
           <div>
             <label className="mb-1 block text-xs text-muted-foreground">买入成本</label>
             <input value={cCost} onChange={(e) => setCCost(e.target.value.replace(/[^\d.-]/g, "").replace(/(?!^)-/g, ""))} placeholder="成本价，可负"
-              className="w-24 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50" />
+              className="w-24 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-hidden focus:border-primary/50" />
           </div>
           <button onClick={addClose} disabled={closing}
             className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-4 py-2 text-sm font-medium text-primary shadow-glow hover:bg-primary/25 disabled:opacity-50">

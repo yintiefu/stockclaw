@@ -1,6 +1,169 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@plugin '@tailwindcss/typography';
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  --font-sans: Inter, system-ui, sans-serif;
+  --font-mono: JetBrains Mono, ui-monospace, monospace;
+}
+
+/* 颜色/圆角/阴影引用运行时可切换的 HSL 通道变量，必须用 inline：
+   工具类直接内联 var() 引用，.light 主题切换才能实时生效 */
+@theme inline {
+  --color-border: hsl(var(--border));
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+
+  --color-success: hsl(var(--success));
+  --color-danger: hsl(var(--danger));
+  --color-warning: hsl(var(--warning));
+  --color-info: hsl(var(--info));
+
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 4px);
+  --radius-sm: calc(var(--radius) - 8px);
+
+  --shadow-glass:
+    0 12px 30px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --shadow-glow:
+    0 0 0 1px hsl(var(--primary) / 0.25), 0 0 24px hsl(var(--primary) / 0.18);
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
+
+@utility glass {
+  /* 玻璃卡：半透明填充 + 发丝边框 + 柔投影 + 顶部内高光（EP26 高级感配方） */
+  background-image: linear-gradient(
+    162deg,
+    var(--glass-fill-top),
+    var(--glass-fill-bot)
+  );
+  border: 1px solid var(--glass-stroke);
+  border-radius: var(--radius);
+  box-shadow:
+    0 12px 30px rgba(0, 0, 0, 0.35),
+    inset 0 1px 0 var(--glass-hi);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  .light & {
+    box-shadow:
+      0 10px 26px rgba(30, 60, 100, 0.1),
+      inset 0 1px 0 var(--glass-hi);
+  }
+}
+
+@utility glass-glow {
+  /* 顶角暖橙光晕（配 .glass 用，装饰热点） */
+  position: relative;
+  overflow: hidden;
+  &::before {
+    content: '';
+    position: absolute;
+    top: -40%;
+    right: -20%;
+    width: 240px;
+    height: 240px;
+    background: radial-gradient(
+      circle,
+      hsl(var(--primary) / 0.16),
+      transparent 70%
+    );
+    pointer-events: none;
+  }
+}
+
+@utility text-glow {
+  /* 暖橙光文字 */
+  text-shadow: 0 0 18px hsl(var(--primary) / 0.45);
+}
+
+@utility agent-inspector-command {
+  @apply inline-flex min-h-8 items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted/60 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50;
+}
+
+@utility agent-artifact-markdown {
+  @apply wrap-break-word text-foreground prose-headings:text-foreground prose-p:text-foreground prose-strong:text-foreground prose-code:text-foreground prose-a:text-primary;
+}
+
+@utility agent-blocked-image {
+  @apply inline-block rounded border border-dashed border-border px-1.5 py-0.5 text-xs text-muted-foreground;
+}
+
+@utility agent-artifact-table-wrap {
+  @apply max-w-full overflow-x-auto rounded-md border border-border;
+}
+
+@utility agent-artifact-table {
+  @apply min-w-full border-collapse text-left text-xs;
+
+  & th {
+    @apply whitespace-nowrap border-b border-border bg-muted/50 px-2 py-1.5 font-medium text-muted-foreground;
+  }
+
+  & td {
+    @apply max-w-64 wrap-break-word border-b border-border/60 px-2 py-1.5 align-top text-foreground;
+  }
+}
+
+@utility agent-json-root {
+  @apply overflow-x-auto rounded-md border border-border bg-black/10 p-2 font-mono text-xs;
+}
+
+@utility agent-json-tree {
+  @apply ml-3 space-y-1 border-l border-border pl-2;
+}
+
+@utility agent-json-list {
+  @apply ml-3 space-y-1 border-l border-border pl-2;
+}
+
+@utility agent-json-entry {
+  & > dt {
+    @apply break-all text-muted-foreground;
+  }
+
+  & > dd {
+    @apply ml-3 break-all text-foreground;
+  }
+}
+
+@utility agent-data-scalar {
+  @apply break-all whitespace-pre-wrap text-foreground;
+}
 
 @layer base {
   /* ============================================================
@@ -106,79 +269,4 @@
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: hsl(var(--border)); border-radius: 4px; }
   ::-webkit-scrollbar-thumb:hover { background: hsl(var(--muted-foreground)); }
-}
-
-@layer components {
-  /* 玻璃卡：半透明填充 + 发丝边框 + 柔投影 + 顶部内高光（EP26 高级感配方） */
-  .glass {
-    background-image: linear-gradient(162deg, var(--glass-fill-top), var(--glass-fill-bot));
-    border: 1px solid var(--glass-stroke);
-    border-radius: var(--radius);
-    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.35), inset 0 1px 0 var(--glass-hi);
-    backdrop-filter: blur(14px);
-    -webkit-backdrop-filter: blur(14px);
-  }
-  .light .glass { box-shadow: 0 10px 26px rgba(30, 60, 100, 0.10), inset 0 1px 0 var(--glass-hi); }
-
-  /* 顶角暖橙光晕（配 .glass 用，装饰热点） */
-  .glass-glow { position: relative; overflow: hidden; }
-  .glass-glow::before {
-    content: "";
-    position: absolute; top: -40%; right: -20%;
-    width: 240px; height: 240px;
-    background: radial-gradient(circle, hsl(var(--primary) / 0.16), transparent 70%);
-    pointer-events: none;
-  }
-
-  /* 暖橙光文字 */
-  .text-glow { text-shadow: 0 0 18px hsl(var(--primary) / 0.45); }
-
-  .agent-inspector-command {
-    @apply inline-flex min-h-8 items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted/60 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50;
-  }
-
-  .agent-artifact-markdown {
-    @apply break-words text-foreground prose-headings:text-foreground prose-p:text-foreground prose-strong:text-foreground prose-code:text-foreground prose-a:text-primary;
-  }
-
-  .agent-blocked-image {
-    @apply inline-block rounded border border-dashed border-border px-1.5 py-0.5 text-xs text-muted-foreground;
-  }
-
-  .agent-artifact-table-wrap {
-    @apply max-w-full overflow-x-auto rounded-md border border-border;
-  }
-
-  .agent-artifact-table {
-    @apply min-w-full border-collapse text-left text-xs;
-  }
-
-  .agent-artifact-table th {
-    @apply whitespace-nowrap border-b border-border bg-muted/50 px-2 py-1.5 font-medium text-muted-foreground;
-  }
-
-  .agent-artifact-table td {
-    @apply max-w-64 break-words border-b border-border/60 px-2 py-1.5 align-top text-foreground;
-  }
-
-  .agent-json-root {
-    @apply overflow-x-auto rounded-md border border-border bg-black/10 p-2 font-mono text-xs;
-  }
-
-  .agent-json-tree,
-  .agent-json-list {
-    @apply ml-3 space-y-1 border-l border-border pl-2;
-  }
-
-  .agent-json-entry > dt {
-    @apply break-all text-muted-foreground;
-  }
-
-  .agent-json-entry > dd {
-    @apply ml-3 break-all text-foreground;
-  }
-
-  .agent-data-scalar {
-    @apply break-all whitespace-pre-wrap text-foreground;
-  }
 }

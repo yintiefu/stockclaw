@@ -79,7 +79,7 @@ export function Notes() {
           {notes.map((n) => {
             const open = openId === n.id;
             return (
-              <GlassCard key={n.id} className="!p-0 overflow-hidden">
+              <GlassCard key={n.id} className="p-0! overflow-hidden">
                 <div className="flex items-center gap-2 px-4 py-3">
                   <button onClick={() => setOpenId(open ? null : n.id)} className="flex flex-1 items-center gap-2 text-left">
                     {open ? <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />}
@@ -109,7 +109,7 @@ export function Notes() {
                     </div>
 
                     {reflectId === n.id && (reflectText || reflectErr) && (
-                      <div className="mt-3 rounded-lg border border-violet-500/30 bg-violet-500/[0.05] p-3">
+                      <div className="mt-3 rounded-lg border border-violet-500/30 bg-violet-500/5 p-3">
                         {reflectErr ? (
                           <p className="text-xs text-destructive">{reflectErr}</p>
                         ) : (

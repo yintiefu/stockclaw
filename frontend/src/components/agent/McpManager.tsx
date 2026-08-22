@@ -235,7 +235,7 @@ export function McpManager({ onReload, disabled }: Props) {
   );
 }
 
-const INPUT = "w-full rounded-lg border border-border bg-black/20 px-2.5 py-1.5 text-xs outline-none focus:border-primary/50";
+const INPUT = "w-full rounded-lg border border-border bg-black/20 px-2.5 py-1.5 text-xs outline-hidden focus:border-primary/50";
 
 function AddServerForm({ disabled, onSubmit, onCancel }: {
   disabled: boolean;

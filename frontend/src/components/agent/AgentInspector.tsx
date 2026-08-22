@@ -679,7 +679,7 @@ export function AgentInspector({
           <div className="space-y-3">
             {uniqueArtifactMessages.length > 0 ? (
               <div role="alert" className="space-y-1 rounded-md border border-border bg-black/10 px-2.5 py-2 text-xs text-muted-foreground">
-                {uniqueArtifactMessages.map((message) => <p key={message} className="break-words">{message}</p>)}
+                {uniqueArtifactMessages.map((message) => <p key={message} className="wrap-break-word">{message}</p>)}
               </div>
             ) : null}
             {visibleArtifacts.length > 1 ? (

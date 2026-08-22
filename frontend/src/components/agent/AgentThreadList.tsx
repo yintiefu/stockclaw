@@ -123,7 +123,7 @@ export function AgentThreadList({
 
   return (
     <div className="min-h-full">
-      <div className="sticky top-0 z-[2] space-y-2 border-b border-border/70 bg-background p-3">
+      <div className="sticky top-0 z-2 space-y-2 border-b border-border/70 bg-background p-3">
         <div className="flex items-center justify-between gap-2">
           <h2 className="text-sm font-semibold">会话</h2>
           <button title="新建会话" aria-label="新建会话" onClick={onCreate}
@@ -138,7 +138,7 @@ export function AgentThreadList({
             aria-label="搜索会话"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            className="min-w-0 flex-1 bg-transparent text-sm outline-none"
+            className="min-w-0 flex-1 bg-transparent text-sm outline-hidden"
             placeholder="搜索标题"
           />
         </label>
@@ -184,7 +184,7 @@ export function AgentThreadList({
                           if (event.key === "Enter") confirmRename();
                           if (event.key === "Escape") setEditing(null);
                         }}
-                        className="min-w-0 flex-1 rounded-md border border-border bg-black/20 px-2 py-1 text-sm outline-none focus:border-primary/50"
+                        className="min-w-0 flex-1 rounded-md border border-border bg-black/20 px-2 py-1 text-sm outline-hidden focus:border-primary/50"
                       />
                       <button
                         type="button"
@@ -211,7 +211,7 @@ export function AgentThreadList({
                         aria-current={selected ? "true" : undefined}
                         aria-label={`${thread.title}，${thread.last_run ? STATUS_LABEL[thread.last_run.status] : "未运行"}`}
                         onClick={() => onSelect(thread.id)}
-                        className="min-w-0 flex-1 px-2.5 py-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+                        className="min-w-0 flex-1 px-2.5 py-2 text-left focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/60"
                       >
                         <span className="block truncate text-sm font-medium" title={thread.title}>{thread.title}</span>
                         <span className="mt-0.5 flex items-center justify-between gap-2 text-xs text-muted-foreground">
@@ -227,7 +227,7 @@ export function AgentThreadList({
                         aria-expanded={menuOpen}
                         ref={menuOpen ? kebabRef : undefined}
                         onClick={() => setMenuFor(menuOpen ? null : thread.id)}
-                        className={`grid h-7 w-7 shrink-0 place-items-center rounded-md transition-opacity hover:bg-muted focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60 group-hover/thread:opacity-100 max-xl:opacity-100 ${
+                        className={`grid h-7 w-7 shrink-0 place-items-center rounded-md transition-opacity hover:bg-muted focus-visible:opacity-100 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/60 group-hover/thread:opacity-100 max-xl:opacity-100 ${
                           menuOpen ? "bg-muted text-foreground opacity-100" : "text-muted-foreground opacity-0"
                         }`}
                       >
@@ -244,7 +244,7 @@ export function AgentThreadList({
                             role="menuitem"
                             autoFocus
                             onClick={() => startRename(thread)}
-                            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm hover:bg-muted/60 focus-visible:outline-none focus-visible:bg-muted/60"
+                            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm hover:bg-muted/60 focus-visible:outline-hidden focus-visible:bg-muted/60"
                           >
                             <Pencil className="h-3.5 w-3.5 text-muted-foreground" aria-hidden />
                             重命名
@@ -255,7 +255,7 @@ export function AgentThreadList({
                             disabled={busy}
                             title={busy ? "运行中的会话不可删除" : "删除会话"}
                             onClick={() => requestDelete(thread)}
-                            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:bg-destructive/10"
+                            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-hidden focus-visible:bg-destructive/10"
                           >
                             <Trash2 className="h-3.5 w-3.5" aria-hidden />
                             删除

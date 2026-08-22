@@ -32,7 +32,7 @@ function CommandButton({ label, onClick, children }: {
       aria-label={label}
       title={label}
       onClick={onClick}
-      className="grid h-8 w-8 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+      className="grid h-8 w-8 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-muted/60 hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/60"
     >
       {children}
     </button>

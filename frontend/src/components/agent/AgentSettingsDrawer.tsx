@@ -30,7 +30,7 @@ const TABS: Array<{ id: AgentSettingsTab; label: string }> = [
 ];
 
 const INPUT_CLASS =
-  "w-full rounded-md border border-border bg-black/20 px-2.5 py-2 text-sm outline-none focus:border-primary/50";
+  "w-full rounded-md border border-border bg-black/20 px-2.5 py-2 text-sm outline-hidden focus:border-primary/50";
 
 type Props = {
   open: boolean;

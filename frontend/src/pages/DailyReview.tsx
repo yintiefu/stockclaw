@@ -193,7 +193,7 @@ export function DailyReview() {
             onChange={(e) => setWatchInput(e.target.value.replace(/[^\d,\s]/g, "").slice(0, 80))}
             onKeyDown={(e) => e.key === "Enter" && addWatch()}
             placeholder="加自选：可批量，如 600519 000858"
-            className="w-60 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50"
+            className="w-60 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-hidden focus:border-primary/50"
           />
           <button onClick={addWatch}
             className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-4 py-2 text-sm font-medium text-primary shadow-glow hover:bg-primary/25">

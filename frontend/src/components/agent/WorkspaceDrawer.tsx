@@ -128,7 +128,7 @@ export function WorkspaceDrawer({ open, onClose, title, side, variant = "panel",
             type="button"
             aria-label="关闭"
             onClick={onClose}
-            className="grid h-8 w-8 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+            className="grid h-8 w-8 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-muted/60 hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/60"
           >
             <X className="h-4 w-4" aria-hidden />
           </button>

@@ -107,7 +107,7 @@ function ArtifactContent({ artifact }: { artifact: ArtifactDetail }) {
       {artifact.content.items.map((item) => (
         <li key={item.source_id} className="border-l-2 border-border pl-2 text-xs">
           <p className="break-all font-mono text-muted-foreground">{item.source_id}</p>
-          {item.note ? <p className="mt-1 whitespace-pre-wrap break-words text-foreground">{item.note}</p> : null}
+          {item.note ? <p className="mt-1 whitespace-pre-wrap wrap-break-word text-foreground">{item.note}</p> : null}
         </li>
       ))}
     </ul>
@@ -128,7 +128,7 @@ export function ArtifactViewer({
       <header className="space-y-2">
         <div className="flex min-w-0 items-start justify-between gap-2">
           <div className="min-w-0">
-            <h3 className="break-words text-sm font-semibold">{artifact.title}</h3>
+            <h3 className="wrap-break-word text-sm font-semibold">{artifact.title}</h3>
             <p className="mt-0.5 break-all font-mono text-[10px] text-muted-foreground">{artifact.id}</p>
           </div>
           <span className="shrink-0 rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground">

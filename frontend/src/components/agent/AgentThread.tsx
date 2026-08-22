@@ -166,7 +166,7 @@ export function AgentThread({
                 aria-label="Agent 消息"
                 disabled={composerDisabled}
                 placeholder={composerDisabled ? "正在同步会话状态…" : "输入投研问题"}
-                className="max-h-40 min-h-8 flex-1 resize-none bg-transparent px-1 py-1 text-sm outline-none"
+                className="max-h-40 min-h-8 flex-1 resize-none bg-transparent px-1 py-1 text-sm outline-hidden"
               />
               <ComposerPrimitive.Send disabled={composerDisabled} className="grid h-9 w-9 place-items-center rounded-md bg-primary text-primary-foreground disabled:opacity-40" title="发送">
                 <Send className="h-4 w-4" />
