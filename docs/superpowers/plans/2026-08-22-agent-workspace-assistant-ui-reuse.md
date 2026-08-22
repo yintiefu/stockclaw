@@ -730,7 +730,8 @@ const STATIC_COMPONENTS: ThreadComponents = {
   ToolFallback: WorkspaceToolFallback,
 };
 
-/** 工作台 Composer：demo 结构 + 收敛禁用态 + 运行中锁输入。 */function WorkspaceComposer({ disabled }: { disabled?: boolean }) {
+/** 工作台 Composer：demo 结构 + 收敛禁用态 + 运行中锁输入。 */
+function WorkspaceComposer({ disabled }: { disabled?: boolean }) {
   const isRunning = useAuiState((s) => s.thread.isRunning);
   return (
     <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
