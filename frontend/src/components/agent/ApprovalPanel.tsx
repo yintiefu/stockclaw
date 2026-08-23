@@ -1,50 +1,47 @@
-/** MCP 审批面板：全量中断决定表单，一次提交。 */
-import { useState } from "react";
+/** MCP 审批面板：解析原生 LangChain HITL 中断，聚合决定一次提交。 */
+import { useEffect, useState } from "react";
 import { ShieldAlert } from "lucide-react";
+import { useLangChainInterrupts, useLangChainRespond } from "@assistant-ui/react-langchain";
 
-import { useApprovalBridge, type PendingApproval } from "@/lib/agent/approval";
-import type { ApprovalDecision } from "@/lib/agent/types";
+import { parseHitlRequest } from "@/lib/agent/approval";
 
-type Choice = "approve_once" | "approve_session" | "reject";
-
-const LABELS: Record<Choice, (name: string) => string> = {
-  approve_once: (n) => `${n}：本次允许`,
-  approve_session: (n) => `${n}：本会话允许`,
-  reject: (n) => `${n}：拒绝`,
-};
-
+const REJECT_MESSAGE = "用户拒绝该工具调用。";
 const ARGS_CHAR_LIMIT = 8000;
 
-export function ApprovalPanel({ disabled, actionable = true }: { disabled: boolean; actionable?: boolean }) {
-  const { pending, resolveAll } = useApprovalBridge();
-  const [choices, setChoices] = useState<Record<string, Choice>>({});
+type Choice = "approve" | "reject";
+
+export function ApprovalPanel({ disabled }: { disabled: boolean }) {
+  const interrupts = useLangChainInterrupts();
+  const respond = useLangChainRespond();
+  const request = parseHitlRequest(interrupts[0]?.value);
+  const [choices, setChoices] = useState<Record<number, Choice>>({});
   const [submitting, setSubmitting] = useState(false);
 
-  if (!actionable || pending.length === 0) {
+  // 新中断到达时清空上一轮选择
+  const interruptId = interrupts[0]?.id;
+  useEffect(() => {
+    setChoices({});
+  }, [interruptId]);
+
+  if (!request) {
     return (
       <section aria-label="MCP 工具审批" className="flex min-h-24 items-center justify-center rounded-md border border-dashed border-border px-3 text-center">
-        <p role="status" className="text-xs text-muted-foreground">
-          {actionable ? "当前没有待审批的工具调用" : "所选历史运行没有可操作的审批"}
-        </p>
+        <p role="status" className="text-xs text-muted-foreground">暂无待审批工具调用</p>
       </section>
     );
   }
 
-  const complete = pending.every((item) => choices[item.id]);
+  const complete = request.actions.every((_, index) => choices[index]);
 
   const submit = async () => {
-    if (!complete || disabled || submitting) return;
+    if (disabled || !complete || submitting) return;
     setSubmitting(true);
     try {
-      const decisions: ApprovalDecision[] = pending.map((item) => {
-        const choice = choices[item.id];
-        return {
-          id: item.id,
-          decision: choice === "reject" ? "reject" : "approve",
-          scope: choice === "approve_session" ? "thread_session" : "once",
-        };
+      await respond({
+        decisions: request.actions.map((_, index) => choices[index] === "approve"
+          ? { type: "approve" as const }
+          : { type: "reject" as const, message: REJECT_MESSAGE }),
       });
-      await resolveAll(decisions);
     } finally {
       setSubmitting(false);
     }
@@ -54,33 +51,33 @@ export function ApprovalPanel({ disabled, actionable = true }: { disabled: boole
     <section className="space-y-3 rounded-md border border-border p-3" aria-label="MCP 工具审批">
       <h2 className="flex items-center gap-1.5 text-sm font-semibold">
         <ShieldAlert className="size-4 text-primary" aria-hidden />
-        MCP 工具调用需要审批（{pending.length} 项）
+        MCP 工具调用需要审批（{request.actions.length} 项）
       </h2>
       <ul className="space-y-2">
-        {pending.map((item) => (
-          <li key={item.id} className="rounded-lg border border-border bg-black/20 p-3">
+        {request.actions.map((action, index) => (
+          <li key={index} className="rounded-lg border border-border bg-black/20 p-3">
             <p className="text-sm">
-              <span className="font-medium">{item.serverName ?? ""}</span>
-              <span className="ml-1 font-mono text-xs text-muted-foreground">
-                {item.toolAlias ?? item.message}
-              </span>
+              <span className="font-medium">{action.name}</span>
+              {action.description ? (
+                <span className="ml-1.5 text-xs text-muted-foreground">{action.description}</span>
+              ) : null}
             </p>
-            {item.arguments && Object.keys(item.arguments).length > 0 && (
+            {action.args && Object.keys(action.args).length > 0 && (
               <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-black/30 p-2 text-xs">
-                {JSON.stringify(item.arguments, null, 2).slice(0, ARGS_CHAR_LIMIT)}
+                {JSON.stringify(action.args, null, 2).slice(0, ARGS_CHAR_LIMIT)}
               </pre>
             )}
             <fieldset className="mt-2 flex flex-wrap gap-3 text-xs" disabled={disabled || submitting}>
-              {(["approve_once", "approve_session", "reject"] as const).map((choice) => (
+              {(["approve", "reject"] as const).map((choice) => (
                 <label key={choice} className="flex cursor-pointer items-center gap-1">
                   <input
                     type="radio"
-                    name={`decision-${item.id}`}
-                    aria-label={LABELS[choice](item.toolName ?? item.message)}
-                    checked={choices[item.id] === choice}
-                    onChange={() => setChoices((prev) => ({ ...prev, [item.id]: choice }))}
+                    name={`decision-${interruptId ?? "0"}-${index}`}
+                    aria-label={`${choice === "approve" ? "批准" : "拒绝"} ${action.name}`}
+                    checked={choices[index] === choice}
+                    onChange={() => setChoices((prev) => ({ ...prev, [index]: choice }))}
                   />
-                  {LABELS[choice](item.toolName ?? item.message)}
+                  {choice === "approve" ? "批准" : "拒绝"}
                 </label>
               ))}
             </fieldset>
@@ -98,5 +95,3 @@ export function ApprovalPanel({ disabled, actionable = true }: { disabled: boole
     </section>
   );
 }
-
-export type { PendingApproval };
