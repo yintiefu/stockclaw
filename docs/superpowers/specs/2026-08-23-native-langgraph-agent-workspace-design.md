@@ -2,7 +2,7 @@
 
 **日期：** 2026-08-23
 
-**状态：** 已完成第二轮对抗性评审修正，待进入 writing-plans
+**状态：** 已完成第三轮对抗性评审修正，待进入 writing-plans
 
 **参考实现：** `/vol2/1000/code/assistant-ui-demo`
 
@@ -72,8 +72,12 @@ LangGraph Server 只监听 `127.0.0.1:2024`，不复用 `VR_API_KEY`，也不经
 监听局域网或公网地址。LangGraph API 默认 `CORS_ALLOW_ORIGINS=*`，会允许其他网页跨域
 读写本机 Agent API，甚至提交 HITL 审批；仅绑定 loopback 不能阻止这种浏览器访问。
 `langgraph.json` 必须通过 `env` 把 `CORS_ALLOW_ORIGINS` 固定为
-`http://127.0.0.1:5899`。以后若需要其他 origin 或远程访问，必须显式修改 allowlist，并单独
-设计鉴权与反代，不能只修改监听地址。
+`http://127.0.0.1:5899`。该设置是浏览器读取隔离，不是请求侧鉴权或 CSRF 防护：恶意 Origin
+的预检会得到 400，实际 GET/POST 响应不会带 `Access-Control-Allow-Origin`，所以网页脚本
+读不到响应；但浏览器仍可发送不触发预检的简单请求，形成创建 thread、提交 run 等盲写，
+可能消耗付费模型和数据源配额。在仅 loopback、单用户的信任模型下接受这一残余风险。以后
+若需要消除盲写、增加其他 origin 或支持远程访问，必须单独设计鉴权、CSRF 防护与反代，不能
+只修改监听地址或 CORS allowlist。
 
 Agent graph 不创建或注入 `MemorySaver`。在 Agent Server 中，线程、checkpoint 和 store
 由 LangGraph Server 管理。开发环境使用 `langgraph dev` 自带的 `.langgraph_api/` 本地
@@ -117,8 +121,20 @@ Agent 工作台迁移后，后端虚拟环境统一要求 Python 3.11+。现有�
 
 ### 5.1 版本与依赖合同
 
-本地重启恢复 spike 已验证以下组合可以在 interrupt 挂起后停止进程、从
-`.langgraph_api/` 恢复 thread/checkpoint，再通过 `command.resume` 完成运行：
+本地重启恢复 spike 进程级验证的是以下 LangGraph 四件套：它们可以在 interrupt 挂起后
+停止进程、从 `.langgraph_api/` 恢复 thread/checkpoint，再通过 `command.resume` 完成运行：
+
+```text
+langgraph-cli[inmem]==0.4.31
+langgraph-api==0.12.6
+langgraph-runtime-inmem==0.32.6
+langgraph==1.2.11
+```
+
+spike 环境的 `langchain-core` 实际为 `1.6.0`，且最小 graph 不经过 LangChain，因此不把
+LangChain 侧版本描述为已完成进程级恢复验证。实施使用的完整 Agent 运行时版本合同如下，
+每一项都必须显式写入 `backend/requirements.txt` 的 Agent 分组，而不是
+`requirements-dev.txt`：
 
 ```text
 langgraph-cli[inmem]==0.4.31
@@ -128,6 +144,9 @@ langgraph==1.2.11
 httpx==0.28.1
 langchain==1.3.15
 langchain-core==1.5.5
+langchain-openai==1.5.1
+langchain-mcp-adapters==0.3.2
+mcp==1.26.0
 deepagents==0.7.7
 langchain-anthropic==1.5.4
 langchain-google-genai==4.3.1
@@ -137,9 +156,10 @@ langchain-google-genai==4.3.1
 `langchain>=1.3.14,<2.0.0` 和 `langchain-core>=1.5.0,<2.0.0`，当前环境已满足，不存在强制
 升级 `langchain-core` 的直接冲突。该包会同时拉入当前 Agent 不直接使用的硬依赖
 `langchain-anthropic` 与 `langchain-google-genai`，这是采用 Deep Agents middleware 的已知
-依赖成本。若不钉住这两个传递依赖，当前镜像会选择 `langchain-anthropic==1.6.0` 并把 core
-升级到 `1.6.0`；上面的 `1.5.4`/`4.3.1` 组合已经 dry-run 验证可保持 core `1.5.5`，实施时
-必须一并写入 requirements。
+依赖成本。`langchain-anthropic==1.5.4` 的作用是避免由 `1.6.0` 直接要求 core `>=1.6.0`，
+但它不会让干净 venv 的 resolver 主动选择 core `1.5.5`；真正固定解析结果的是
+`langchain-core==1.5.5` 的直接 requirements 条目。`1.5.4`/`4.3.1` 与 core `1.5.5` 的组合
+已在当前 venv 做增量 dry-run 兼容验证，干净 venv 仍必须按上面的完整显式合同复验。
 
 依赖任务仍先在当前 `requirements.txt` 上执行 `pip install --dry-run`，记录解析差异；再在
 临时干净 Python 3.11+ venv 中安装完整 requirements、运行 `pip check` 和 LangChain、
@@ -147,7 +167,8 @@ LangGraph、MCP、mootdx 合同测试。若解析结果改变上述钉住版本�
 合同，不能只运行新 Agent 测试。
 
 迁移完成前不得放宽上述全部钉住版本。以后升级必须重新执行
-“挂起 interrupt -> 停服 -> 重启 -> 恢复”的进程级测试。
+“挂起 interrupt -> 停服 -> 重启 -> 恢复”的进程级测试；首次迁移也必须用完整合同，尤其
+是 core `1.5.5`，重跑该恢复 case，补上 spike 未覆盖的 LangChain 组合。
 
 ### 5.2 Graph 组装
 
@@ -164,7 +185,8 @@ LangGraph、MCP、mootdx 合同测试。若解析结果改变上述钉住版本�
 7. 调用 `create_agent`，由 Agent Server 接管 graph 持久化与执行。
 
 异步 builder 暴露 `model: BaseChatModel | None = None` 测试注入参数。生产路径在参数为
-`None` 时才从 settings 构建 `ChatOpenAI`；离线测试必须注入 scripted model，不能访问真实
+`None` 时才从 settings 构建 `ChatOpenAI`；离线测试复用
+`tests/agent/fakes.py::ScriptedChatModel` 注入带 tool calls 的回复序列，不能访问真实
 provider。测试配置由 `backend/conftest.py` 在任何 Agent 模块导入前把
 `VR_AGENT_SETTINGS` 指向临时目录，禁止读取真实 `~/.vibe-research/agent/settings.json`。
 
@@ -314,6 +336,10 @@ assistant-ui 的 LangChain runtime 负责消息水合、流式、工具调用、
   `archive` 和 `unarchive`；`initialize(threadId)` 负责把 assistant-ui 本地 thread 初始化为
   LangGraph remote thread。
 - `generateTitle` 从首条用户消息派生标题并写入 LangGraph thread metadata。
+- LangGraph threads API 没有 archive 概念。`archive(remoteId)` 先读取并保留现有 metadata，
+  再通过 threads update 写入 `archived: true`；`unarchive` 写入 `archived: false`。`list` 和
+  `fetch` 把该字段翻译为 assistant-ui 的 `status: "archived" | "regular"`。首期 UI 不显示
+  归档按钮，但 adapter 的必需方法保持可用。
 - thread 切换不属于 adapter；使用 `useStreamRuntime` 顶层的受控 `threadId` 与
   `onThreadIdChange` 接入页面路由/选中状态。
 - 提供自定义 adapter 后，不再配置顶层 create/delete callbacks；这些选项会被静默忽略。
@@ -375,6 +401,8 @@ assistant-ui 的 LangChain runtime 负责消息水合、流式、工具调用、
 删除后端 `ag-ui-*` 依赖以及前端 `@ag-ui/client`、`@assistant-ui/react-ag-ui`；加入
 `@assistant-ui/react-langchain==0.0.27` 及其经锁文件解析的 LangGraph React/SDK 依赖。
 同时删除 `frontend/package.json` 中只为 AG-UI 存在的 `overrides["@ag-ui/client"]`。
+后端 requirements 的 Agent 运行时分组删除 `ag-ui-langgraph`、`ag-ui-protocol` 和
+`ag-ui-a2ui-toolkit`，并按第 5.1 节逐条写入完整版本合同。
 
 以下文件属于明确保护范围，不得被目录级删除误伤：
 
@@ -394,7 +422,8 @@ assistant-ui 的 LangChain runtime 负责消息水合、流式、工具调用、
 - 配置测试覆盖合法配置、缺失字段、非法 JSON、路径错误和 secret 脱敏。
 - 测试环境在导入 graph 前设置临时 `VR_AGENT_SETTINGS`，并断言真实默认配置未被读取。
 - Graph 测试覆盖中立系统提示、内置工具、MCP tools、Skills middleware 和 HITL policy。
-- 使用离线 scripted model 验证普通回复和内置工具循环。
+- 复用 `tests/agent/fakes.py::ScriptedChatModel` 验证普通回复、带 tool calls 的内置工具循环
+  和 HITL 恢复，不另建第二套 scripted model。
 - 并发调用两个会进入 `astock.em_get` 的内置工具，mock 底层 HTTP `get` 记录实际开始
   时间，断言两次请求间隔不小于 1 秒；同时断言所有内置 tool 实例共享同一进程级锁。
 - 使用 fake MCP server 验证工具发现、server-name 前缀、暂停、批准后执行和拒绝后不执行；
@@ -406,9 +435,11 @@ assistant-ui 的 LangChain runtime 负责消息水合、流式、工具调用、
   避免每个 case 重启；专门的恢复 case 再完整编排“interrupt 挂起 -> 停服 -> 确认
   `.langgraph_api/` 落盘 -> 重启 -> 恢复同一 interrupt -> 终态”。禁用 watchfiles，避免测试
   写临时文件时触发 reload 干扰停服与重启。
-- Agent Server HTTP 集成测试分别携带允许的本地前端 Origin 和
-  `https://evil.example.com`，断言前者可访问、后者得到 HTTP 400，且恶意 Origin 不能读写
-  thread/run 或提交 HITL 审批。
+- Agent Server HTTP 集成测试按 CORS 层次断言：恶意 Origin 的 OPTIONS 预检得到 HTTP 400；
+  直接发送带恶意 Origin 的 GET/POST 时允许下游返回 200，但响应不得包含
+  `Access-Control-Allow-Origin`；允许的本地前端 Origin 正常获得该响应头。另用
+  `text/plain` 简单 POST 实证盲写可创建 thread、提交 run 并推进到 interrupt，把这一残余面
+  固定为已知风险，不能误写成 CORS 会阻止请求执行。
 - 依赖安装与 clean-venv 测试需要访问清华镜像，标记为 `@pytest.mark.live`，不进入默认
   `pytest -m "not live"`；它在临时 Python 3.11+ venv 运行安装、`pip check`、钉版本断言，
   以及 LangChain、LangGraph、MCP、mootdx 合同测试。
@@ -417,7 +448,8 @@ assistant-ui 的 LangChain runtime 负责消息水合、流式、工具调用、
 ### 10.2 前端
 
 - 测试 LangGraph thread adapter 的全部必需方法，尤其是 `initialize`、`fetch`、
-  `generateTitle`、`archive` 和 `unarchive`。
+  `generateTitle`、`archive` 和 `unarchive`；归档测试断言 metadata 合并不丢 title 等字段，
+  且 `list`/`fetch` 正确翻译 status。
 - 对 `unstable_threadListAdapter` 做编译与运行合同测试，升级 assistant-ui 时优先发现破坏。
 - 测试 `threadId`/`onThreadIdChange` 的受控切换，并断言自定义 adapter 下不依赖会被忽略的
   顶层 create/delete callbacks。
@@ -432,12 +464,21 @@ assistant-ui 的 LangChain runtime 负责消息水合、流式、工具调用、
 当前 `frontend/playwright.config.ts` 直接启动 `tests.agent_e2e_app`，该 fixture 依赖将删除的
 `agent.router`，必须随架构一起重建：
 
-- Playwright 总计启动三个隔离服务：临时数据根的 FastAPI fixture、测试专用 LangGraph
-  Server、Vite。
-- 测试 graph 调用生产异步 builder 并注入 scripted model；不得在生产 graph 中增加
-  `VR_E2E` 分支。
-- LangGraph webServer 使用独立临时 cwd，使 `.langgraph_api/` 不触碰开发会话；通过
-  `VR_AGENT_SETTINGS` 指向 E2E 专用 settings，Skills/MCP 也只引用临时 fixture。
+- Playwright 总计启动三个隔离服务：生产 `app:app` FastAPI、测试专用 LangGraph Server、
+  Vite。FastAPI 只通过临时 `VR_DATA_DIR`/`VR_REPORTS_DIR` 隔离用户数据，不再保留
+  `tests.agent_e2e_app` 薄壳或 Agent 接缝，探活 URL 改为 `/api/health`。
+- E2E graph 与配置固定放在 `backend/tests/agent_e2e/graph.py` 和
+  `backend/tests/agent_e2e/langgraph.json`。启动 helper 把这两个 fixture 复制到独立临时 cwd，
+  设置生产 backend 为 `PYTHONPATH`，再用
+  `langgraph dev --config <temp>/langgraph.json --no-browser --no-reload` 启动，使
+  `.langgraph_api/` 不触碰开发会话。
+- E2E graph 导入生产 `agent/graph.py` 时会先执行一次模块级生产 builder，再调用同一异步
+  builder 注入 `tests/agent/fakes.py::ScriptedChatModel` 构建测试 graph；两次构建是已知且
+  接受的测试启动成本，不在生产 graph 中增加 `VR_E2E` 分支。E2E settings 使用无效模型
+  凭据，首次生产 builder 只实例化模型而不调用 provider。
+- fake MCP 固定使用 `tests/agent/fake_mcp_server.py` 的 stdio transport，由 E2E settings
+  启动和回收，不分配端口，也不增加第四个 Playwright `webServer`。
+- LangGraph 通过 `VR_AGENT_SETTINGS` 指向 E2E 专用 settings，Skills 只引用临时 fixture。
 - Vite 同时注入隔离的 FastAPI URL 与 LangGraph URL。三个服务均使用固定测试端口、
   `127.0.0.1` 和 `reuseExistingServer: false`；测试专用 LangGraph 配置把
   `CORS_ALLOW_ORIGINS` 设为该 Vite 测试 origin。
@@ -451,15 +492,17 @@ assistant-ui 的 LangChain runtime 负责消息水合、流式、工具调用、
 - 刷新页面后恢复消息。
 - 切换、重命名和删除 thread。
 - MCP 调用暂停，批准后继续，拒绝后不执行。
-- 使用本地前端 Origin 可正常访问 Agent API；使用 `https://evil.example.com` 直连 `:2024`
-  得到 HTTP 400 且不能读写 thread/run 或提交审批。
+- 使用本地前端 Origin 可正常读取 Agent API；恶意 Origin 的预检失败，实际响应不含 CORS
+  allow-origin 头。盲写风险由第 10.1 节 HTTP 集成测试覆盖，不在浏览器测试中错误断言服务端
+  拒绝实际请求。
 - 停止生成可用，布局无重叠或溢出。
 
 ### 10.4 文档与依赖检查
 
 - 更新 `README.md`、`README_en.md`、`backend/README.md` 和根 `AGENTS.md`：Python 3.11+、
   FastAPI/LangGraph 双进程命令、预装 requirements 前置条件、`settings.json` 明文 secret 与
-  `0600` 权限、仅本机监听，以及 `CORS_ALLOW_ORIGINS` 的浏览器信任边界。
+  `0600` 权限、仅本机监听，以及 `CORS_ALLOW_ORIGINS` 只能阻止跨域读取、不能消除简单请求
+  盲写的浏览器信任边界。
 - 在 `backend/.env.example` 记录 `VR_AGENT_SETTINGS`；在 `backend/.gitignore` 忽略
   `.langgraph_api/`。
 - 更新 `CHANGELOG.md`，说明 Agent 工作台会话不迁移、功能删减和启动方式变化。
@@ -483,5 +526,6 @@ git diff --check
 - 仓库中不再存在 Agent 自研 session/run/checkpoint 持久化实现。
 - 中立性红线、工具客观失败语义和 Eastmoney 串行限流约束保持有效。
 - LangGraph Server 只监听本机，且 `langgraph.json.env.CORS_ALLOW_ORIGINS` 明确限制为本地
-  前端 origin；恶意网页 Origin 无法跨域读写 Agent API 或提交 HITL 审批。
+  前端 origin；恶意网页脚本不能读取 Agent API 响应，但简单请求盲写仍可能创建 thread、
+  提交 run 并消耗模型或数据源配额。该残余面在本地单用户模式下被明确接受和测试。
 - 旧 AI 入口行为和 API 合同不变。
