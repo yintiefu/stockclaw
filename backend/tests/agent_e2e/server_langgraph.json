@@ -1,0 +1,5 @@
+{
+  "dependencies": ["./"],
+  "graphs": {"agent": "./server_graph.py:graph"},
+  "env": {"CORS_ALLOW_ORIGINS": "http://127.0.0.1:5873"}
+}
