@@ -9,7 +9,9 @@ vi.mock("@assistant-ui/react", () => ({
 }));
 
 import { AgentRuntimeProvider } from "./runtime";
-import { langGraphThreadAdapter } from "./thread-adapter";
+import { langGraphThreadAdapter, resolveAgentApiUrl } from "./thread-adapter";
+
+const apiUrl = resolveAgentApiUrl();
 
 afterEach(() => {
   cleanup();
@@ -29,7 +31,7 @@ describe("AgentRuntimeProvider", () => {
     const options = useStreamRuntime.mock.calls[0][0];
     expect(options).toEqual({
       assistantId: "agent",
-      apiUrl: "/agent-api",
+      apiUrl,
       onThreadIdChange,
       unstable_threadListAdapter: langGraphThreadAdapter,
     });

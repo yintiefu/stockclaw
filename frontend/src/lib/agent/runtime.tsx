@@ -2,7 +2,7 @@
 import type { ReactNode } from "react";
 import { AssistantRuntimeProvider } from "@assistant-ui/react";
 import { useStreamRuntime } from "@assistant-ui/react-langchain";
-import { langGraphThreadAdapter } from "./thread-adapter";
+import { langGraphThreadAdapter, resolveAgentApiUrl } from "./thread-adapter";
 
 export function AgentRuntimeProvider({ onThreadIdChange, children }: {
   onThreadIdChange?: (threadId: string | undefined) => void;
@@ -10,7 +10,7 @@ export function AgentRuntimeProvider({ onThreadIdChange, children }: {
 }) {
   const runtime = useStreamRuntime({
     assistantId: "agent",
-    apiUrl: "/agent-api",
+    apiUrl: resolveAgentApiUrl(),
     onThreadIdChange,
     unstable_threadListAdapter: langGraphThreadAdapter,
   });

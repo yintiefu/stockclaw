@@ -57,5 +57,14 @@ export function createLangGraphThreadAdapter(client: AgentThreadClient): RemoteT
   };
 }
 
-export const langGraphClient = new Client({ apiUrl: "/agent-api" });
+// langgraph-sdk 的 Client / @langchain/react 的 useStream 都需要绝对 URL
+// （内部直接 new URL）；相对 /agent-api 经 Vite 代理转发，浏览器里锚定到当前源。
+export function resolveAgentApiUrl(): string {
+  if (typeof window !== "undefined") {
+    return new URL("/agent-api", window.location.origin).toString();
+  }
+  return "/agent-api";
+}
+
+export const langGraphClient = new Client({ apiUrl: resolveAgentApiUrl() });
 export const langGraphThreadAdapter = createLangGraphThreadAdapter(langGraphClient);
