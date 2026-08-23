@@ -301,9 +301,9 @@ class CapabilityResolver:
         if self._tools_provider is not None:
             tools = await asyncio.to_thread(self._tools_provider, skill_tools)
         else:
-            from agent.tool_registry import compose_run_tools
+            from agent.tool_registry import build_builtin_tools
 
-            tools = await asyncio.to_thread(compose_run_tools, skill_tools)
+            tools = await asyncio.to_thread(lambda: [*build_builtin_tools(), *skill_tools])
         if bindings:
             tools = [*tools, *(b.as_langchain_tool(self._registry) for b in bindings)]
         return CapabilityLease(

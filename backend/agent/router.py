@@ -82,7 +82,7 @@ from agent.artifacts import (
 )
 from agent.skills import SkillError, SkillImporter, SkillRegistry, SkillResourceForbidden, SkillUnavailable
 from agent.tool_executor import BoundedToolExecutor
-from agent.tool_registry import build_builtin_tools, create_artifact_tool
+from agent.tool_registry import build_builtin_tools
 
 router = APIRouter(prefix="/api/agent")
 
@@ -128,9 +128,8 @@ def build_services(root: Path | None = None) -> AgentServices:
     _artifact_lock_target = _CoordinatorRef()
 
     def _run_tools(skill_tools=()):
-        # 测试接缝：1A/1B 通过 monkeypatch agent.router.build_builtin_tools 注入；
-        # create_artifact 只在生产组合中注册（REST 不提供 POST）
-        return [*build_builtin_tools(), *skill_tools, create_artifact_tool()]
+        # 测试接缝：1A/1B 通过 monkeypatch agent.router.build_builtin_tools 注入
+        return [*build_builtin_tools(), *skill_tools]
 
     coordinator = RunCoordinator(
         factory=coordinator._factory, threads=threads, runs=runs,
