@@ -4,6 +4,8 @@ A股数据层 + 可插拔 AI 层。全部只读、无状态；不预置任何标
 
 ## 安装
 
+需要 **Python 3.11+**（Agent 工作台的 LangGraph 运行时要求）。
+
 ```bash
 cd backend
 python3 -m venv .venv
@@ -12,11 +14,22 @@ python3 -m venv .venv
 
 > 行情 + 研报只需 `fastapi / uvicorn / requests`（秒装、必可用）。
 > 一致预期 / 新闻 / 公告需 `akshare`，K线 / 财务需 `mootdx`；未装时对应端点返回 501 + 安装提示，不影响其余功能。
+> `langgraph dev` **不会**安装依赖——务必先装 `requirements.txt`。
 
 ## 1. HTTP API（给网页前端 + 系统 AI）
 
 ```bash
 .venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8900
+```
+
+## 1b. Agent 工作台（本地 LangGraph Server :2024）
+
+与 FastAPI 分离启动，只绑 `127.0.0.1`（绝不绑局域网/公网地址）。启动时读取一次静态设置
+（默认 `~/.vibe-research/agent/settings.json`，可用 `VR_AGENT_SETTINGS` 覆盖；含明文密钥，建议
+`chmod 600`），负责 Agent 的线程 / 运行 / 检查点 / MCP 审批持久化：
+
+```bash
+.venv/bin/langgraph dev --host 127.0.0.1 --port 2024 --no-browser
 ```
 
 | 端点 | 说明 | 依赖 |

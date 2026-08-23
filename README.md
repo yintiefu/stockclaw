@@ -111,17 +111,19 @@ Vibe-Research 把三套公开数据源**直接集成进仓库**——`git clone`
 Vibe-Research/
 ├── a-stock-data/      A 股全栈数据工具箱（数据源，v3.6.0，自带即用）
 ├── global-stock-data/ 美股 / 港股数据工具箱（数据源，v2.0.3，自带即用）
-├── backend/           FastAPI :8900
+├── backend/           FastAPI :8900 + 本地 LangGraph Server :2024（Agent 工作台）
 │   ├── astock.py        A 股数据（移植自 a-stock-data）
 │   ├── gstock.py        美股 / 港股数据（移植自 global-stock-data）
 │   ├── newsradar.py     资讯雷达（移植自 investment-news）
 │   ├── market.py        市场情绪 + 板块资金流 + 全球指数
 │   ├── portfolio.py     持仓 + 已清仓（存本地用户目录）
-│   ├── tools.py         AI 工具层（23 个数据工具，chat / MCP / debate 共用）
+│   ├── tools.py         AI 工具层（24 个数据工具，chat / MCP / debate / Agent 共用）
 │   ├── chat.py          系统 AI（OpenAI 兼容 function-calling）
 │   ├── debate.py        多空辩论编排（事实底稿 → 多方 / 空方 / 中立主持）
 │   ├── reflection.py    反思审计（对已有分析做推理审计）
-│   └── mcp_server.py    MCP server（给 Claude Code 等 agent）
+│   ├── mcp_server.py    MCP server（给 Claude Code 等 agent）
+│   ├── langgraph.json   Agent 工作台图注册（agent/graph.py → langgraph dev）
+│   └── agent/           Agent 图组装：静态设置 + 工具适配 + 图构建
 └── frontend/          Vite + React 19 + TS + Tailwind（玻璃暖橙主题）:5899
 ```
 
@@ -129,13 +131,19 @@ Vibe-Research/
 
 ## 快速开始
 
+需要 **Python 3.11+**（Agent 工作台的 LangGraph 运行时要求）。`langgraph dev` 不会自动安装依赖，
+务必先 `pip install -r requirements.txt`。
+
 ```bash
-# 后端（:8900）
+# 数据 + 传统 AI 后端（FastAPI :8900）
 cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8900
 
-# 前端（:5899）
-cd frontend && npm install && npm run dev
+# Agent 工作台后端（本地 LangGraph Server :2024，只用 127.0.0.1，绝不绑局域网/公网地址）
+.venv/bin/langgraph dev --host 127.0.0.1 --port 2024 --no-browser
+
+# 前端（Vite :5899，/api 代理到 8900、/agent-api 代理到 2024）
+cd ../frontend && npm install && npm run dev
 # 浏览器打开 http://localhost:5899
 ```
 
@@ -219,25 +227,59 @@ portfolio_manager 角色，产出「买 / 卖 / 仓位多少」。**本项目刻
 
 ## Agent 工作台
 
-「Agent 工作台」是把上述能力串成一个**多步研究任务运行时**：你配置自己的模型（OpenAI 兼容 API），
-Agent 按轮调用模型与工具（内置行情/资讯工具 + 你接入的 MCP 服务器），中途产出 Markdown 研究产物，
-每一步都有预算治理与审批控制。它和整个产品一样**只整理客观数据与分析框架，不给买卖结论**——
-辩论止于分歧点，工作台的产物止于「可核对的事实与来源」。
+「Agent 工作台」由一个**本地 LangGraph Server**（`127.0.0.1:2024`，与 FastAPI 分离启动）驱动：
+线程、运行、检查点与人工审批（HITL）全部由它原生持久化，进程重启后普通会话与待审批断点都能恢复。
+Agent 按轮调用你配置的模型与工具（内置行情/资讯工具 + 你接入的 MCP 服务器，配合本地 Skills 库）。
+它和整个产品一样**只整理客观数据与分析框架，不给买卖结论**——辩论止于分歧点，工作台止于
+「可核对的事实」。
+
+模型、MCP 与 Skills 全部来自一份**本地静态配置文件**（默认 `~/.vibe-research/agent/settings.json`，
+可用 `VR_AGENT_SETTINGS` 覆盖），Agent Server 启动时读取一次，修改后需重启：
+
+```json
+{
+  "model": {
+    "provider": "openai",
+    "name": "gpt-5",
+    "apiKey": "sk-...",
+    "baseURL": "https://api.openai.com/v1",
+    "temperature": 0.2
+  },
+  "skills": {
+    "path": "/absolute/path/to/skills"
+  },
+  "mcpServers": {
+    "example": {
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["example-mcp"],
+      "env": {}
+    },
+    "remote-example": {
+      "transport": "http",
+      "url": "https://example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ..."
+      }
+    }
+  }
+}
+```
 
 要点：
 
-- **模型密钥只在你本地**：配置存在浏览器 `localStorage`（`vr-agent-model`），每次请求经请求头转发、
-  服务端不落盘。服务端日志与产物中的密钥引用一律脱敏。
-- **Policy 快照治理**：每次运行从当前 Policy 生成不可变预算快照（模型调用 / 工具调用 / 超时 / 上下文上限），
-  运行中改 Policy 不影响进行中的 run。Policy 保存走 CAS（带 revision 的乐观锁）；文件损坏时接口
-  fail-closed，界面显示原因并要求**二次确认**后才能重置。
-- **MCP 工具审批**：外部 MCP 工具默认逐次审批，可选择「本次允许 / 本会话允许 / 拒绝」；
-  被拒的工具调用以拒绝结果进入对话，不会静默失败。
-- **Artifact 与来源标签**：产物固定为 Markdown（不可执行内容），支持版本链（同主题多版演进、
-  只能删叶子版本）；每个事实来源标注「执行记录」（工具实际执行所得）或「模型提供，未验证」，
-  永远不把模型的话当成数据。
-- **可恢复与可收敛**：所有运行/消息/产物落盘在本地数据根；刷新或断线后前端从 REST 权威状态收敛，
-  失败/取消的运行可一键重试（严格重试：回到触发消息边界，不改写原运行）。
+- **密钥只在本地设置文件**：模型/MCP 密钥以明文保存在 `settings.json`，请执行
+  `chmod 600 ~/.vibe-research/agent/settings.json`（权限过宽时服务启动会在 stderr 提醒）。
+  它们不进入线程元数据、检查点、日志或前端请求；传统「接入 AI」页的 `vr-llm` 仍存浏览器 localStorage。
+- **MCP 逐次审批**：外部 MCP 工具默认需要批准，每次只有「批准 / 拒绝」两种决定；
+  被拒的调用以拒绝结果回到对话，不会静默执行。
+- **Skills 只读且限制在配置根目录**：模型经 `ls` / `read_file` 渐进读取本地技能库
+  （先见名称与描述，按需读全文），路径逃逸（`..` 越出根目录）会被拒绝。
+- **CORS 边界（如实说明）**：Agent Server 的来源白名单只允许本地前端
+  （`http://127.0.0.1:5899`）。它阻止无关网站**读取**响应，但不是鉴权、也不是 CSRF 防护——
+  浏览器 simple request 仍可盲写线程/提交运行、消耗模型与数据源额度。此残余风险仅在
+  loopback 单用户场景下接受，因此 Agent Server 绝不要绑定局域网/公网地址。
+- 旧版自定义 Agent 会话（JSON 文件）**不迁移**：升级后工作台从空列表开始，原文件保留在磁盘上。
 
 ## 测试
 
@@ -255,13 +297,14 @@ npm run build     # tsc -b && vite build
 
 ### Agent 工作台浏览器测试（Playwright）
 
-后端为生产路由 + 三处确定性接缝（模型 / MCP 会话 / 本地工具），数据根是临时目录，
-**不触碰 8900 端口的常规服务，也不读你的 `~/.vibe-research/`**：
+三个隔离服务（FastAPI :8873 + LangGraph :2873 + Vite :5873），LangGraph 用确定性脚本化模型与
+stdio 假 MCP，数据根为每次运行新建的临时目录，**不触碰 8900/2024 端口的常规服务，也不读你的
+`~/.vibe-research/`**：
 
 ```bash
 cd frontend
 npm run test:e2e:install   # 首次：安装 Chromium（受限网络可设 PLAYWRIGHT_DOWNLOAD_HOST 指向可达镜像）
-npm run test:e2e          # 串行跑完整交互矩阵 + 三视口×双主题截图 + 网络安全断言
+npm run test:e2e          # 串行跑完整交互矩阵 + 桌面/移动截图 + 代理与 CORS 断言
 ```
 
 ## 更新日志

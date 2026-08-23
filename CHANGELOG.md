@@ -3,6 +3,25 @@
 本项目的版本号唯一来源是 `frontend/package.json`；后端 HTTP API、`/api/health`、
 前端界面与 MCP `serverInfo` 全部从它读取（见 `backend/version.py`）。
 
+## 未发布 — 2026-08-24：Agent 工作台迁移到本地 LangGraph Server
+
+Agent 工作台的自定义 FastAPI/AG-UI 运行时整体替换为 **assistant-ui + 本地 LangGraph Server**
+（与 FastAPI 分离启动，`127.0.0.1:2024`，仅回环地址）：
+
+- **原生线程 / 检查点 / 审批**：会话、运行、检查点与 MCP 人工审批（HITL）由 LangGraph Server
+  原生持久化，进程重启后普通会话与待审批断点均可恢复；前端经 `useStreamRuntime` + LangGraph SDK
+  线程适配器直连。
+- **静态本地配置**：模型 / MCP / Skills 全部来自一份本地设置文件（默认
+  `~/.vibe-research/agent/settings.json`，`VR_AGENT_SETTINGS` 可覆盖；含明文密钥，建议 `chmod 600`），
+  Agent Server 启动时读取一次，修改后重启生效。请求级模型配置与请求头密钥转发已移除。
+- **三个本地服务**：`uvicorn app:app`（:8900）+ `langgraph dev`（:2024）+ `npm run dev`（:5899）；
+  Python 3.11+，`langgraph dev` 不会自动安装依赖。
+- **旧会话不迁移**：旧版自定义 Agent JSON 会话不读取也不删除，升级后工作台从空列表开始。
+- **移除的能力**：Inspector、Artifact / 来源标签、预算治理（Policy/会话配额）、MCP/Skills 管理
+  界面与「本次/本会话」审批粒度——MCP 审批收敛为逐次「批准 / 拒绝」。
+- **不变的部分**：传统 chat / debate / reflect 仍走 FastAPI 且保持请求级模型配置与 SSRF 行为；
+  `tools.py` 的 24 个数据工具为全出口共用，Eastmoney 节流仍保持串行（进程级锁）。
+
 ## v0.3.1 — 2026-08-09
 
 三个用户报告的 bug + 版本号治理。感谢 [@lihaoran0412](https://github.com/lihaoran0412)

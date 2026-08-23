@@ -107,17 +107,19 @@ One data layer, three AI outlets:
 Vibe-Research/
 ├── a-stock-data/      A-share data toolkit (vendored v3.6.0, ready to use)
 ├── global-stock-data/ US / HK data toolkit (vendored v2.0.3, ready to use)
-├── backend/           FastAPI :8900
+├── backend/           FastAPI :8900 + local LangGraph Server :2024 (Agent workspace)
 │   ├── astock.py        A-share data
 │   ├── gstock.py        US / HK data
 │   ├── newsradar.py     News radar
 │   ├── market.py        Market breadth + sector fund flows + global indices
 │   ├── portfolio.py     Portfolio (stored in your local user directory)
-│   ├── tools.py         AI tool layer (23 data tools, shared by chat / MCP / debate)
+│   ├── tools.py         AI tool layer (24 data tools, shared by chat / MCP / debate / Agent)
 │   ├── chat.py          In-app AI (OpenAI-compatible function calling)
 │   ├── debate.py        Bull-vs-bear orchestration (dossier → bull / bear / moderator)
 │   ├── reflection.py    Reflection audit (audits reasoning in existing analysis)
-│   └── mcp_server.py    MCP server (for Claude Code and other agents)
+│   ├── mcp_server.py    MCP server (for Claude Code and other agents)
+│   ├── langgraph.json   Agent workspace graph registration (agent/graph.py → langgraph dev)
+│   └── agent/           Agent graph assembly: static settings + tool adapter + graph build
 └── frontend/          Vite + React 19 + TS + Tailwind :5899
 ```
 
@@ -125,13 +127,19 @@ Vibe-Research/
 
 ## Quick Start
 
+Requires **Python 3.11+** (the Agent workspace LangGraph runtime). `langgraph dev` does not install
+requirements for you — run `pip install -r requirements.txt` first.
+
 ```bash
-# Backend (:8900)
+# Data + legacy AI backend (FastAPI :8900)
 cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8900
 
-# Frontend (:5899)
-cd frontend && npm install && npm run dev
+# Agent workspace backend (local LangGraph Server :2024, loopback only — never bind LAN/public addresses)
+.venv/bin/langgraph dev --host 127.0.0.1 --port 2024 --no-browser
+
+# Frontend (:5899, /api proxied to 8900 and /agent-api to 2024)
+cd ../frontend && npm install && npm run dev
 # Open http://localhost:5899
 ```
 
@@ -206,30 +214,64 @@ Much cheaper — **a single model call** over the text you selected.
 
 ## Agent Workspace
 
-The **Agent Workspace** turns those pieces into a multi-step research-task runtime: you plug in your own
-OpenAI-compatible model, and the agent runs rounds of model + tool calls (built-in market/news tools plus MCP
-servers you connect), producing Markdown research artifacts along the way, with budget governance and
-approval control on every step. Like the rest of the product it **organizes objective data and analysis
-frameworks — it never gives buy/sell conclusions**. The debate stops at points of disagreement; workspace
-artifacts stop at "verifiable facts and their sources".
+The **Agent Workspace** is powered by a **local LangGraph Server** (`127.0.0.1:2024`, started separately
+from FastAPI): threads, runs, checkpoints and human-in-the-loop approvals are persisted natively — after a
+process restart both ordinary conversations and a pending approval checkpoint are restored. The agent runs
+rounds of model + tool calls (built-in market/news tools plus MCP servers you connect, alongside a local
+Skills library). Like the rest of the product it **organizes objective data and analysis frameworks — it
+never gives buy/sell conclusions**.
+
+Model, MCP and Skills configuration all come from one **local static settings file**
+(default `~/.vibe-research/agent/settings.json`, override with `VR_AGENT_SETTINGS`), read once when the
+Agent server starts — restart it after edits:
+
+```json
+{
+  "model": {
+    "provider": "openai",
+    "name": "gpt-5",
+    "apiKey": "sk-...",
+    "baseURL": "https://api.openai.com/v1",
+    "temperature": 0.2
+  },
+  "skills": {
+    "path": "/absolute/path/to/skills"
+  },
+  "mcpServers": {
+    "example": {
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["example-mcp"],
+      "env": {}
+    },
+    "remote-example": {
+      "transport": "http",
+      "url": "https://example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ..."
+      }
+    }
+  }
+}
+```
 
 Highlights:
 
-- **Your model key never leaves your machine**: it lives in browser `localStorage` (`vr-agent-model`), is
-  forwarded per request as a header, and is never persisted server-side. Key references in server logs and
-  artifacts are always redacted.
-- **Policy snapshot governance**: every run snapshots the current Policy into an immutable budget
-  (model calls / tool calls / timeouts / context caps); editing Policy mid-run doesn't affect running runs.
-  Policy saves use CAS (revision-based optimistic locking); a corrupted policy file fails closed — the UI
-  shows why and requires **explicit double confirmation** before reset.
-- **MCP tool approval**: external MCP tools are approved per call — allow once / allow for this thread /
-  reject. Rejected calls enter the conversation as rejections, never silently failing.
-- **Artifacts & source labels**: artifacts are plain Markdown (nothing executable) with version chains
-  (only the leaf version can be deleted). Every fact is labeled either "execution record" (from an actual
-  tool run) or "model-provided, unverified" — the model's word is never treated as data.
-- **Recoverable & convergent**: runs/messages/artifacts persist to the local data root; after a refresh or
-  disconnect the frontend converges on the authoritative REST state, and failed/cancelled runs can be
-  retried (strict retry: back to the trigger-message boundary, original runs are never rewritten).
+- **Keys stay in the local settings file**: model/MCP keys are stored in plaintext inside `settings.json`;
+  run `chmod 600 ~/.vibe-research/agent/settings.json` (the server warns on stderr if the permissions are
+  too broad). They never enter thread metadata, checkpoints, logs or frontend requests. The legacy
+  "Bring your AI" page keeps using browser localStorage (`vr-llm`).
+- **Per-call MCP approval**: external MCP tools require approval, with exactly two decisions each time —
+  approve or reject. Rejected calls return to the conversation as rejections, never executing silently.
+- **Read-only Skills confined to the configured root**: the model explores the local skill library via
+  `ls` / `read_file` (metadata first, full body on demand); path escapes out of the root are rejected.
+- **The CORS limit, stated honestly**: the Agent server's origin allowlist only permits the local frontend
+  (`http://127.0.0.1:5899`). It prevents an unrelated website from reading LangGraph responses. It is not
+  authentication or CSRF protection: browser simple requests can still blindly create threads or submit
+  runs and consume model/data-source quota. This residual risk is accepted only for loopback, single-user
+  operation — never bind the Agent server to LAN/public addresses.
+- Old custom Agent sessions (JSON files) are **not migrated**: the workspace starts empty after the
+  upgrade; the files remain untouched on disk.
 
 ## Tests
 
@@ -247,13 +289,14 @@ npm run build     # tsc -b && vite build
 
 ### Agent Workspace browser tests (Playwright)
 
-The backend runs the production routes with three deterministic seams (model / MCP session / local tools)
-against a temp data root — **it never touches the regular service on port 8900 or your `~/.vibe-research/`**:
+Three isolated services (FastAPI :8873 + LangGraph :2873 + Vite :5873). LangGraph runs a deterministic
+scripted model and a stdio fake MCP against a fresh temp data root per run — **it never touches the regular
+services on 8900/2024 or your `~/.vibe-research/`**:
 
 ```bash
 cd frontend
 npm run test:e2e:install   # first time: install Chromium (on restricted networks set PLAYWRIGHT_DOWNLOAD_HOST to a reachable mirror)
-npm run test:e2e          # serial run: full interaction matrix + 3 viewports × 2 themes screenshots + network-safety assertions
+npm run test:e2e          # serial run: full interaction matrix + desktop/mobile screenshots + proxy & CORS assertions
 ```
 
 ## Changelog
