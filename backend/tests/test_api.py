@@ -69,9 +69,9 @@ def test_gstock_quote_full_null_shape():
 
 
 def test_cors_preflight_allows_patch():
-    """Agent 工作台需要 PATCH 预检放行。"""
+    """前端自定义方法（如持仓改用的 PATCH 语义）预检需放行。"""
     r = client.options(
-        "/api/agent/run",
+        "/api/holdings",
         headers={
             "Origin": "http://127.0.0.1:5899",
             "Access-Control-Request-Method": "PATCH",
@@ -79,3 +79,12 @@ def test_cors_preflight_allows_patch():
     )
     assert r.status_code == 200
     assert "PATCH" in r.headers.get("access-control-allow-methods", "")
+
+
+def test_fastapi_keeps_legacy_ai_and_has_no_agent_control_plane():
+    """迁移后 FastAPI 只保留数据 + 传统 AI 路由，Agent 控制面全部移除。"""
+    assert client.get("/api/health").status_code == 200
+    assert client.post("/api/chat", json={}).status_code in {400, 422}
+    assert client.post("/api/debate", json={}).status_code in {400, 422}
+    assert client.post("/api/reflect", json={}).status_code in {400, 422}
+    assert client.get("/api/agent/threads").status_code == 404
