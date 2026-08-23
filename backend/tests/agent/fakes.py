@@ -9,12 +9,13 @@ from langchain_core.tools import BaseTool
 
 
 class ScriptedChatModel(BaseChatModel):
-    """离线脚本化模型：按顺序吐出预设回复，供协议/运行时测试复用。"""
+    """离线脚本化模型：按顺序吐出预设回复，并记录每次收到的消息列表。"""
 
     replies: deque[AIMessage]
+    invocations: list[list[BaseMessage]]
 
     def __init__(self, replies: Sequence[AIMessage]):
-        super().__init__(replies=deque(replies))
+        super().__init__(replies=deque(replies), invocations=[])
 
     @property
     def _llm_type(self) -> str:
@@ -30,6 +31,7 @@ class ScriptedChatModel(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
+        self.invocations.append(list(messages))
         return ChatResult(generations=[ChatGeneration(message=self.replies.popleft())])
 
     def _stream(
@@ -39,8 +41,8 @@ class ScriptedChatModel(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
-        # ag-ui-langgraph 只从 on_chat_model_stream 生成 TEXT_MESSAGE_* 事件，
-        # 因此脚本化模型必须支持流式输出。
+        # 流式输出与 _generate 同步记录调用面，供测试断言第二次模型调用内容。
+        self.invocations.append(list(messages))
         message = self.replies.popleft()
         if message.content:
             yield ChatGenerationChunk(message=AIMessageChunk(content=message.content))
