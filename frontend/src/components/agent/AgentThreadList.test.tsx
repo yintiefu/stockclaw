@@ -1,148 +1,124 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+/** Task 9：线程列表的 assistant-ui 原生原语契约——新建/切换/重命名/删除。 */
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { ComposerPrimitive } from "@assistant-ui/react";
+
+import { TestAgentRuntimeProvider } from "@/test/agent-runtime";
 
 import { AgentThreadList } from "./AgentThreadList";
-import type { AgentThreadSummary } from "@/lib/agent/types";
 
-const threads: AgentThreadSummary[] = [
-  {
-    id: "thread-running",
-    title: "一段很长的现金流核验会话标题",
-    updated_at: "2026-08-19T09:30:00Z",
-    revision: 3,
-    last_run: { id: "run-1", status: "running", updated_at: "2026-08-19T09:30:00Z", retry_of: null },
-  },
-  {
-    id: "thread-failed",
-    title: "行业供需",
-    updated_at: "2026-08-18T08:00:00Z",
-    revision: 2,
-    last_run: { id: "run-2", status: "failed", updated_at: "2026-08-18T08:00:00Z", retry_of: null },
-  },
-];
+afterEach(cleanup);
 
-const props = () => ({
-  threads,
-  activeThreadId: "thread-running",
-  warnings: [{ code: "DOCUMENT_CORRUPT" as const, document_type: "run" as const, filename: "run-bad.json.corrupt" }],
-  onSelect: vi.fn(),
-  onCreate: vi.fn(),
-  onRename: vi.fn(),
-  onDelete: vi.fn(),
-});
-
-function rowOf(title: RegExp) {
-  const select = screen.getByRole("button", { name: title });
-  const row = select.closest("[data-thread-row]");
-  if (!row) throw new Error(`未找到标题为 ${title} 的会话行`);
-  return row as HTMLElement;
+// 远程线程列表中，新线程只有发出首条消息（initialize）后才会出现在列表里；
+// 测试用一个小型 Composer 驱动线程初始化。
+function Harness() {
+  return (
+    <TestAgentRuntimeProvider>
+      <AgentThreadList />
+      <ComposerPrimitive.Root>
+        <ComposerPrimitive.Input aria-label="Agent 消息" />
+        <ComposerPrimitive.Send aria-label="发送消息" />
+      </ComposerPrimitive.Root>
+    </TestAgentRuntimeProvider>
+  );
 }
 
-afterEach(() => cleanup());
+async function createThreads(user: ReturnType<typeof userEvent.setup>, count: number) {
+  for (let index = 1; index <= count; index += 1) {
+    await user.click(screen.getByRole("button", { name: "新建会话" }));
+    await user.type(screen.getByRole("textbox", { name: "Agent 消息" }), `会话消息 ${index}`);
+    await user.click(screen.getByRole("button", { name: "发送消息" }));
+    if (index < count) {
+      await waitFor(() => {
+        expect(screen.queryAllByTestId(/^agent-thread-/)).toHaveLength(index);
+      });
+    }
+  }
+  await waitFor(() => {
+    expect(screen.queryAllByTestId(/^agent-thread-/)).toHaveLength(count);
+  });
+  return screen.getAllByTestId(/^agent-thread-/);
+}
+
+/** 按标题文本定位某个线程条目（列表按更新时间倒序，不依赖数组顺序）。 */
+function itemTitled(text: string) {
+  const item = screen.getAllByTestId(/^agent-thread-/)
+    .find((element) => element.textContent?.includes(text));
+  if (!item) throw new Error(`找不到标题含 "${text}" 的线程条目`);
+  return item;
+}
 
 describe("AgentThreadList", () => {
-  it("按标题本地搜索并保留选中态与完整标题 tooltip", async () => {
+  it("lists initialized threads with the active one marked", async () => {
     const user = userEvent.setup();
-    render(<AgentThreadList {...props()} />);
+    render(<Harness />);
 
-    const selected = screen.getByRole("button", { name: /一段很长的现金流核验会话标题/ });
-    expect(selected).toHaveAttribute("aria-current", "true");
-    expect(screen.getByText("一段很长的现金流核验会话标题")).toHaveAttribute(
-      "title",
-      "一段很长的现金流核验会话标题",
-    );
-    await user.type(screen.getByRole("searchbox", { name: "搜索会话" }), "供需");
-    expect(screen.queryByText("一段很长的现金流核验会话标题")).toBeNull();
-    expect(screen.getByText("行业供需")).toBeInTheDocument();
+    const items = await createThreads(user, 1);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toHaveAttribute("data-active", "true");
+    expect(within(items[0]).getByText("会话消息 1")).toBeVisible();
   });
 
-  it("线程行展示更新时间、最近运行状态和恢复警告", () => {
-    render(<AgentThreadList {...props()} />);
-    expect(screen.getByText("运行中")).toBeInTheDocument();
-    expect(screen.getByText("失败")).toBeInTheDocument();
-    expect(screen.getAllByText(/08\/19|8月19日/).length).toBeGreaterThan(0);
-    expect(screen.getByText(/run-bad\.json\.corrupt/)).toBeInTheDocument();
-  });
-
-  it("按更新时间分组显示今天/昨天/近 7 天/更早", () => {
-    const now = new Date();
-    const iso = (offsetDays: number) => {
-      const date = new Date(now.getFullYear(), now.getMonth(), now.getDate() - offsetDays, 12);
-      return date.toISOString();
-    };
-    render(
-      <AgentThreadList
-        {...props()}
-        warnings={[]}
-        threads={[
-          { id: "t-today", title: "今天会话", updated_at: iso(0), revision: 1, last_run: null },
-          { id: "t-yesterday", title: "昨天会话", updated_at: iso(1), revision: 1, last_run: null },
-          { id: "t-week", title: "本周会话", updated_at: iso(3), revision: 1, last_run: null },
-          { id: "t-earlier", title: "更早会话", updated_at: iso(30), revision: 1, last_run: null },
-        ]}
-      />,
-    );
-    expect(screen.getByText("今天")).toBeInTheDocument();
-    expect(screen.getByText("昨天")).toBeInTheDocument();
-    expect(screen.getByText("近 7 天")).toBeInTheDocument();
-    expect(screen.getByText("更早")).toBeInTheDocument();
-  });
-
-  it("行内三点菜单支持重命名，Escape 关闭菜单", async () => {
+  it("switches between threads via thread-list selection", async () => {
     const user = userEvent.setup();
-    const handlers = props();
-    render(<AgentThreadList {...handlers} />);
+    render(<Harness />);
 
-    await user.click(screen.getByRole("button", { name: "新建会话" }));
-    expect(handlers.onCreate).toHaveBeenCalledOnce();
+    await createThreads(user, 2);
+    const first = itemTitled("会话消息 1");
+    const second = itemTitled("会话消息 2");
+    await user.click(within(first).getByRole("button", { name: /会话消息 1/ }));
+    await waitFor(() => {
+      expect(first).toHaveAttribute("data-active", "true");
+      expect(second).not.toHaveAttribute("data-active", "true");
+    });
+  });
 
-    await user.click(within(rowOf(/一段很长的现金流核验会话标题/)).getByLabelText("会话操作"));
-    await user.click(screen.getByRole("menuitem", { name: "重命名" }));
-    await user.clear(screen.getByLabelText("新会话标题"));
-    await user.type(screen.getByLabelText("新会话标题"), "新标题");
-    await user.click(screen.getByRole("button", { name: "确认重命名" }));
+  it("renames the active thread inline without window.prompt", async () => {
+    const user = userEvent.setup();
+    render(<Harness />);
 
-    expect(handlers.onRename).toHaveBeenCalledWith("thread-running", "新标题");
+    const [item] = await createThreads(user, 1);
+    await user.click(within(item).getByRole("button", { name: "重命名会话" }));
+    const input = within(item).getByRole("textbox", { name: "会话标题" });
+    await user.clear(input);
+    await user.type(input, "客观核验会话");
+    await user.click(within(item).getByRole("button", { name: "确认重命名" }));
 
-    // Escape 关闭菜单
-    await user.click(within(rowOf(/一段很长的现金流核验会话标题/)).getByLabelText("会话操作"));
-    expect(screen.getByRole("menu")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(within(item).getByText("客观核验会话")).toBeVisible();
+    });
+  });
+
+  it("cancels renaming with Escape and blocks blank titles", async () => {
+    const user = userEvent.setup();
+    render(<Harness />);
+
+    const [item] = await createThreads(user, 1);
+    await user.click(within(item).getByRole("button", { name: "重命名会话" }));
+    const input = within(item).getByRole("textbox", { name: "会话标题" });
+    await user.clear(input);
+    expect(within(item).getByRole("button", { name: "确认重命名" })).toBeDisabled();
     await user.keyboard("{Escape}");
-    expect(screen.queryByRole("menu")).toBeNull();
+    expect(within(item).queryByRole("textbox", { name: "会话标题" })).toBeNull();
   });
 
-  it("行内重命名可取消且空标题不可确认", async () => {
+  it("deletes a thread from the list", async () => {
     const user = userEvent.setup();
-    const handlers = props();
-    render(<AgentThreadList {...handlers} />);
+    render(<Harness />);
 
-    await user.click(within(rowOf(/行业供需/)).getByLabelText("会话操作"));
-    await user.click(screen.getByRole("menuitem", { name: "重命名" }));
-    await user.clear(screen.getByLabelText("新会话标题"));
-    expect(screen.getByRole("button", { name: "确认重命名" })).toBeDisabled();
-    await user.click(screen.getByRole("button", { name: "取消重命名" }));
-
-    expect(handlers.onRename).not.toHaveBeenCalled();
-    expect(screen.getByText("行业供需")).toBeInTheDocument();
+    const [item] = await createThreads(user, 1);
+    await user.click(within(item).getByRole("button", { name: "删除会话" }));
+    await waitFor(() => {
+      expect(screen.queryByTestId(/^agent-thread-/)).toBeNull();
+    });
   });
 
-  it("运行中的会话禁止删除，空闲会话删除需确认", async () => {
+  it("does not render archive controls", async () => {
     const user = userEvent.setup();
-    const handlers = props();
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
-    render(<AgentThreadList {...handlers} />);
+    render(<Harness />);
 
-    // 运行中：删除禁用
-    await user.click(within(rowOf(/一段很长的现金流核验会话标题/)).getByLabelText("会话操作"));
-    expect(screen.getByRole("menuitem", { name: "删除" })).toBeDisabled();
-    await user.keyboard("{Escape}");
-
-    // 空闲：确认后删除
-    await user.click(within(rowOf(/行业供需/)).getByLabelText("会话操作"));
-    await user.click(screen.getByRole("menuitem", { name: "删除" }));
-    expect(confirm).toHaveBeenCalledOnce();
-    expect(handlers.onDelete).toHaveBeenCalledWith("thread-failed");
-    confirm.mockRestore();
+    const [item] = await createThreads(user, 1);
+    expect(within(item).queryByRole("button", { name: /归档/ })).toBeNull();
   });
 });

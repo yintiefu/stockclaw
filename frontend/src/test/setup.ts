@@ -18,3 +18,20 @@ class ResizeObserverStub {
 if (!globalThis.ResizeObserver) {
   Object.defineProperty(globalThis, "ResizeObserver", { value: ResizeObserverStub });
 }
+
+// jsdom 没有 matchMedia，Agent 页面用它判断桌面布局
+if (!window.matchMedia) {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    value: (query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }),
+  });
+}
