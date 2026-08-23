@@ -23,11 +23,26 @@ CODE = "600519"
 # 锁定版本
 # ---------------------------------------------------------------------------
 
+EXPECTED_AGENT_VERSIONS = {
+    "langgraph-cli": "0.4.31",
+    "langgraph-api": "0.12.6",
+    "langgraph-runtime-inmem": "0.32.6",
+    "langgraph": "1.2.11",
+    "httpx": "0.28.1",
+    "langchain": "1.3.15",
+    "langchain-core": "1.5.5",
+    "langchain-openai": "1.5.1",
+    "langchain-mcp-adapters": "0.3.2",
+    "mcp": "1.26.0",
+    "deepagents": "0.7.7",
+    "langchain-anthropic": "1.5.4",
+    "langchain-google-genai": "4.3.1",
+}
+
+
 def test_locked_mcp_stack_and_local_mootdx_are_importable():
     assert version("mootdx") == "0.11.7+vr1"
-    assert version("langchain-mcp-adapters") == "0.3.2"
-    assert version("mcp") == "1.26.0"
-    assert version("httpx") == "0.28.1"
+    assert {name: version(name) for name in EXPECTED_AGENT_VERSIONS} == EXPECTED_AGENT_VERSIONS
 
 
 # ---------------------------------------------------------------------------
