@@ -151,6 +151,9 @@ test.describe("桌面工作台交互", () => {
     await expect(page.getByLabel("转向新问题")).toBeVisible({ timeout: 30_000 });
     await decideApproval(page, "reject");
     await expect(page.getByText(/工具调用被拒绝/).first()).toBeVisible({ timeout: 30_000 });
+    // 终态自动命名：默认标题被首条用户消息替换（heading 限定，避开消息气泡同名文本）
+    await expect(page.getByRole("heading", { name: "需要审批的调用" }))
+      .toBeVisible({ timeout: 30_000 });
   });
 
   test("Stop 取消慢速运行", async ({ page }) => {
@@ -167,8 +170,9 @@ test.describe("桌面工作台交互", () => {
     await openWorkspace(page);
     await send(page, "这次会失败");
     // 重试按钮在 cancelled 状态同样渲染：先等线程状态 chip 变为「失败」，
-    // 确保点击时 last_run 已指向本轮 failed run（而非上一测试遗留的 cancelled run）
-    const threadRow = page.getByRole("button", { name: /^新会话/ });
+    // 确保点击时 last_run 已指向本轮 failed run（而非上一测试遗留的 cancelled run）。
+    // 线程行定位：该线程在「新会话中拒绝审批调用」用例已被终态自动命名
+    const threadRow = page.getByRole("button", { name: /需要审批的调用/ });
     await expect(threadRow.getByText("失败", { exact: true })).toBeVisible({ timeout: 30_000 });
     await expect(page.getByRole("button", { name: "重试本轮" })).toBeVisible({ timeout: 30_000 });
     await page.getByRole("button", { name: "重试本轮" }).click();

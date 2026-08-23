@@ -251,6 +251,11 @@ class RunSummary(BaseModel):
     retry_of: str | None = None
 
 
+# 新建线程的默认标题（router.ThreadCreate 与隐式创建共用）；
+# run 终态时若标题仍为此值，则用首条用户消息截断自动命名
+DEFAULT_THREAD_TITLE = "新会话"
+
+
 class ThreadDocument(BaseModel):
     """权威线程文档 —— 唯一可信的消息历史来源。"""
 

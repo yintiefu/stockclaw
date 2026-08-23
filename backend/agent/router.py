@@ -22,7 +22,7 @@ import json
 
 from ag_ui.core.events import CustomEvent
 from agent.governance import build_budget_payload
-from agent.models import ModelRef, RunSecrets, RunSummary, RuntimeForwardedProps, ThreadDocument
+from agent.models import DEFAULT_THREAD_TITLE, ModelRef, RunSecrets, RunSummary, RuntimeForwardedProps, ThreadDocument
 from agent.policy import (
     PolicyCorrupt,
     PolicyInvalid,
@@ -690,7 +690,7 @@ async def run(input_data: RunAgentInput, request: Request) -> StreamingResponse:
 
 
 class ThreadCreate(BaseModel):
-    title: str = "新会话"
+    title: str = DEFAULT_THREAD_TITLE
 
 
 class ThreadPatch(BaseModel):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,7 +12,16 @@ from uuid import uuid4
 
 from ag_ui.core.types import RunAgentInput
 
-from agent.models import AgentMessage, ModelRef, RunDocument, RunSecrets, RunSummary, RunUsage, ThreadDocument
+from agent.models import (
+    AgentMessage,
+    DEFAULT_THREAD_TITLE,
+    ModelRef,
+    RunDocument,
+    RunSecrets,
+    RunSummary,
+    RunUsage,
+    ThreadDocument,
+)
 from agent.protocol import PendingInterrupt, interrupt_payloads
 from agent.capabilities import (
     AllowanceRegistry,
@@ -121,6 +131,68 @@ class CommittedRevision:
     reason: str
 
 
+# 自动命名标题的截断长度（中文字符计）
+THREAD_TITLE_LIMIT = 20
+
+
+def _plain_text_of_content(content: Any) -> str:
+    """用户消息 content 的纯文本：兼容 str 与 AG-UI 分片列表两种形态。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = [
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        return " ".join(texts)
+    return ""
+
+
+def derive_thread_title(messages: Sequence[AgentMessage]) -> str | None:
+    """从首条 user 消息派生会话标题；无可用文本时返回 None（保持默认名）。"""
+    for message in messages:
+        if message.role != "user":
+            continue
+        text = _plain_text_of_content(message.content)
+        # 剥离常见 markdown 标记，避免标题里出现 ## / ** / ` 噪声
+        text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+        text = text.replace("**", "").replace("`", "")
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return None
+        if len(text) > THREAD_TITLE_LIMIT:
+            return text[:THREAD_TITLE_LIMIT].rstrip() + "…"
+        return text
+    return None
+
+
+def apply_thread_autotitle(threads: "ThreadStore", thread_id: str, expected_revision: int) -> int | None:
+    """终态自动命名：仅当标题仍为默认值时，用首条用户消息截断替换一次。
+
+    返回命名后的新 revision；未命中守卫（非默认标题 / 无可用文本 / 写冲突）
+    返回 None。命名不具权威性，任何冲突直接放弃，绝不影响终态主流程。
+    调用方持有线程锁：expected 与 store 当前一致，重读只为取标题与消息。
+    """
+    try:
+        doc = threads.get(thread_id)
+    except DocumentNotFound:
+        return None
+    if doc.title != DEFAULT_THREAD_TITLE:
+        return None
+    title = derive_thread_title(doc.messages)
+    if title is None:
+        return None
+    try:
+        updated = threads.update(
+            thread_id, expected_revision,
+            lambda d: d.model_copy(update={"title": title}),
+        )
+    except RevisionConflict:
+        return None
+    return updated.revision
+
+
 class RunJournal:
     """语义边界运行日志：只消费已脱敏的标准 AG-UI 事件。
 
@@ -205,6 +277,7 @@ class RunJournal:
 
     def persist_terminal(self, status: str, error_code: str | None = None, error_message: str | None = None) -> CommittedRevision:
         self._handle.control.close_active_segment()  # 终局：关闭最后一段（幂等）
+        self._maybe_autotitle()  # 默认标题线程用首条用户消息命名（终态一次，不覆盖手动改名）
         run_update: dict[str, Any] = {"status": status}
         if error_code is not None:
             run_update["error_code"] = error_code
@@ -225,6 +298,7 @@ class RunJournal:
             return None
         self.closed = True
         self._handle.control.close_active_segment()  # 取消：关闭最后一段（幂等）
+        self._maybe_autotitle()
         if self._pending_request_calls:
             self._flush_request_message(partial=True)
         for message_id, buffer in self._assistant_buffers.items():
@@ -248,6 +322,13 @@ class RunJournal:
         return commit
 
     # ---- 内部 ----
+
+    def _maybe_autotitle(self) -> None:
+        """终态自动命名（journal 路径）：默认标题线程用首条用户消息命名一次。"""
+        new_revision = apply_thread_autotitle(
+            self._threads, self._handle.runtime.thread_id, self._handle.thread_revision)
+        if new_revision is not None:
+            self._handle.thread_revision = new_revision
 
     def _elapsed_ms(self) -> int:
         return int((time.monotonic() - self._handle.started_monotonic) * 1000)
@@ -680,7 +761,7 @@ class RunCoordinator:
         implicit_thread = thread is None
         if thread is None:
             # 线程不存在则隐式创建（revision 0）；客户端 revision 必须与之对齐
-            thread = ThreadDocument.new(thread_id, "新会话", now=utc_now())
+            thread = ThreadDocument.new(thread_id, DEFAULT_THREAD_TITLE, now=utc_now())
             if client_revision not in (None, 0):
                 raise RevisionConflict(
                     f"线程 {thread_id} 不存在，客户端 revision {client_revision} 无法对齐"
@@ -869,13 +950,14 @@ class RunCoordinator:
                 "error_message": "Graph 构建失败",
                 "budget_snapshot": control.snapshot,
             }))
-            threads.update(
+            failed_thread = threads.update(
                 thread_id,
                 updated_thread.revision,
                 lambda doc: doc.model_copy(update={"last_run": RunSummary(
                     id=run_id, status="failed", updated_at=utc_now(), retry_of=None
                 )}),
             )
+            apply_thread_autotitle(threads, thread_id, failed_thread.revision)
             raise
 
         model_history = updated_thread.model_history()
@@ -1382,6 +1464,9 @@ class RunCoordinator:
                     return
                 continue
             handle.thread_revision = updated.revision
+            # 终态摘要写成功后再自动命名：命名推进 revision 不能先于 last_run CAS，
+            # 否则会把这轮容错循环的两个 expected 全部挤过期（见 cancel 兜底用例）
+            apply_thread_autotitle(self._threads, handle.runtime.thread_id, updated.revision)
             return
 
     async def ensure_run_terminal(

@@ -1217,3 +1217,85 @@ def test_run_document_write_amplification_benchmark(tmp_path):
     assert len(encoded) < 3 * 1024 * 1024, len(encoded)
     reloaded = runs.get("run-bench")
     assert len(reloaded.sources) == 200
+
+
+# ---- 终态自动命名：默认标题线程用首条用户消息截断命名（不覆盖手动改名） ----
+
+
+@pytest.mark.parametrize("content,expected", [
+    ("分析现金流", "分析现金流"),                              # 短文本原样
+    ("  查一下行情  ", "查一下行情"),                          # 去首尾空白
+    ("## 每日复盘\n帮我整理今日要点", "每日复盘 帮我整理今日要点"),  # 剥离行首 markdown 标题
+    ("用**加粗**和`代码`提问", "用加粗和代码提问"),              # 剥离强调/代码标记
+    ("这句话长度超过二十个字符所以要被截断掉了呀", "这句话长度超过二十个字符所以要被截断掉了…"),  # 21 字截 20
+    ("", None),                                                # 空文本保持默认名
+    ("   ", None),                                             # 纯空白保持默认名
+])
+def test_derive_thread_title_from_plain_content(content, expected):
+    from agent.runs import derive_thread_title
+    messages = [AgentMessage(id="u1", role="user", content=content)]
+    assert derive_thread_title(messages) == expected
+
+
+def test_derive_thread_title_from_parts_content_and_guards():
+    from agent.runs import derive_thread_title
+    # AG-UI 分片 content：拼接 text part
+    parts = [
+        {"type": "text", "text": "先查行情"},
+        {"type": "other", "x": 1},
+        {"type": "text", "text": "再查资金流"},
+    ]
+    assert derive_thread_title([AgentMessage(id="u1", role="user", content=parts)]) == "先查行情 再查资金流"
+    # 没有 user 消息 → 保持默认名
+    assert derive_thread_title([AgentMessage(id="a1", role="assistant", content="回答")]) is None
+    assert derive_thread_title([]) is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_autotitles_default_thread_with_first_user_message(tmp_path):
+    coordinator, threads, runs = make_coordinator(tmp_path)
+
+    def failing_builder(model_ref, secrets):
+        raise RuntimeError("provider unavailable")
+
+    with pytest.raises(RuntimeError):
+        await coordinator.acquire_start(
+            model_ref=MODEL_REF, secrets=SECRETS, model_builder=failing_builder, tools=[],
+            thread_id="thread-1", middleware=(),
+            protocol_run_id="protocol-1",
+            messages=[user_msg("user-1", "分析贵州茅台近期成交量")], client_revision=None,
+        )
+
+    # 隐式创建的线程默认标题在 run 终态后被首条用户消息替换
+    thread = threads.get("thread-1")
+    assert thread.title == "分析贵州茅台近期成交量"
+
+
+@pytest.mark.asyncio
+async def test_terminal_autotitle_never_overrides_manual_rename(tmp_path):
+    coordinator, threads, runs = make_coordinator(tmp_path)
+    seed = ThreadDocument.new("thread-1", "手动命名", now=NOW)
+    threads.create(seed)
+
+    def failing_builder(model_ref, secrets):
+        raise RuntimeError("provider unavailable")
+
+    with pytest.raises(RuntimeError):
+        await coordinator.acquire_start(
+            model_ref=MODEL_REF, secrets=SECRETS, model_builder=failing_builder, tools=[],
+            thread_id="thread-1", middleware=(),
+            protocol_run_id="protocol-1",
+            messages=[user_msg("user-1", "分析")], client_revision=0,
+        )
+
+    assert threads.get("thread-1").title == "手动命名"
+
+
+@pytest.mark.asyncio
+async def test_completed_run_autotitles_via_journal_path(tmp_path):
+    """正常终局走 RunJournal.persist_terminal：默认标题同样在终态被自动命名。"""
+    coordinator, threads, runs = make_coordinator(tmp_path)
+    await start(coordinator, protocol_run_id="protocol-1", revision=None,
+                content="复盘今日市场数据")
+    await coordinator.finish_if_terminal("thread-1", "completed")
+    assert threads.get("thread-1").title == "复盘今日市场数据"
