@@ -3,6 +3,15 @@
 本项目的版本号唯一来源是 `frontend/package.json`；后端 HTTP API、`/api/health`、
 前端界面与 MCP `serverInfo` 全部从它读取（见 `backend/version.py`）。
 
+## 未发布 — 2026-08-24：Agent 会话调用链路追踪（JSONL）
+
+- 新增 `SessionTraceMiddleware`：每个 run 的模型调用（耗时 / token / tool_calls）、工具调用、
+  HITL 拒绝实时追加写入按线程组织的 `~/.vibe-research/agent/traces/<thread_id>.jsonl`，
+  可 `tail -f` / `jq`；`settings.json` 的 `trace.enabled` / `trace.dir` 可关可改。
+- 终端查看：`scripts/dev trace`（列线程）与 `scripts/dev trace show <thread_id>`
+  （时间线 / `--raw`）。
+- 追踪写入失败不影响 agent 运行（首错熔断，仅一行 stderr 告警）；只记录启用后的新 run。
+
 ## 未发布 — 2026-08-24：Agent 工作台迁移到本地 LangGraph Server
 
 Agent 工作台的自定义 FastAPI/AG-UI 运行时整体替换为 **assistant-ui + 本地 LangGraph Server**

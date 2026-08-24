@@ -262,6 +262,10 @@ Agent 按轮调用你配置的模型与工具（内置行情/资讯工具 + 你�
         "Authorization": "Bearer ..."
       }
     }
+  },
+  "trace": {
+    "enabled": true,
+    "dir": "~/.vibe-research/agent/traces"
   }
 }
 ```
@@ -271,6 +275,12 @@ Agent 按轮调用你配置的模型与工具（内置行情/资讯工具 + 你�
 - **密钥只在本地设置文件**：模型/MCP 密钥以明文保存在 `settings.json`，请执行
   `chmod 600 ~/.vibe-research/agent/settings.json`（权限过宽时服务启动会在 stderr 提醒）。
   它们不进入线程元数据、检查点、日志或前端请求；传统「接入 AI」页的 `vr-llm` 仍存浏览器 localStorage。
+- **会话数据在用户目录**：`scripts/dev` 托管启动的 Agent Server 以
+  `~/.vibe-research/agent/server/` 为工作目录——里面是自动生成的绝对路径
+  `langgraph.json` 与 `.langgraph_api/` 会话数据（运行时把存储路径硬编码为
+  cwd 下的 `.langgraph_api/`，无 env 覆盖项），仓库内不落任何运行时文件。
+  若手动 `cd backend && langgraph dev` 裸跑，数据会落在 `backend/.langgraph_api/`
+  （已 gitignore），与用户目录互不可见。
 - **MCP 逐次审批**：外部 MCP 工具默认需要批准，每次只有「批准 / 拒绝」两种决定；
   被拒的调用以拒绝结果回到对话，不会静默执行。
 - **Skills 只读且限制在配置根目录**：模型经 `ls` / `read_file` 渐进读取本地技能库
@@ -280,6 +290,19 @@ Agent 按轮调用你配置的模型与工具（内置行情/资讯工具 + 你�
   浏览器 simple request 仍可盲写线程/提交运行、消耗模型与数据源额度。此残余风险仅在
   loopback 单用户场景下接受，因此 Agent Server 绝不要绑定局域网/公网地址。
 - 旧版自定义 Agent 会话（JSON 文件）**不迁移**：升级后工作台从空列表开始，原文件保留在磁盘上。
+- **调用链路追踪（JSONL）**：默认开启（`trace.enabled`）。每个 run 的执行流程——模型调用
+  （耗时、model、token 用量、tool_calls）、工具调用（入参、结果预览、状态）、HITL 拒绝——
+  实时追加写入 `~/.vibe-research/agent/traces/<thread_id>.jsonl`（每线程一文件，可用
+  `trace.dir` 覆盖），可 `tail -f` / `jq` 消费。终端查看：`scripts/dev trace`（列线程）与
+  `scripts/dev trace show <thread_id>`（按 run 分组的时间线，`show --raw` 输出 jq-friendly
+  原文，`--traces-dir` 覆盖目录）。注意：
+  - 追踪文件含对话与工具入参/结果的**明文**，与 `settings.json` 同一隐私边界（本机、
+    绝不提交仓库）；密钥不会写入（事件只含消息内容与工具数据）。
+  - 自定义 baseURL 的流式上游常无 usage chunk，`input_tokens` / `output_tokens` 记
+    `null` 是正常形态，消费方不得假定非空。
+  - 被中断（等待审批）的 run 没有末尾 `run_end` 事件；恢复（resume）产生新 run_id。
+  - 追踪写入失败绝不影响 agent 运行：首错熔断、整个进程只打一行 stderr 告警。
+  - 只记录启用后的新 run，历史会话不补录。
 
 ## 测试
 
