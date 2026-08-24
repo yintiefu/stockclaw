@@ -52,11 +52,18 @@ class HttpMcpSettings(BaseModel):
 McpSettings = Annotated[StdioMcpSettings | HttpMcpSettings, Field(discriminator="transport")]
 
 
+class TraceSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = True
+    dir: Path = Field(default_factory=lambda: Path.home() / ".vibe-research" / "agent" / "traces")
+
+
 class AgentSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model: ModelSettings
     skills: SkillsSettings
     mcp_servers: dict[str, McpSettings] = Field(default_factory=dict, alias="mcpServers")
+    trace: TraceSettings = Field(default_factory=TraceSettings)
 
     def mcp_connections(self) -> dict[str, dict[str, object]]:
         return {name: config.model_dump(mode="python", exclude_none=True)
@@ -87,6 +94,7 @@ def load_agent_settings(path: Path | None = None) -> AgentSettings:
     if not skill_root.is_dir() or not os.access(skill_root, os.R_OK):
         raise AgentSettingsError(f"Agent Skills 目录不存在、不可读或不是目录：{skill_root}")
     settings.skills.path = skill_root
+    settings.trace.dir = settings.trace.dir.expanduser().resolve()
     try:
         if resolved.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
             print(f"警告：Agent 配置包含明文密钥，建议执行 chmod 600 {resolved}", file=sys.stderr)

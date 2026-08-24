@@ -37,6 +37,7 @@ def make_settings(tmp_path: Path) -> AgentSettings:
         },
         "skills": {"path": str(skills)},
         "mcpServers": {},
+        "trace": {"enabled": False, "dir": str(tmp_path / "traces")},
     })
 
 

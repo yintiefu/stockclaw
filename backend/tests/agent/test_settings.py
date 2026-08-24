@@ -122,6 +122,58 @@ def test_tight_permission_stays_quiet(tmp_path, monkeypatch, capsys):
     assert capsys.readouterr().err == ""
 
 
+def test_trace_defaults_to_enabled_and_default_dir(tmp_path, monkeypatch):
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    path = write_settings(tmp_path, skills=skills)
+    monkeypatch.setenv("VR_AGENT_SETTINGS", str(path))
+    settings = load_agent_settings()
+    assert settings.trace.enabled is True
+    assert settings.trace.dir == (Path.home() / ".vibe-research" / "agent" / "traces").resolve()
+
+
+def test_trace_can_be_disabled_and_dir_expanded(tmp_path, monkeypatch):
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    trace_dir = tmp_path / "traces"
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({
+        "model": {
+            "provider": "openai", "name": "test-model",
+            "apiKey": "sk-test", "baseURL": "https://example.test/v1",
+        },
+        "skills": {"path": str(skills)},
+        "mcpServers": {},
+        "trace": {"enabled": False, "dir": str(trace_dir)},
+    }), encoding="utf-8")
+    path.chmod(0o600)
+    monkeypatch.setenv("VR_AGENT_SETTINGS", str(path))
+    settings = load_agent_settings()
+    assert settings.trace.enabled is False
+    assert settings.trace.dir == trace_dir.resolve()
+
+
+def test_trace_unknown_field_reports_location_without_value(tmp_path, monkeypatch):
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({
+        "model": {
+            "provider": "openai", "name": "test-model",
+            "apiKey": "sk-test", "baseURL": "https://example.test/v1",
+        },
+        "skills": {"path": str(skills)},
+        "mcpServers": {},
+        "trace": {"enabled": True, "level": "verbose"},
+    }), encoding="utf-8")
+    monkeypatch.setenv("VR_AGENT_SETTINGS", str(path))
+    with pytest.raises(AgentSettingsError) as caught:
+        load_agent_settings()
+    message = str(caught.value)
+    assert "trace.level" in message
+    assert "verbose" not in message
+
+
 def test_settings_model_never_prints_secret(tmp_path, monkeypatch):
     skills = tmp_path / "skills"
     skills.mkdir()

@@ -30,6 +30,7 @@ _TEST_SETTINGS.write_text(json.dumps({
     },
     "skills": {"path": str(_TEST_SKILLS_DIR)},
     "mcpServers": {},
+    "trace": {"enabled": False},
 }), encoding="utf-8")
 os.chmod(_TEST_SETTINGS, 0o600)
 os.environ["VR_AGENT_SETTINGS"] = str(_TEST_SETTINGS)
