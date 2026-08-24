@@ -3,6 +3,15 @@
 本项目的版本号唯一来源是 `frontend/package.json`；后端 HTTP API、`/api/health`、
 前端界面与 MCP `serverInfo` 全部从它读取（见 `backend/version.py`）。
 
+## 未发布 — 2026-08-24：Agent 思考过程展示（thinking 开关）
+
+- `settings.json` 的 `model.thinking`（默认 `false`）：开启后请求带上游思考参数，模型
+  `reasoning_content` 增量转成 thinking content block，前端以「思考过程」折叠区实时展示。
+- 新增 `ReasoningChatOpenAI`：`ChatOpenAI` 会丢弃第三方非标准字段 `reasoning_content`，
+  子类在流式 chunk 转换处保留并转块；历史回传上游前 thinking 块自动剥离（智谱等对
+  未知内容块返回 400）。
+- 思考计入 output tokens；仅对支持 `reasoning_content` 的第三方 OpenAI 兼容上游生效。
+
 ## 未发布 — 2026-08-24：Agent 会话调用链路追踪（JSONL）
 
 - 新增 `SessionTraceMiddleware`：每个 run 的模型调用（耗时 / token / tool_calls）、工具调用、

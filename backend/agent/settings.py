@@ -27,6 +27,10 @@ class ModelSettings(BaseModel):
     api_key: SecretStr = Field(alias="apiKey")
     base_url: str = Field(alias="baseURL", min_length=1)
     temperature: float = Field(default=0.2, ge=0, le=2)
+    # 思考输出开关：开启后请求带 thinking 参数并把 reasoning_content 增量转成
+    # thinking content block 供前端展示；计入 output tokens，默认关闭。
+    # strict：拒绝 "yes"/1 之类的宽松布尔转换，配置错误尽早暴露。
+    thinking: Annotated[bool, Field(strict=True)] = False
 
 
 class SkillsSettings(BaseModel):

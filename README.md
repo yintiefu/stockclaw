@@ -243,7 +243,8 @@ Agent 按轮调用你配置的模型与工具（内置行情/资讯工具 + 你�
     "name": "gpt-5",
     "apiKey": "sk-...",
     "baseURL": "https://api.openai.com/v1",
-    "temperature": 0.2
+    "temperature": 0.2,
+    "thinking": false
   },
   "skills": {
     "path": "/absolute/path/to/skills"
@@ -289,6 +290,11 @@ Agent 按轮调用你配置的模型与工具（内置行情/资讯工具 + 你�
   （`http://127.0.0.1:5899`）。它阻止无关网站**读取**响应，但不是鉴权、也不是 CSRF 防护——
   浏览器 simple request 仍可盲写线程/提交运行、消耗模型与数据源额度。此残余风险仅在
   loopback 单用户场景下接受，因此 Agent Server 绝不要绑定局域网/公网地址。
+- **思考过程展示（thinking）**：`model.thinking` 设为 `true` 后（默认关闭），请求会带
+  上游思考参数（智谱 GLM 系），模型的 `reasoning_content` 在对话中以「思考过程」折叠区
+  展示。注意：思考计入 output tokens（更贵更慢）；含思考的历史消息回传上游前会自动剥离
+  thinking 块（第三方接口对未知内容块会 400）；仅对支持 `reasoning_content` 的第三方
+  OpenAI 兼容上游生效（官方 OpenAI 无此字段）；修改后需重启 Agent Server。
 - 旧版自定义 Agent 会话（JSON 文件）**不迁移**：升级后工作台从空列表开始，原文件保留在磁盘上。
 - **调用链路追踪（JSONL）**：默认开启（`trace.enabled`）。每个 run 的执行流程——模型调用
   （耗时、model、token 用量、tool_calls）、工具调用（入参、结果预览、状态）、HITL 拒绝——

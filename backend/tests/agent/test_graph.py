@@ -109,6 +109,15 @@ def test_model_is_streaming_serial_and_secret_safe(settings):
     assert model.streaming is True
     assert isinstance(model.openai_api_key, SecretStr)
     assert "test-secret-never-send" not in repr(model)
+    assert type(model) is graph_module.ChatOpenAI  # thinking 关闭时用原生类
+
+
+def test_model_thinking_uses_reasoning_subclass(settings):
+    settings.model.thinking = True
+    with pytest.warns(UserWarning, match="transferred to model_kwargs"):
+        model = graph_module._build_model(settings)
+    assert isinstance(model, graph_module.ReasoningChatOpenAI)
+    assert model.extra_body == {"thinking": {"type": "enabled"}}
 
 
 @pytest.mark.asyncio

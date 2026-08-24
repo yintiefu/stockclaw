@@ -20,6 +20,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from pydantic import SecretStr
 
 import chat
+from agent.reasoning_model import ReasoningChatOpenAI
 from agent.settings import AgentSettings, load_agent_settings
 from agent.session_trace import SessionTraceMiddleware
 from agent.tool_registry import build_builtin_tools
@@ -27,13 +28,20 @@ from agent.tool_registry import build_builtin_tools
 
 def _build_model(settings: AgentSettings) -> ChatOpenAI:
     model = settings.model
-    return ChatOpenAI(
+    # thinking 开启时换用保留 reasoning_content 的子类，并带上游思考参数；
+    # 默认关闭，避免不知不觉多耗 output tokens。
+    model_cls = ReasoningChatOpenAI if model.thinking else ChatOpenAI
+    extra_kwargs: dict[str, Any] = {}
+    if model.thinking:
+        extra_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+    return model_cls(
         model=model.name,
         base_url=model.base_url.rstrip("/"),
         api_key=SecretStr(model.api_key.get_secret_value()),
         temperature=model.temperature,
         streaming=True,
         parallel_tool_calls=False,
+        **extra_kwargs,
     )
 
 

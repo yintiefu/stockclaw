@@ -122,6 +122,30 @@ def test_tight_permission_stays_quiet(tmp_path, monkeypatch, capsys):
     assert capsys.readouterr().err == ""
 
 
+def test_thinking_defaults_off_and_can_enable(tmp_path, monkeypatch):
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    path = write_settings(tmp_path, skills=skills)
+    monkeypatch.setenv("VR_AGENT_SETTINGS", str(path))
+    assert load_agent_settings().model.thinking is False
+    path = write_settings(tmp_path, skills=skills, model={
+        "provider": "openai", "name": "test-model",
+        "apiKey": "sk-test", "baseURL": "https://example.test/v1",
+        "thinking": True,
+    })
+    monkeypatch.setenv("VR_AGENT_SETTINGS", str(path))
+    assert load_agent_settings().model.thinking is True
+    path = write_settings(tmp_path, skills=skills, model={
+        "provider": "openai", "name": "test-model",
+        "apiKey": "sk-test", "baseURL": "https://example.test/v1",
+        "thinking": "yes",
+    })
+    monkeypatch.setenv("VR_AGENT_SETTINGS", str(path))
+    with pytest.raises(AgentSettingsError) as caught:
+        load_agent_settings()
+    assert "model.thinking" in str(caught.value)
+
+
 def test_trace_defaults_to_enabled_and_default_dir(tmp_path, monkeypatch):
     skills = tmp_path / "skills"
     skills.mkdir()
