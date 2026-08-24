@@ -38,3 +38,8 @@ frontend/tsconfig.tsbuildinfo
 
 # 本地 vendored mootdx 安装时的构建残留
 backend/vendor/mootdx_compat/src/*.egg-info/
+
+# ── 本地开发编排 / agent 会话状态（scripts/dev 与 ZCode 本地产物）──
+.vr-dev/
+.zcode/
+.superpowers/

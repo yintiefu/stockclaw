@@ -27,7 +27,8 @@ def test_production_langgraph_config_is_local_and_persistent_ready():
         "graphs": {"agent": "./agent/graph.py:graph"},
         "env": {"CORS_ALLOW_ORIGINS": "http://127.0.0.1:5899"},
     }
-    assert ".langgraph_api/" in (BACKEND / ".gitignore").read_text(encoding="utf-8")
+    # 通配形态覆盖 migrate_agent_data 留下的 .langgraph_api.bak 等残留
+    assert ".langgraph_api*" in (BACKEND / ".gitignore").read_text(encoding="utf-8")
 
 
 def test_server_fixture_config_uses_only_the_server_graph():
