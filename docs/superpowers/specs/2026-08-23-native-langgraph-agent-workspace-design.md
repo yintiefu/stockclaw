@@ -340,8 +340,13 @@ assistant-ui 的 LangChain runtime 负责消息水合、流式、工具调用、
   再通过 threads update 写入 `archived: true`；`unarchive` 写入 `archived: false`。`list` 和
   `fetch` 把该字段翻译为 assistant-ui 的 `status: "archived" | "regular"`。首期 UI 不显示
   归档按钮，但 adapter 的必需方法保持可用。
-- thread 切换不属于 adapter；使用 `useStreamRuntime` 顶层的受控 `threadId` 与
-  `onThreadIdChange` 接入页面路由/选中状态。
+- thread 切换不属于 adapter；由 assistant-ui thread-list runtime 内部的
+  `switchToThread(remoteId)` 驱动。锁定的 `@assistant-ui/react-langchain==0.0.27` 会用当前
+  thread-list item 的 `externalId` 覆盖传给 `useStreamRuntime` 的顶层 `threadId`，因此本期
+  不把该选项描述或实现为受控路由入口。`onThreadIdChange` 只用于观测已经结算的 remote ID。
+- 刷新后 runtime 会先创建新的本地空 thread，不会自动恢复刷新前的选中项；用户从会话列表
+  点击原 thread 后，SDK 才按 checkpoint 水合消息。自动恢复最近 thread 留待 assistant-ui
+  升级并重新验证受控或命令式切换 API 后处理。
 - 提供自定义 adapter 后，不再配置顶层 create/delete callbacks；这些选项会被静默忽略。
 
 不再定义自己的 run 文档、revision、watermark、重复 run 或终态恢复模型。
@@ -423,7 +428,8 @@ assistant-ui 的 LangChain runtime 负责消息水合、流式、工具调用、
 - 测试环境在导入 graph 前设置临时 `VR_AGENT_SETTINGS`，并断言真实默认配置未被读取。
 - Graph 测试覆盖中立系统提示、内置工具、MCP tools、Skills middleware 和 HITL policy。
 - 复用 `tests/agent/fakes.py::ScriptedChatModel` 验证普通回复、带 tool calls 的内置工具循环
-  和 HITL 恢复，不另建第二套 scripted model。
+  和 HITL 恢复，不另建第二套 scripted model；离线 reject-resume 用例必须断言工具未执行、
+  注入 `status="error"` 的 `ToolMessage`，并由模型第二次调用消费拒绝结果。
 - 并发调用两个会进入 `astock.em_get` 的内置工具，mock 底层 HTTP `get` 记录实际开始
   时间，断言两次请求间隔不小于 1 秒；同时断言所有内置 tool 实例共享同一进程级锁。
 - 使用 fake MCP server 验证工具发现、server-name 前缀、暂停、批准后执行和拒绝后不执行；
@@ -451,7 +457,8 @@ assistant-ui 的 LangChain runtime 负责消息水合、流式、工具调用、
   `generateTitle`、`archive` 和 `unarchive`；归档测试断言 metadata 合并不丢 title 等字段，
   且 `list`/`fetch` 正确翻译 status。
 - 对 `unstable_threadListAdapter` 做编译与运行合同测试，升级 assistant-ui 时优先发现破坏。
-- 测试 `threadId`/`onThreadIdChange` 的受控切换，并断言自定义 adapter 下不依赖会被忽略的
+- 测试 thread-list runtime 的内部切换和 `onThreadIdChange` 对已结算 remote ID 的观测回调；
+  明确断言不向 0.0.27 传入无效的顶层受控 `threadId`，且自定义 adapter 下不依赖会被忽略的
   顶层 create/delete callbacks。
 - 测试 `useStreamRuntime` 固定 assistant ID/API URL，不发送模型密钥。
 - 测试一个聚合 HITL interrupt 的多个 action 按原顺序通过一次
@@ -472,6 +479,8 @@ assistant-ui 的 LangChain runtime 负责消息水合、流式、工具调用、
   设置生产 backend 为 `PYTHONPATH`，再用
   `langgraph dev --config <temp>/langgraph.json --no-browser --no-reload` 启动，使
   `.langgraph_api/` 不触碰开发会话。
+- 后端 server 集成测试使用独立的 `backend/tests/agent_e2e/server_graph.py` 和
+  `server_langgraph.json`；其 16 条 `return_direct` 剧本不与浏览器的六步剧本共用或互相覆盖。
 - E2E graph 导入生产 `agent/graph.py` 时会先执行一次模块级生产 builder，再调用同一异步
   builder 注入 `tests/agent/fakes.py::ScriptedChatModel` 构建测试 graph；两次构建是已知且
   接受的测试启动成本，不在生产 graph 中增加 `VR_E2E` 分支。E2E settings 使用无效模型
@@ -483,13 +492,14 @@ assistant-ui 的 LangChain runtime 负责消息水合、流式、工具调用、
   `127.0.0.1` 和 `reuseExistingServer: false`；测试专用 LangGraph 配置把
   `CORS_ALLOW_ORIGINS` 设为该 Vite 测试 origin。
 - 进程重启恢复由第 10.1 节的后端子进程测试编排；Playwright 不依赖无法在测试中重启的
-  `webServer` 管理器，只验证浏览器刷新后的 checkpoint 水合。
+  `webServer` 管理器。浏览器刷新后从会话列表点击原 thread，再验证 checkpoint 水合；不承诺
+  0.0.27 会自动恢复刷新前的选中 thread。
 - 验证 Vite `/agent-api` 代理剥离前缀后访问 LangGraph 根 API。
 
 使用仓库 `AGENTS.md` 指定的 headless Playwright Chromium，在桌面和移动 viewport 验证：
 
 - 新建会话并收到流式回复。
-- 刷新页面后恢复消息。
+- 刷新页面后从会话列表点击原 thread，并恢复其消息。
 - 切换、重命名和删除 thread。
 - MCP 调用暂停，批准后继续，拒绝后不执行。
 - 使用本地前端 Origin 可正常读取 Agent API；恶意 Origin 的预检失败，实际响应不含 CORS
