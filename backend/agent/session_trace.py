@@ -401,3 +401,111 @@ class SessionTraceMiddleware(AgentMiddleware):
 
     async def aafter_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
         return self.after_model(state, runtime)
+
+
+# ---------------------------------------------------------------------------
+# CLI 查看器：python -m agent.session_trace [list|show <thread_id>] [--traces-dir DIR]
+# ---------------------------------------------------------------------------
+
+def _default_traces_dir() -> Path:
+    try:
+        from agent.settings import load_agent_settings
+        return load_agent_settings().trace.dir
+    except Exception:
+        return (Path.home() / ".vibe-research" / "agent" / "traces").resolve()
+
+
+def _fmt_tokens(value: Any) -> str:
+    return "—" if value is None else str(value)
+
+
+def _cmd_list(traces_dir: Path) -> int:
+    if not traces_dir.is_dir():
+        print(f"追踪目录不存在：{traces_dir}")
+        return 1
+    files = sorted(traces_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        print(f"（{traces_dir} 下暂无追踪文件）")
+        return 0
+    print(f"{'线程':38} {'行数':>6}  最后时间")
+    for path in files:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        last_ts = ""
+        for line in reversed(lines):
+            try:
+                last_ts = json.loads(line).get("ts", "")
+                if last_ts:
+                    break
+            except json.JSONDecodeError:
+                continue
+        print(f"{path.stem:38} {len(lines):>6}  {last_ts}")
+    return 0
+
+
+def _cmd_show(traces_dir: Path, thread_id: str, raw: bool) -> int:
+    path = traces_dir / _safe_thread_filename(thread_id)
+    if not path.is_file():
+        print(f"追踪文件不存在：{path}")
+        return 1
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if raw:
+        for line in lines:
+            print(line)
+        return 0
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            print(f"（无法解析的行：{line[:60]}…）")
+            continue
+        kind = event.get("event")
+        ts = str(event.get("ts", ""))[11:23]
+        seq = event.get("seq")
+        if kind == "run_start":
+            print(f"\n=== run {event.get('run_id', '')} 开始（{event.get('ts', '')}）===")
+        elif kind == "model_call":
+            calls = ", ".join(c.get("name", "?") for c in event.get("tool_calls", []))
+            suffix = f" → 调用工具[{calls}]" if calls else ""
+            print(f"  [{ts}] #{seq} 模型 {event.get('model') or '—'} "
+                  f"{event.get('duration_ms')}ms "
+                  f"tokens {_fmt_tokens(event.get('input_tokens'))}/{_fmt_tokens(event.get('output_tokens'))}"
+                  f"（缺失记 —）{suffix}")
+        elif kind == "tool_call":
+            preview = str(event.get("result_preview", ""))[:120].replace("\n", " ")
+            print(f"  [{ts}] #{seq} 工具 {event.get('name')} "
+                  f"{event.get('duration_ms')}ms [{event.get('status')}] {preview}")
+        elif kind == "hitl_reject":
+            print(f"  [{ts}] #{seq} ✗ HITL 拒绝 {event.get('name')} "
+                  f"(id={event.get('tool_call_id')})：{str(event.get('content', ''))[:80]}")
+        elif kind == "run_end":
+            print(f"=== run 结束 status={event.get('status')} 共 {event.get('total_ms')}ms ===")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    dir_parent = argparse.ArgumentParser(add_help=False)
+    # SUPPRESS：子命令解析时不得用默认值覆盖主解析器已收到的 --traces-dir
+    dir_parent.add_argument("--traces-dir", type=Path, default=argparse.SUPPRESS,
+                            help="追踪目录（默认读 agent settings 的 trace.dir）")
+    parser = argparse.ArgumentParser(
+        prog="python -m agent.session_trace",
+        description="查看 Agent 工作台调用链路追踪（JSONL）",
+        parents=[dir_parent],
+    )
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("list", parents=[dir_parent], help="列出追踪目录下的线程（默认行为）")
+    show = sub.add_parser("show", parents=[dir_parent], help="按 run 分组渲染某线程的时间线")
+    show.add_argument("thread_id")
+    show.add_argument("--raw", action="store_true", help="输出 jq-friendly 原文")
+    args = parser.parse_args(argv)
+
+    traces_dir = (getattr(args, "traces_dir", None) or _default_traces_dir()).expanduser().resolve()
+    if args.command == "show":
+        return _cmd_show(traces_dir, args.thread_id, args.raw)
+    return _cmd_list(traces_dir)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
