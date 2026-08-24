@@ -79,6 +79,23 @@ async def test_build_graph_uses_fixed_prompt_and_complete_tool_surface(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_trace_middleware_position_and_disable(monkeypatch, settings, tmp_path):
+    captured = {}
+    compiled = object()
+    monkeypatch.setattr(graph_module, "create_agent", lambda **kwargs: captured.update(kwargs) or compiled)
+    monkeypatch.setattr(graph_module.MultiServerMCPClient, "get_tools", AsyncMock(return_value=[]))
+    settings.trace.enabled = True
+    settings.trace.dir = tmp_path / "traces"
+    await graph_module.build_graph(model=ScriptedChatModel([AIMessage(content="ok")]), settings=settings)
+    assert isinstance(captured["middleware"][0], graph_module.SessionTraceMiddleware)
+    assert isinstance(captured["middleware"][1], SkillsMiddleware)
+    assert isinstance(captured["middleware"][3], HumanInTheLoopMiddleware)
+    settings.trace.enabled = False
+    await graph_module.build_graph(model=ScriptedChatModel([AIMessage(content="ok")]), settings=settings)
+    assert not any(isinstance(m, graph_module.SessionTraceMiddleware) for m in captured["middleware"])
+
+
+@pytest.mark.asyncio
 async def test_duplicate_tool_names_fail_before_agent_creation(monkeypatch, settings):
     monkeypatch.setattr(graph_module.MultiServerMCPClient, "get_tools", AsyncMock(return_value=[duplicate_query_quote]))
     with pytest.raises(RuntimeError, match="query_quote"):

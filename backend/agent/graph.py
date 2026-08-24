@@ -21,6 +21,7 @@ from pydantic import SecretStr
 
 import chat
 from agent.settings import AgentSettings, load_agent_settings
+from agent.session_trace import SessionTraceMiddleware
 from agent.tool_registry import build_builtin_tools
 
 
@@ -57,7 +58,11 @@ async def build_graph(
     mcp_tools = await client.get_tools()
     all_tools = [*builtin_tools, *mcp_tools]
     _require_unique_tool_names(all_tools)
-    middleware = [
+    middleware = []
+    if resolved.trace.enabled:
+        # 追踪中间件置于列表第一位（wrap 链最外层，计时含其余中间件开销）
+        middleware.append(SessionTraceMiddleware(resolved.trace))
+    middleware += [
         SkillsMiddleware(backend=backend, sources=["/"]),
         FilesystemMiddleware(backend=backend, tools=["ls", "read_file"]),
         HumanInTheLoopMiddleware({
