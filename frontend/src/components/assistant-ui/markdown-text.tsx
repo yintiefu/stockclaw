@@ -13,6 +13,7 @@ import { type FC, memo, useState } from "react";
 import { CheckIcon, CopyIcon } from "lucide-react";
 
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
+import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 
 const MarkdownTextImpl = () => {
@@ -60,17 +61,17 @@ const useCopyToClipboard = ({
   const [isCopied, setIsCopied] = useState<boolean>(false);
 
   const copyToClipboard = (value: string) => {
-    if (!value || typeof navigator === "undefined" || !navigator.clipboard) {
+    if (!value) {
       return;
     }
 
-    navigator.clipboard.writeText(value).then(
-      () => {
+    // 非安全上下文（局域网 IP + HTTP）下 navigator.clipboard 不可用，内部有 execCommand 兜底
+    copyText(value).then((ok) => {
+      if (ok) {
         setIsCopied(true);
         setTimeout(() => setIsCopied(false), copiedDuration);
-      },
-      () => {},
-    );
+      }
+    });
   };
 
   return { isCopied, copyToClipboard };

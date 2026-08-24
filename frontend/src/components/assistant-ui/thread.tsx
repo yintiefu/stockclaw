@@ -24,6 +24,7 @@ import {
 } from "@/components/assistant-ui/tool-group";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { Button } from "@/components/ui/button";
+import { copyText } from "@/lib/clipboard";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import {
@@ -60,6 +61,7 @@ import {
 import {
   createContext,
   useContext,
+  useState,
   type ComponentType,
   type FC,
   type PropsWithChildren,
@@ -417,6 +419,35 @@ const AssistantMessage: FC = () => {
   );
 };
 
+const MessageCopyButton: FC = () => {
+  // ActionBarPrimitive.Copy 内部只走 navigator.clipboard，在非安全上下文
+  // （局域网 IP + HTTP 访问）下静默失败，这里自管复制与已复制状态并带兜底。
+  const [copied, setCopied] = useState(false);
+  const message = useAuiState((s) => s.message);
+
+  const handleCopy = async () => {
+    const text = (message.content ?? [])
+      .map((part) => (part.type === "text" ? part.text : ""))
+      .join("")
+      .trim();
+    if (!text) return;
+    if (await copyText(text)) {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 3000);
+    }
+  };
+
+  return (
+    <TooltipIconButton tooltip="复制" onClick={handleCopy}>
+      {copied ? (
+        <CheckIcon className="animate-in zoom-in-50 fade-in duration-200 ease-out" />
+      ) : (
+        <CopyIcon className="animate-in zoom-in-75 fade-in duration-150" />
+      )}
+    </TooltipIconButton>
+  );
+};
+
 const AssistantActionBar: FC = () => {
   return (
     <ActionBarPrimitive.Root
@@ -424,11 +455,7 @@ const AssistantActionBar: FC = () => {
       autohide="not-last"
       className="aui-assistant-action-bar-root text-muted-foreground animate-in fade-in col-start-3 row-start-2 -ms-1 flex gap-1 duration-200"
     >
-      <ActionBarPrimitive.Copy render={<TooltipIconButton tooltip="复制" />}><AuiIf condition={(s) => s.message.isCopied}>
-                      <CheckIcon className="animate-in zoom-in-50 fade-in duration-200 ease-out" />
-                    </AuiIf><AuiIf condition={(s) => !s.message.isCopied}>
-                      <CopyIcon className="animate-in zoom-in-75 fade-in duration-150" />
-                    </AuiIf></ActionBarPrimitive.Copy>
+      <MessageCopyButton />
       <AuiIf condition={(s) => s.thread.capabilities.reload}>
         <ActionBarPrimitive.Reload render={<TooltipIconButton tooltip="重新生成" />}><RefreshCwIcon /></ActionBarPrimitive.Reload>
       </AuiIf>
