@@ -1,8 +1,32 @@
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import path from "node:path";
+
 import { expect, test, type Page } from "@playwright/test";
+
+import { TRACES_ROOT } from "../playwright.config";
 
 test.describe.configure({ mode: "serial" });
 
 const E2E_LANGGRAPH_URL = "http://127.0.0.1:2873";
+
+/** 读取隔离临时根内最新线程的 trace 事件（等待文件出现，由 LangGraph 写入侧落盘）。 */
+async function readTraceEvents(predicate: (events: any[]) => boolean) {
+  await expect(async () => {
+    const files = readdirSync(TRACES_ROOT).filter((name) => name.endsWith(".jsonl"));
+    expect(files.length).toBeGreaterThan(0);
+    const newest = files
+      .map((name) => {
+        const full = path.join(TRACES_ROOT, name);
+        return { full, mtime: statSync(full).mtimeMs };
+      })
+      .sort((a, b) => b.mtime - a.mtime)[0].full;
+    const events = readFileSync(newest, "utf-8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    expect(predicate(events)).toBe(true);
+  }).toPass({ timeout: 15_000 });
+}
 
 async function send(page: Page, text: string) {
   const composer = page.getByLabel("Agent 消息", { exact: true });
@@ -30,11 +54,16 @@ test("native Agent workspace persists threads and handles MCP approval", async (
   await page.getByRole("radio", { name: /批准/ }).check();
   await page.getByRole("button", { name: "提交全部决定" }).click();
   await expect(page.getByText(/MCP 客观结果/)).toBeVisible();
+  await readTraceEvents((events) =>
+    events.some((event) => event.event === "run_start")
+    && events.some((event) => event.event === "tool_call" && event.name === "fixture_echo"));
 
   await send(page, "调用 MCP 并拒绝");
   await page.getByRole("radio", { name: /拒绝/ }).check();
   await page.getByRole("button", { name: "提交全部决定" }).click();
   await expect(page.getByText(/已拒绝/)).toBeVisible();
+  await readTraceEvents((events) =>
+    events.some((event) => event.event === "hitl_reject" && event.name === "fixture_echo"));
 
   await send(page, "启动慢速 MCP 后停止");
   await page.getByRole("radio", { name: /批准/ }).check();

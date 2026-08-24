@@ -11,11 +11,13 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 import chat
 from agent.settings import load_agent_settings
+from agent.session_trace import SessionTraceMiddleware
 from tests.agent.fakes import ScriptedChatModel
 
 
 async def build_fixture_graph():
     settings = load_agent_settings()
+    trace = SessionTraceMiddleware(settings.trace) if settings.trace.enabled else None
     tools = await MultiServerMCPClient(
         settings.mcp_connections(), tool_name_prefix=True,
     ).get_tools()
@@ -32,7 +34,7 @@ async def build_fixture_graph():
     return create_agent(
         model=ScriptedChatModel(replies),
         tools=tools,
-        middleware=[HumanInTheLoopMiddleware({
+        middleware=[*( [trace] if trace else []), HumanInTheLoopMiddleware({
             tool.name: {"allowed_decisions": ["approve", "reject"]}
             for tool in tools
         })],

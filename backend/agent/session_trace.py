@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -268,7 +269,8 @@ class SessionTraceMiddleware(AgentMiddleware):
         return None
 
     async def abefore_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
-        return self.before_agent(state, runtime)
+        # LangGraph Server 会拦截事件循环线程内的阻塞文件 IO，写入必须放到工作线程
+        return await asyncio.to_thread(self.before_agent, state, runtime)
 
     def after_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
         key = self._ids(runtime)
@@ -281,7 +283,7 @@ class SessionTraceMiddleware(AgentMiddleware):
         return None
 
     async def aafter_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
-        return self.after_agent(state, runtime)
+        return await asyncio.to_thread(self.after_agent, state, runtime)
 
     # -- 钩子：模型调用计时 ----------------------------------------------------
 
@@ -310,7 +312,7 @@ class SessionTraceMiddleware(AgentMiddleware):
         key = self._ids(request.runtime)
         started = time.perf_counter()
         result = await handler(request)
-        return self._record_model_call(key, started, result)
+        return await asyncio.to_thread(self._record_model_call, key, started, result)
 
     # -- 钩子：工具调用计时 ----------------------------------------------------
 
@@ -318,6 +320,16 @@ class SessionTraceMiddleware(AgentMiddleware):
         call_id = request.tool_call.get("id")
         if call_id:
             self._executed.setdefault(key, set()).add(str(call_id))
+
+    def _record_tool_error(self, key: tuple[str, str], started: float, request: ToolCallRequest, exc_text: str) -> None:
+        thread_id, run_id = key
+        self._writer.emit(thread_id, build_tool_call(
+            run_id=run_id, seq=self._next_seq(key),
+            name=str(request.tool_call.get("name")),
+            args=request.tool_call.get("args"),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            status="error", result_preview=_text_preview(exc_text), result_chars=len(exc_text),
+        ))
 
     def _record_tool_call(
         self, key: tuple[str, str], started: float, request: ToolCallRequest,
@@ -344,14 +356,7 @@ class SessionTraceMiddleware(AgentMiddleware):
         try:
             result = handler(request)
         except Exception as exc:
-            thread_id, run_id = key
-            self._writer.emit(thread_id, build_tool_call(
-                run_id=run_id, seq=self._next_seq(key),
-                name=str(request.tool_call.get("name")),
-                args=request.tool_call.get("args"),
-                duration_ms=int((time.perf_counter() - started) * 1000),
-                status="error", result_preview=_text_preview(str(exc)), result_chars=len(str(exc)),
-            ))
+            self._record_tool_error(key, started, request, str(exc))
             raise
         return self._record_tool_call(key, started, request, result, "ok")
 
@@ -362,16 +367,10 @@ class SessionTraceMiddleware(AgentMiddleware):
         try:
             result = await handler(request)
         except Exception as exc:
-            thread_id, run_id = key
-            self._writer.emit(thread_id, build_tool_call(
-                run_id=run_id, seq=self._next_seq(key),
-                name=str(request.tool_call.get("name")),
-                args=request.tool_call.get("args"),
-                duration_ms=int((time.perf_counter() - started) * 1000),
-                status="error", result_preview=_text_preview(str(exc)), result_chars=len(str(exc)),
-            ))
+            await asyncio.to_thread(
+                self._record_tool_error, key, started, request, str(exc))
             raise
-        return self._record_tool_call(key, started, request, result, "ok")
+        return await asyncio.to_thread(self._record_tool_call, key, started, request, result, "ok")
 
     # -- 钩子：HITL 拒绝识别 ---------------------------------------------------
 
@@ -400,7 +399,7 @@ class SessionTraceMiddleware(AgentMiddleware):
         return None
 
     async def aafter_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
-        return self.after_model(state, runtime)
+        return await asyncio.to_thread(self.after_model, state, runtime)
 
 
 # ---------------------------------------------------------------------------

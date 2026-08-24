@@ -51,6 +51,8 @@ settings_path.write_text(json.dumps({
             "env": {},
         },
     },
+    # E2E 断言需要 trace 事件；目录必须落在隔离临时根内，绝不写真实用户目录
+    "trace": {"enabled": True, "dir": str(root / "traces")},
 }, ensure_ascii=False), encoding="utf-8")
 settings_path.chmod(0o600)
 

@@ -18,8 +18,14 @@ export const BACKEND_PORT = 8873;
 export const LANGGRAPH_PORT = 2873;
 export const FRONTEND_PORT = 5873;
 
-const dataRoot = mkdtempSync(path.join(os.tmpdir(), "vr-agent-e2e-"));
+// 数据根必须全进程唯一：spec 里 import 本模块会再次执行，靠 env 变量保证
+// worker 进程与 webServer 进程拿到的是同一个根（否则各建各的临时目录）。
+const dataRoot = process.env.VR_E2E_DATA_ROOT
+  ?? mkdtempSync(path.join(os.tmpdir(), "vr-agent-e2e-"));
+process.env.VR_E2E_DATA_ROOT = dataRoot;
 const langGraphRoot = path.join(dataRoot, "langgraph");
+/** 隔离临时根内的 trace 目录（start_langgraph.py 的 settings.trace.dir 指向这里） */
+export const TRACES_ROOT = path.join(langGraphRoot, "traces");
 
 export default defineConfig({
   testDir: "./e2e",

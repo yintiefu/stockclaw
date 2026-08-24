@@ -64,6 +64,7 @@ class LangGraphServerHarness:
                     "env": {},
                 },
             },
+            "trace": {"enabled": True, "dir": str(self.cwd / "traces")},
         }
         path = self.cwd / "settings.json"
         path.write_text(json.dumps(settings, ensure_ascii=False), encoding="utf-8")
