@@ -48,8 +48,10 @@ async function testAskAi() {
   await page.screenshot({ path: shot1, fullPage: false });
   console.log(`✔ Step 1 screenshot captured: ask_ai_step1_drawer_opened.png`);
 
-  // 3. Configure mock LLM in localStorage
+  // 3. Backup & configure mock LLM in localStorage
   console.log("\n4. Configuring LLM in localStorage to test active chat UI...");
+  const savedLlm = await page.evaluate(() => localStorage.getItem("vr-llm"));
+
   await page.evaluate(() => {
     const mockLlm = {
       provider: "deepseek",
@@ -109,6 +111,12 @@ async function testAskAi() {
     await page.screenshot({ path: shot5, fullPage: false });
     console.log(`✔ Step 5 screenshot captured: ask_ai_step5_drawer_closed.png`);
   }
+
+  console.log("\n7. Restoring original localStorage...");
+  await page.evaluate((orig) => {
+    if (orig !== null) localStorage.setItem("vr-llm", orig);
+    else localStorage.removeItem("vr-llm");
+  }, savedLlm);
 
   console.log("\nClosing CDP test tab...");
   await page.close();

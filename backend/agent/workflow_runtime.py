@@ -62,25 +62,33 @@ def is_payload_empty(value: Any) -> bool:
     return False
 
 
+def sanitize_error_string(raw: str) -> str:
+    """严格脱敏错误文本，消除 Bearer 凭据、API Key、内部 IP 及敏感查询参数。"""
+    if not raw:
+        return ""
+    # 替换 Bearer token
+    redacted = re.sub(r"(?i)bearer\s+[A-Za-z0-9_\-\.]+", "Bearer [REDACTED]", raw)
+    # 替换各种常见 API Key 格式
+    redacted = re.sub(r"(?i)(?:key|token|password|secret|apikey|api_key)[\"':= ]+([A-Za-z0-9_\-\.]{6,})", r"key=[REDACTED]", redacted)
+    redacted = re.sub(r"sk-[A-Za-z0-9_\-]{8,}", "[REDACTED_KEY]", redacted)
+    # 替换内部 IP 地址
+    redacted = re.sub(r"\b(?:10|172\.(?:1[6-9]|2[0-9]|3[01])|192\.168)\.\d{1,3}\.\d{1,3}\b", "[INTERNAL_IP]", redacted)
+    # 截短长度防超长 payload
+    if len(redacted) > 200:
+        redacted = redacted[:190] + "...[redacted]"
+    return redacted
+
+
 def redact_workflow_error(
     err: Exception | str,
     stage_id: str | None = None,
     code: str = "EXECUTION_ERROR",
 ) -> WorkflowError:
-    """脱敏错误信息，剔除 API 密钥、内网 IP 与底层敏感信息。"""
-    raw = str(err)
-    # 替换常见 API Key 格式 (如 sk-xxxx, Bearer xxxx)
-    redacted = re.sub(r"(Bearer\s+)[A-Za-z0-9_\-\.]+", r"\1[REDACTED]", raw)
-    redacted = re.sub(r"sk-[A-Za-z0-9_\-]{8,}", "[REDACTED_KEY]", redacted)
-    # 替换内部 IP
-    redacted = re.sub(r"\b(?:10|172\.(?:1[6-9]|2[0-9]|3[01])|192\.168)\.\d{1,3}\.\d{1,3}\b", "[INTERNAL_IP]", redacted)
-    # 截短过长的错误信息
-    if len(redacted) > 300:
-        redacted = redacted[:290] + "...[redacted]"
-
+    """脱敏错误信息并生成严格白名单的 WorkflowError。"""
+    redacted = sanitize_error_string(str(err))
     return WorkflowError(
         code=code,
-        message=redacted,
+        message=redacted or "执行异常",
         stage_id=stage_id,
     )
 
@@ -144,7 +152,8 @@ async def collect_dossier_sections(
                 status = "gap"
                 summary = "数据缺失"
                 body = NO_RECORD_TEXT
-                err_msg = str(raw_result.get("error")) if is_err else "数据为空"
+                raw_err = str(raw_result.get("error")) if is_err else "数据为空"
+                err_msg = sanitize_error_string(raw_err)
         else:
             status = "ok"
             err_msg = None
@@ -265,9 +274,13 @@ async def run_stage(
     emitter: WorkflowEventEmitter | None = None,
     stage_id: str = "",
 ) -> tuple[str, bool]:
-    """流式执行单个阶段模型推理并向 emitter 发送增量事件。"""
+    """流式执行单个阶段模型推理并向 emitter 发送增量事件（硬上限控制）。"""
     buf: list[str] = []
+    current_len = 0
     truncated = False
+    suffix = "...[truncated]"
+    suffix_len = len(suffix)
+    effective_max = max(0, max_chars - suffix_len) if max_chars > suffix_len else max_chars
 
     async for chunk in model.astream(messages):
         piece = chunk.content if isinstance(chunk, BaseMessage) else str(chunk)
@@ -275,14 +288,25 @@ async def run_stage(
             piece = "".join(str(p) for p in piece)
         if not piece:
             continue
+
+        if current_len + len(piece) > effective_max:
+            allowed = max(0, effective_max - current_len)
+            if allowed > 0:
+                buf.append(piece[:allowed])
+                current_len += allowed
+                if emitter and stage_id:
+                    await emitter.emit("stage_delta", stage_id=stage_id, delta=piece[:allowed])
+            truncated = True
+            break
+
         buf.append(piece)
+        current_len += len(piece)
         if emitter and stage_id:
             await emitter.emit("stage_delta", stage_id=stage_id, delta=piece)
 
     full_output = "".join(buf).strip()
-    if len(full_output) > max_chars:
-        full_output = full_output[:max_chars - 15] + "...[truncated]"
-        truncated = True
+    if truncated:
+        full_output = full_output + suffix
 
     return full_output, truncated
 

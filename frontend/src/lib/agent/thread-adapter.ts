@@ -33,13 +33,17 @@ export function createLangGraphThreadAdapter(client: AgentThreadClient): RemoteT
   return {
     async list() {
       const threads = await client.threads.search({ limit: 100, sortBy: "updated_at", sortOrder: "desc" });
-      return { threads: threads.map(toRemote) };
+      // 仅展示工作台会话 (channel: "workspace") 或存量无 channel 会话，隔离 embedded / workflow 会话
+      const filtered = threads.filter((t) => {
+        const ch = metadataOf(t).channel;
+        return ch === "workspace" || !ch;
+      });
+      return { threads: filtered.map(toRemote) };
     },
     async fetch(id) { return toRemote(await client.threads.get(id)); },
     async initialize() {
-      // LangGraph Server 只接受 UUID thread_id，assistant-ui 传入的 __LOCALID_* 必须忽略，
-      // 让服务端分配规范 UUID。
-      const thread = await client.threads.create();
+      // 显式打上 channel: "workspace" 隔离元数据
+      const thread = await client.threads.create({ metadata: { channel: "workspace" } });
       return { remoteId: thread.thread_id, externalId: thread.thread_id };
     },
     async rename(id, title) { await mergeMetadata(client, id, { title }); },

@@ -135,10 +135,12 @@ async function runE2E() {
   console.log("\n==========================================");
   console.log("E2E CDP Test Summary:");
   console.log("==========================================");
-  for (const r of testResults) {
-    console.log(`[${r.status}] ${r.name} (${r.path}) - ${r.duration || 0}ms`);
-  }
   console.log(`Total Errors logged: ${errors.length}`);
+  const hasFailures = testResults.some((r) => r.status === "FAIL");
+  if (hasFailures) {
+    console.error("Some E2E routes failed!");
+    process.exit(1);
+  }
   return testResults;
 }
 

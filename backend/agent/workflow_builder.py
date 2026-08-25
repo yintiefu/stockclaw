@@ -30,6 +30,7 @@ from agent.workflow_loader import (
     SinglePassConfig,
     StagedResearchConfig,
     WorkflowConfig,
+    WorkflowConfigError,
 )
 from agent.workflow_runtime import (
     collect_dossier_sections,
@@ -49,16 +50,15 @@ from agent.workflow_state import (
 
 
 def _load_instruction_text(skill_name: str, instruction_path: str, root: Path) -> str:
-    """读取指定技能的指令文本。"""
-    prefix = skill_name.removeprefix("builtin/")
+    """读取指定技能的指令文本，缺失时快速失败。"""
+    prefix = skill_name.removeprefix("builtin/").removeprefix("/builtin/")
     file_path = root / prefix / instruction_path
-    if not file_path.is_file():
-        # 尝试直接在技能根目录下寻找
-        skill_file = root / prefix / "SKILL.md"
-        if skill_file.is_file():
-            return skill_file.read_text(encoding="utf-8")
-        return ""
-    return file_path.read_text(encoding="utf-8")
+    if file_path.is_file():
+        return file_path.read_text(encoding="utf-8")
+    skill_file = root / prefix / "SKILL.md"
+    if skill_file.is_file():
+        return skill_file.read_text(encoding="utf-8")
+    raise WorkflowConfigError(f"未找到技能指令文件：{file_path} (skill={skill_name}, instruction={instruction_path})")
 
 
 def _build_staged_graph(
@@ -112,6 +112,26 @@ def _build_staged_graph(
         }
 
     builder.add_node("collect_dossier", collect_dossier)
+
+    # 2.5 底稿全空熔断节点
+    async def abort_no_data(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
+        err = WorkflowError(
+            code="NO_SUBSTANTIVE_DATA",
+            message="全部客观数据源抓取失败或为空，分析必须有客观底稿支撑，辩论中止。",
+            stage_id=None,
+        )
+        emitter = WorkflowEventEmitter.from_config(cfg.id, state.get("event_seq", 0), config)
+        await emitter.emit("workflow_failed", workflow_type=cfg.id, error=err)
+        return {
+            "workflow_status": "failed",
+            "result_summary": "多空辩论中止：无客观底稿数据",
+            "result": None,
+            "errors": [err],
+            "event_seq": emitter.last_seq,
+        }
+
+    builder.add_node("abort_no_data", abort_no_data)
+    builder.add_edge("abort_no_data", END)
 
     # 3. 动态注册所有 stage 节点
     for s_cfg in cfg.stages:
@@ -190,6 +210,7 @@ def _build_staged_graph(
                                 completed_at=utc_now(),
                             )
                         },
+                        "context_truncated": _ctx_truncated or truncated,
                         "event_seq": emitter.last_seq,
                     }
                 except Exception as e:
@@ -216,7 +237,10 @@ def _build_staged_graph(
         completed_count = sum(1 for sid in expected_stages if stages.get(sid, StageResult(stage_id=sid, status="pending")).status == "completed")
         failed_count = sum(1 for sid in expected_stages if stages.get(sid, StageResult(stage_id=sid, status="pending")).status == "failed")
 
-        if failed_count > 0 and completed_count == 0:
+        referee_st = stages.get("referee")
+        referee_failed = ("referee" in expected_stages) and (not referee_st or referee_st.status != "completed")
+
+        if referee_failed or (failed_count > 0 and completed_count == 0):
             final_status: WorkflowStatus = "failed"
         elif failed_count > 0:
             final_status = "partial"
@@ -226,11 +250,15 @@ def _build_staged_graph(
         dossier = state.get("dossier")
         missing_count = len(dossier.missing) if dossier else 0
 
-        summary = f"多空辩论完成：{completed_count}/{len(expected_stages)} 阶段完成，{missing_count} 项缺口"
         if final_status == "failed":
-            summary = f"多空辩论失败：{failed_count} 个阶段报错中断"
+            if referee_failed:
+                summary = f"多空辩论失败：中立主持阶段未能正常产出"
+            else:
+                summary = f"多空辩论失败：{failed_count} 个阶段报错中断"
         elif final_status == "partial":
             summary = f"多空辩论部分完成：{completed_count}/{len(expected_stages)} 阶段完成（含错误）"
+        else:
+            summary = f"多空辩论完成：{completed_count}/{len(expected_stages)} 阶段完成，{missing_count} 项缺口"
 
         if len(summary) > 80:
             summary = summary[:77] + "..."
@@ -242,7 +270,6 @@ def _build_staged_graph(
             err = errors[-1] if errors else WorkflowError(code="EXECUTION_FAILED", message="工作流执行失败")
             await emitter.emit("workflow_failed", workflow_type=cfg.id, error=err)
 
-        referee_st = stages.get("referee")
         result_text = referee_st.content if (referee_st and referee_st.status == "completed") else None
 
         return {
@@ -259,11 +286,15 @@ def _build_staged_graph(
     builder.add_edge("validate_input", "collect_dossier")
 
     def route_after_dossier(state: WorkflowState) -> str:
+        dossier = state.get("dossier")
+        if not dossier or not any(s.status == "ok" for s in dossier.sections):
+            return "abort_no_data"
         variant = state.get("variant") or list(cfg.variants.keys())[0]
         v_stages = cfg.variants.get(variant, [])
         return f"start_{v_stages[0]}"
 
     start_targets = {f"start_{s.id}": f"start_{s.id}" for s in cfg.stages}
+    start_targets["abort_no_data"] = "abort_no_data"
     builder.add_conditional_edges("collect_dossier", route_after_dossier, start_targets)
 
     for i, s_cfg in enumerate(cfg.stages):
@@ -347,9 +378,9 @@ def _build_single_pass_graph(
 
     # 3. 运行阶段节点
     async def run_stage_fn(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
-        inp_text = state["input"].get(cfg.input.text_field, "")
-        if len(inp_text) > cfg.input.max_chars:
-            inp_text = inp_text[:cfg.input.max_chars]
+        raw_inp = state["input"].get(cfg.input.text_field, "")
+        inp_truncated = len(raw_inp) > cfg.input.max_chars
+        inp_text = raw_inp[:cfg.input.max_chars] if inp_truncated else raw_inp
 
         policy_text = fixed_system_policy(f"工作流：{cfg.id}")
         messages = [
@@ -378,6 +409,7 @@ def _build_single_pass_graph(
                         completed_at=utc_now(),
                     )
                 },
+                "context_truncated": inp_truncated or truncated,
                 "event_seq": emitter.last_seq,
             }
         except Exception as e:

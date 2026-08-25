@@ -135,4 +135,77 @@ async def test_stage_continue_on_error_routes_to_next_stage(monkeypatch):
     assert res["stages"]["bear"].status == "completed"
     assert res["stages"]["referee"].status == "completed"
     assert len(res["errors"]) >= 1
-    assert res["workflow_status"] in ("completed", "partial")
+    assert res["workflow_status"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_dossier_all_failed_aborts_without_model_calls(monkeypatch):
+    # Simulate all tools failing / empty
+    monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"error": "接口限流或无数据"})
+    cfg = load_workflow_config_from_file(WORKFLOWS_DIR / "debate.yaml", builtin_skills_root=BUILTIN_SKILLS_DIR)
+    model = ScriptedChatModel([AIMessage(content="不应被调用")])
+    graph = build_workflow_graph(cfg, model=model, checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
+
+    res = await graph.ainvoke({"input": {"code": "600519"}, "variant": "standard"}, config={"configurable": {"thread_id": "t-all-fail"}})
+
+    assert res["workflow_status"] == "failed"
+    assert len(model.invocations) == 0, "全部底稿失败时模型不应被调用"
+    assert any(err.code == "NO_SUBSTANTIVE_DATA" for err in res["errors"])
+
+
+@pytest.mark.asyncio
+async def test_referee_failure_fails_entire_workflow(monkeypatch):
+    monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"price": 1800.0, "ok": True})
+    cfg = load_workflow_config_from_file(WORKFLOWS_DIR / "debate.yaml", builtin_skills_root=BUILTIN_SKILLS_DIR)
+
+    class FailingRefereeModel(ScriptedChatModel):
+        async def astream(self, messages, config=None, **kwargs):
+            if len(self.invocations) == 2:  # 3rd invocation (referee) fails
+                self.invocations.append(messages)
+                raise RuntimeError("Referee failed")
+            async for chunk in super().astream(messages, config=config, **kwargs):
+                yield chunk
+
+    model = FailingRefereeModel([
+        AIMessage(content="多方正常"),
+        AIMessage(content="空方正常"),
+    ])
+    graph = build_workflow_graph(cfg, model=model, checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
+
+    res = await graph.ainvoke({"input": {"code": "600519"}, "variant": "standard"}, config={"configurable": {"thread_id": "t-referee-fail"}})
+
+    assert res["workflow_status"] == "failed"
+    assert res["stages"]["referee"].status == "failed"
+    assert res["result"] is None
+
+
+@pytest.mark.asyncio
+async def test_compiled_graph_emits_custom_stream_events(monkeypatch):
+    monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"price": 1800.0, "ok": True})
+    cfg = load_workflow_config_from_file(WORKFLOWS_DIR / "debate.yaml", builtin_skills_root=BUILTIN_SKILLS_DIR)
+    model = ScriptedChatModel([
+        AIMessage(content="多方论点"),
+        AIMessage(content="空方论点"),
+        AIMessage(content="中立主持"),
+    ])
+    graph = build_workflow_graph(cfg, model=model, checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
+
+    custom_events = []
+    async for mode, chunk in graph.astream(
+        {"input": {"code": "600519"}, "variant": "standard"},
+        config={"configurable": {"thread_id": "t-custom-stream"}},
+        stream_mode=["custom", "updates"],
+    ):
+        if mode == "custom":
+            custom_events.append(chunk)
+
+    assert len(custom_events) > 0
+    event_types = [e.get("type") for e in custom_events]
+    assert "workflow_started" in event_types
+    assert "dossier_progress" in event_types
+    assert "dossier_completed" in event_types
+    assert "stage_started" in event_types
+    assert "stage_delta" in event_types
+    assert "stage_completed" in event_types
+    assert "workflow_completed" in event_types
+    assert custom_events[-1]["type"] == "workflow_completed"

@@ -1,3 +1,6 @@
+// 统一工作流流式客户端与自定义事件契约定义。
+// 严格对齐 docs/contracts/workflow-custom-events.json 与后端 workflow_events.py
+
 import { authHeaders, ApiError } from "./api.ts";
 
 export type WorkflowEventType =
@@ -11,89 +14,76 @@ export type WorkflowEventType =
   | "workflow_completed"
   | "workflow_failed";
 
-export interface WorkflowStartedEvent {
-  event: "workflow_started";
+export interface WorkflowError {
+  code: string;
+  message: string;
+  stage_id?: string | null;
+}
+
+export interface BaseWorkflowEvent {
+  type: WorkflowEventType;
+  workflow_id: string;
+  run_id: string;
+  seq: number;
+  emitted_at: string;
+}
+
+export interface WorkflowStartedEvent extends BaseWorkflowEvent {
+  type: "workflow_started";
   workflow_type: string;
   input: Record<string, unknown>;
   variant?: string | null;
-  run_id?: string;
-  seq?: number;
-  created_at?: string;
 }
 
-export interface DossierProgressEvent {
-  event: "dossier_progress";
-  code: string;
-  section: string;
-  status: "ok" | "empty" | "error";
-  missing: boolean;
-  run_id?: string;
-  seq?: number;
-  created_at?: string;
+export interface DossierProgressEvent extends BaseWorkflowEvent {
+  type: "dossier_progress";
+  title: string;
+  section_id: string;
+  tool: string;
+  status: "ok" | "no_record" | "gap";
+  loaded: number;
+  total: number;
 }
 
-export interface DossierCompletedEvent {
-  event: "dossier_completed";
-  code: string;
-  sections: { key: string; title: string; body: string; missing: boolean }[];
-  missing: string[];
-  summary: string;
-  run_id?: string;
-  seq?: number;
-  created_at?: string;
+export interface DossierCompletedEvent extends BaseWorkflowEvent {
+  type: "dossier_completed";
+  section_count: number;
+  missing_count: number;
 }
 
-export interface StageStartedEvent {
-  event: "stage_started";
+export interface StageStartedEvent extends BaseWorkflowEvent {
+  type: "stage_started";
   stage_id: string;
-  run_id?: string;
-  seq?: number;
-  created_at?: string;
 }
 
-export interface StageDeltaEvent {
-  event: "stage_delta";
+export interface StageDeltaEvent extends BaseWorkflowEvent {
+  type: "stage_delta";
   stage_id: string;
   delta: string;
-  run_id?: string;
-  seq?: number;
-  created_at?: string;
 }
 
-export interface StageCompletedEvent {
-  event: "stage_completed";
+export interface StageCompletedEvent extends BaseWorkflowEvent {
+  type: "stage_completed";
   stage_id: string;
-  truncated: boolean;
-  run_id?: string;
-  seq?: number;
-  created_at?: string;
+  truncated?: boolean;
 }
 
-export interface StageFailedEvent {
-  event: "stage_failed";
+export interface StageFailedEvent extends BaseWorkflowEvent {
+  type: "stage_failed";
   stage_id: string;
-  error: { code: string; message: string; details?: unknown };
-  run_id?: string;
-  seq?: number;
-  created_at?: string;
+  error: WorkflowError;
 }
 
-export interface WorkflowCompletedEvent {
-  event: "workflow_completed";
+export interface WorkflowCompletedEvent extends BaseWorkflowEvent {
+  type: "workflow_completed";
   workflow_type: string;
   result_summary: string;
-  run_id?: string;
-  seq?: number;
-  created_at?: string;
 }
 
-export interface WorkflowFailedEvent {
-  event: "workflow_failed";
+export interface WorkflowFailedEvent extends BaseWorkflowEvent {
+  type: "workflow_failed";
   workflow_type: string;
-  error: { code: string; message: string; details?: unknown };
-  run_id?: string;
-  seq?: number;
-  created_at?: string;
+  error: WorkflowError;
 }
 
 export type WorkflowEvent =
@@ -110,74 +100,147 @@ export type WorkflowEvent =
 export function normalizeWorkflowEvent(raw: any): WorkflowEvent {
   if (!raw || typeof raw !== "object") {
     return {
-      event: "stage_delta",
+      type: "stage_delta",
+      workflow_id: "unknown",
+      run_id: "unknown",
+      seq: 0,
+      emitted_at: new Date().toISOString(),
       stage_id: "unknown",
       delta: String(raw ?? ""),
     };
   }
 
-  // 原生自定义事件直接返回
-  if (raw.event && typeof raw.event === "string") {
-    return raw as WorkflowEvent;
-  }
+  const eventType = raw.type || raw.event;
+  if (typeof eventType === "string") {
+    const workflowId = String(raw.workflow_id || raw.workflow_type || "workflow");
+    const runId = String(raw.run_id || "local-run");
+    const seq = typeof raw.seq === "number" ? raw.seq : 0;
+    const emittedAt = String(raw.emitted_at || raw.created_at || new Date().toISOString());
 
-  // 兼容传统 NDJSON 格式
-  const type = raw.type;
-  if (type === "dossier_progress") {
-    return {
-      event: "dossier_progress",
-      code: raw.code || "",
-      section: raw.section || "",
-      status: raw.status || (raw.missing ? "empty" : "ok"),
-      missing: Boolean(raw.missing),
-    };
-  }
-  if (type === "dossier") {
-    return {
-      event: "dossier_completed",
-      code: raw.code || "",
-      sections: raw.sections || [],
-      missing: raw.missing || [],
-      summary: raw.summary || "",
-    };
-  }
-  if (type === "round_start" || type === "start") {
-    return {
-      event: "stage_started",
-      stage_id: raw.role || raw.stage || "main",
-    };
-  }
-  if (type === "delta") {
-    return {
-      event: "stage_delta",
-      stage_id: raw.role || raw.stage || "main",
-      delta: raw.content || raw.delta || "",
-    };
-  }
-  if (type === "round_end") {
-    return {
-      event: "stage_completed",
-      stage_id: raw.role || raw.stage || "main",
-      truncated: Boolean(raw.truncated),
-    };
-  }
-  if (type === "done") {
-    return {
-      event: "workflow_completed",
-      workflow_type: raw.workflow_type || "workflow",
-      result_summary: raw.result_summary || "完成",
-    };
-  }
-  if (type === "error") {
-    return {
-      event: "stage_failed",
-      stage_id: raw.role || "main",
-      error: { code: "ERROR", message: raw.message || "执行错误" },
-    };
+    switch (eventType) {
+      case "workflow_started":
+        return {
+          type: "workflow_started",
+          workflow_id: workflowId,
+          workflow_type: String(raw.workflow_type || workflowId),
+          input: (raw.input && typeof raw.input === "object") ? raw.input : {},
+          variant: raw.variant ?? null,
+          run_id: runId,
+          seq,
+          emitted_at: emittedAt,
+        };
+      case "dossier_progress":
+        return {
+          type: "dossier_progress",
+          workflow_id: workflowId,
+          run_id: runId,
+          seq,
+          emitted_at: emittedAt,
+          title: String(raw.title || raw.section || ""),
+          section_id: String(raw.section_id || raw.section || ""),
+          tool: String(raw.tool || ""),
+          status: raw.status === "no_record" || raw.status === "gap" || raw.status === "ok"
+            ? raw.status
+            : (raw.missing ? "gap" : "ok"),
+          loaded: typeof raw.loaded === "number" ? raw.loaded : 0,
+          total: typeof raw.total === "number" ? raw.total : 0,
+        };
+      case "dossier_completed":
+      case "dossier":
+        return {
+          type: "dossier_completed",
+          workflow_id: workflowId,
+          run_id: runId,
+          seq,
+          emitted_at: emittedAt,
+          section_count: typeof raw.section_count === "number"
+            ? raw.section_count
+            : (Array.isArray(raw.sections) ? raw.sections.length : 0),
+          missing_count: typeof raw.missing_count === "number"
+            ? raw.missing_count
+            : (Array.isArray(raw.missing) ? raw.missing.length : 0),
+        };
+      case "stage_started":
+      case "round_start":
+        return {
+          type: "stage_started",
+          workflow_id: workflowId,
+          run_id: runId,
+          seq,
+          emitted_at: emittedAt,
+          stage_id: String(raw.stage_id || raw.role || raw.stage || "main"),
+        };
+      case "stage_delta":
+      case "delta":
+        return {
+          type: "stage_delta",
+          workflow_id: workflowId,
+          run_id: runId,
+          seq,
+          emitted_at: emittedAt,
+          stage_id: String(raw.stage_id || raw.role || raw.stage || "main"),
+          delta: String(raw.delta || raw.content || raw.text || ""),
+        };
+      case "stage_completed":
+      case "round_end":
+        return {
+          type: "stage_completed",
+          workflow_id: workflowId,
+          run_id: runId,
+          seq,
+          emitted_at: emittedAt,
+          stage_id: String(raw.stage_id || raw.role || raw.stage || "main"),
+          truncated: Boolean(raw.truncated),
+        };
+      case "stage_failed":
+        return {
+          type: "stage_failed",
+          workflow_id: workflowId,
+          run_id: runId,
+          seq,
+          emitted_at: emittedAt,
+          stage_id: String(raw.stage_id || raw.role || "main"),
+          error: {
+            code: String(raw.error?.code || "STAGE_ERROR"),
+            message: String(raw.error?.message || raw.message || "阶段执行异常"),
+            stage_id: raw.stage_id || raw.role || "main",
+          },
+        };
+      case "workflow_completed":
+      case "done":
+        return {
+          type: "workflow_completed",
+          workflow_id: workflowId,
+          run_id: runId,
+          seq,
+          emitted_at: emittedAt,
+          workflow_type: String(raw.workflow_type || workflowId),
+          result_summary: String(raw.result_summary || "执行完成"),
+        };
+      case "workflow_failed":
+      case "error":
+        return {
+          type: "workflow_failed",
+          workflow_id: workflowId,
+          run_id: runId,
+          seq,
+          emitted_at: emittedAt,
+          workflow_type: String(raw.workflow_type || workflowId),
+          error: {
+            code: String(raw.error?.code || "WORKFLOW_FAILED"),
+            message: String(raw.error?.message || raw.message || "工作流执行失败"),
+            stage_id: raw.error?.stage_id || null,
+          },
+        };
+    }
   }
 
   return {
-    event: "stage_delta",
+    type: "stage_delta",
+    workflow_id: "unknown",
+    run_id: "local-run",
+    seq: 0,
+    emitted_at: new Date().toISOString(),
     stage_id: "main",
     delta: raw.content || JSON.stringify(raw),
   };
@@ -206,7 +269,7 @@ export function parseSSEEvents(raw: string): WorkflowEvent[] {
       const dataStr = dataLines.join("\n");
       try {
         const parsed = JSON.parse(dataStr);
-        if (eventName === "custom" || parsed.event) {
+        if (eventName === "custom" || parsed.type || parsed.event) {
           events.push(normalizeWorkflowEvent(parsed));
         }
       } catch {
@@ -222,12 +285,16 @@ export async function* streamWorkflowEvents(
   url: string,
   body: unknown,
   signal?: AbortSignal,
+  headers?: Record<string, string>,
 ): AsyncGenerator<WorkflowEvent> {
+  const isDirectLangGraph = url.includes(":2024") || url.startsWith("/agent-api");
   const resp = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...authHeaders(),
+      // LangGraph Server 不接收 VR_API_KEY，仅在调用 FastAPI 路由时注入 Bearer
+      ...(isDirectLangGraph ? {} : authHeaders()),
+      ...(headers || {}),
     },
     body: JSON.stringify(body),
     signal,
@@ -254,7 +321,7 @@ export async function* streamWorkflowEvents(
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
 
-    // 按行或双换行拆分处理（兼容 NDJSON 与 SSE）
+    // 按行拆分处理（兼容 NDJSON 与 SSE）
     const lines = buffer.split("\n");
     buffer = lines.pop() ?? "";
 

@@ -19,13 +19,12 @@ StageStatus = Literal[
 
 
 class WorkflowError(BaseModel):
-    """工作流执行错误数据结构。"""
+    """工作流执行错误数据结构（严格白名单字段，禁止透传任意未脱敏 details）。"""
     model_config = ConfigDict(extra="forbid")
 
     code: str
     message: str
     stage_id: str | None = None
-    details: dict[str, Any] | None = None
 
 
 class StageResult(BaseModel):
@@ -121,4 +120,5 @@ class WorkflowState(TypedDict, total=False):
     result: str | None
     result_summary: str | None
     errors: Annotated[list[WorkflowError], append_workflow_errors]
+    context_truncated: bool
     event_seq: int

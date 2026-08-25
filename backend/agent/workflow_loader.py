@@ -112,6 +112,8 @@ class StagedResearchConfig(BaseModel):
 
         stage_id_set = set(stage_ids)
         for variant_name, v_stages in self.variants.items():
+            if len(v_stages) != len(set(v_stages)):
+                raise ValueError(f"variant '{variant_name}' 存在重复阶段 ID：{v_stages}")
             for sid in v_stages:
                 if sid not in stage_id_set:
                     raise ValueError(f"variant '{variant_name}' 引用了未定义的阶段：{sid}")
@@ -179,6 +181,13 @@ def _extract_all_strings(obj: Any) -> list[str]:
 def _verify_path_safety(instruction: str, skill_prefix: str, root: Path | None) -> None:
     if ".." in instruction or instruction.startswith("/"):
         raise WorkflowConfigError(f"路径逃逸违规 (Path traversal)：{instruction}")
+    if root is not None:
+        prefix = skill_prefix.removeprefix("builtin/").removeprefix("/builtin/")
+        file_path = root / prefix / instruction
+        if not file_path.is_file():
+            skill_md = root / prefix / "SKILL.md"
+            if not skill_md.is_file():
+                raise WorkflowConfigError(f"引用的内置技能指令文件不存在：{file_path} (skill={skill_prefix}, instruction={instruction})")
 
 
 def validate_workflow_config(
@@ -189,6 +198,8 @@ def validate_workflow_config(
     """严格校验工作流配置字典。"""
     if not isinstance(raw_dict, dict):
         raise WorkflowConfigError("工作流配置必须是字典结构")
+
+    skills_root = builtin_skills_root or BUILTIN_SKILLS_DIR
 
     # 基础元信息检查
     if "schema_version" in raw_dict and raw_dict["schema_version"] != 1:
@@ -208,9 +219,9 @@ def validate_workflow_config(
         except ValidationError as e:
             raise WorkflowConfigError(f"staged_research 配置校验失败：{e}") from e
 
-        # 检查指令路径安全
+        # 检查指令路径安全与真实存在
         for s in cfg.stages:
-            _verify_path_safety(s.instruction, s.skill, builtin_skills_root)
+            _verify_path_safety(s.instruction, s.skill, skills_root)
         return cfg
 
     elif kind == "single_pass":
@@ -219,7 +230,7 @@ def validate_workflow_config(
         except ValidationError as e:
             raise WorkflowConfigError(f"single_pass 配置校验失败：{e}") from e
 
-        _verify_path_safety(cfg.instruction, cfg.skill, builtin_skills_root)
+        _verify_path_safety(cfg.instruction, cfg.skill, skills_root)
         return cfg
 
     else:

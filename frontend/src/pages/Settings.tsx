@@ -75,6 +75,11 @@ export function Settings() {
         <span>API key <b className="text-foreground">只存在你本地浏览器</b>，仅在你提问时发给你自己的后端去调模型，不上传、不进仓库。所有分析由你的模型给出，本产品不校准。</span>
       </div>
 
+      <div className="mb-4 flex items-start gap-2 rounded-lg border border-primary/25 bg-primary/5 p-3 text-xs text-muted-foreground">
+        <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+        <span>统一 LangGraph 工作流图与 Agent 工作台采用服务端静态配置 <code className="rounded bg-muted/50 px-1">~/.vibe-research/agent/settings.json</code>（权限 0600）。页面级「问 AI」与工作流已实现全链路统一流式调度。</span>
+      </div>
+
       {/* 两种接入方式 */}
       <div className="mb-4 grid gap-3 sm:grid-cols-2">
         <GlassCard glow={mode === "subscription"} onClick={() => setMode("subscription")}

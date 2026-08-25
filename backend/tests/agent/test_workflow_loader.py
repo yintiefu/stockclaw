@@ -36,9 +36,9 @@ FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "workflows"
 PRODUCTION_WORKFLOWS_DIR = Path(__file__).resolve().parents[2] / "agent" / "workflows"
 
 
-def test_load_valid_staged_workflow_file(tmp_path: Path) -> None:
+def test_load_valid_staged_workflow_file() -> None:
     path = FIXTURES_DIR / "staged_valid.yaml"
-    cfg = load_workflow_config_from_file(path, builtin_skills_root=tmp_path)
+    cfg = load_workflow_config_from_file(path)
     assert isinstance(cfg, StagedResearchConfig)
     assert cfg.id == "staged_valid"
     assert cfg.kind == "staged_research"
@@ -46,9 +46,9 @@ def test_load_valid_staged_workflow_file(tmp_path: Path) -> None:
     assert "standard" in cfg.variants
 
 
-def test_load_valid_single_pass_file(tmp_path: Path) -> None:
+def test_load_valid_single_pass_file() -> None:
     path = FIXTURES_DIR / "single_pass_valid.yaml"
-    cfg = load_workflow_config_from_file(path, builtin_skills_root=tmp_path)
+    cfg = load_workflow_config_from_file(path)
     assert isinstance(cfg, SinglePassConfig)
     assert cfg.id == "single_pass_valid"
     assert cfg.kind == "single_pass"
@@ -378,3 +378,41 @@ def test_production_skills_contain_neutral_boundaries() -> None:
     assert news_path.exists()
     news_text = news_path.read_text(encoding="utf-8")
     assert "不推荐买卖" in news_text
+
+
+def test_reject_variant_with_duplicate_stages() -> None:
+    doc = {
+        "schema_version": 1,
+        "config_version": 1,
+        "id": "dup_variant",
+        "kind": "staged_research",
+        "input": {"code": {"type": "string"}},
+        "dossier": {
+            "section_chars": 1000,
+            "dossier_summary_chars": 2000,
+            "sections": [{"id": "quote", "tool": "query_quote", "empty_policy": "gap_if_empty"}],
+        },
+        "stages": [
+            {"id": "bull", "skill": "builtin/debate", "instruction": "references/bull.md", "output_chars": 1000, "context_chars": 2000},
+            {"id": "referee", "skill": "builtin/debate", "instruction": "references/referee.md", "output_chars": 1000, "context_chars": 2000},
+        ],
+        "variants": {
+            "standard": ["bull", "bull", "referee"],
+        },
+    }
+    with pytest.raises(WorkflowConfigError, match="存在重复阶段 ID"):
+        validate_workflow_config(doc, workflow_id="dup_variant")
+
+
+def test_reject_nonexistent_skill_file(tmp_path: Path) -> None:
+    doc = {
+        "schema_version": 1,
+        "config_version": 1,
+        "id": "missing_skill_wf",
+        "kind": "single_pass",
+        "skill": "builtin/nonexistent-skill-xyz",
+        "instruction": "SKILL.md",
+        "input": {"text_field": "source", "max_chars": 1000},
+    }
+    with pytest.raises(WorkflowConfigError, match="引用的内置技能指令文件不存在"):
+        validate_workflow_config(doc, workflow_id="missing_skill_wf")

@@ -18,7 +18,7 @@ from langchain.agents import AgentState, create_agent
 from langchain.agents.middleware import ModelRequest, dynamic_prompt
 from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.checkpoint.base import BaseCheckpointSaver
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from agent.model_factory import build_model
 from agent.policy import fixed_system_policy
@@ -26,6 +26,9 @@ from agent.settings import load_agent_settings
 from agent.skill_backends import BUILTIN_SKILLS_DIR
 from agent.tool_registry import build_builtin_tools
 from agent.workflow_events import utc_now
+
+
+MAX_PAGE_CONTEXT_CHARS: int = 40000
 
 
 class PageContextInput(BaseModel):
@@ -36,6 +39,12 @@ class PageContextInput(BaseModel):
     scope_key: str
     source_as_of: str
     content: str
+
+    @model_validator(mode="after")
+    def validate_content_length(self) -> "PageContextInput":
+        if len(self.content) > MAX_PAGE_CONTEXT_CHARS:
+            self.content = self.content[:MAX_PAGE_CONTEXT_CHARS - 15] + "...[truncated]"
+        return self
 
 
 class PageContextSnapshot(BaseModel):
@@ -48,6 +57,12 @@ class PageContextSnapshot(BaseModel):
     content: str
     captured_at: str
     version: int
+
+    @model_validator(mode="after")
+    def validate_snapshot_length(self) -> "PageContextSnapshot":
+        if len(self.content) > MAX_PAGE_CONTEXT_CHARS:
+            self.content = self.content[:MAX_PAGE_CONTEXT_CHARS - 15] + "...[truncated]"
+        return self
 
 
 class AssistantContextRef(BaseModel):

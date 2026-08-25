@@ -4,7 +4,7 @@ import { Sparkles, X, Settings, Send, Loader2, Wrench, AlertCircle, Trash2 } fro
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { cn } from "@/lib/utils";
-import { hasLlm, chatStream, type ChatMsg } from "@/lib/llm";
+import { streamEmbeddedChat } from "@/lib/agent/embedded-client";
 import { ApiError } from "@/lib/api";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
 import { storageGet, storageSet, storageRemove } from "@/lib/storage";
@@ -16,15 +16,15 @@ import { storageGet, storageSet, storageRemove } from "@/lib/storage";
 // 按路由分开存：不同页面的「问 AI」上下文不同（个股页 vs 板块页），
 // 混在一起会把上一页的对话带到下一页，比不存更让人困惑。
 const CHAT_KEY_PREFIX = "vr-askai-chat:";
-// 单页对话上限。localStorage 总配额约 5MB，而一轮研报级回答可能上万字；
-// 不设上限迟早写爆，届时 storageSet 静默失败、用户以为存上了。
 const MAX_PERSISTED_MSGS = 40;
+
+export interface ChatMsg {
+  role: "user" | "assistant" | "system";
+  content: string;
+}
 
 type StoredMsg = ChatMsg & {
   tools?: ToolUse[];
-  // 流式中途被中止、只收到半截的回答。**不落盘、也不进下一轮 history**：
-  // 否则刷新后它会以「完整回答」的身份被喂回模型，后续推理建立在残句上。
-  // UI 仍然显示，用户能看到已经拿到的部分。
   partial?: boolean;
 };
 
@@ -93,13 +93,6 @@ const TOOL_LABEL: Record<string, string> = {
   query_news: "查新闻",
 };
 
-// 数据溯源：把工具调用的关键参数压成一小段（查了哪只/哪些代码）。
-const argStr = (a: Record<string, unknown>): string => {
-  if (Array.isArray(a.codes)) return (a.codes as unknown[]).join(",");
-  if (typeof a.code === "string") return a.code;
-  return "";
-};
-
 interface ToolUse { name: string; arg: string }
 
 // 「问 AI」入口 —— 把当前分栏内容作为上下文，调用户自己配置的模型；
@@ -137,7 +130,7 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI", scope
   chatKeyRef.current = chatKey;
 
   useEffect(() => {
-    if (open) setConfigured(hasLlm());
+    if (open) setConfigured(true);
   }, [open]);
 
   // 换页面/换标的 = 换一份对话（key 变了），把目标 key 已存的读进来。
@@ -183,11 +176,9 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI", scope
     if (!q || loading) return;
     setInput("");
     setErr(null);
-    // 未完成的轮次整轮不进 history（半截回答 + 它的提问）：
-    // 模型会把残句当成自己上一轮的完整发言继续推理，孤立的提问则会被当成待答问题。
+    // 未完成的轮次整轮不进 history（半截回答 + 它的提问）
     const history: ChatMsg[] = [
       ...completeTurns(msgs).map(({ role, content }) => ({ role, content })),
-      { role: "user", content: q },
     ];
     // 先放用户气泡 + 一个空的 assistant 气泡，流式往里填。
     // assistant 气泡**从创建就是 partial**，只有流式正常结束才摘掉这个标记。
@@ -209,10 +200,15 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI", scope
     // 只有仍是「当前这次请求」才允许写 UI——旧请求的迟到 chunk 直接丢弃
     const alive = () => abortRef.current === ac && !ac.signal.aborted;
     try {
-      await chatStream(history, context, {
-        onTool: (tool, args) => { if (alive()) patchLast((msg) => ({ ...msg, tools: [...(msg.tools || []), { name: tool, arg: argStr(args) }] })); },
+      await streamEmbeddedChat({
+        route: pathname,
+        scopeKey,
+        context,
+        message: q,
+        history,
         onDelta: (t) => { if (alive()) patchLast((msg) => ({ ...msg, content: msg.content + t })); },
-      }, ac.signal);
+        signal: ac.signal,
+      });
       // 正常收完：摘掉 partial，这条回答才开始落盘、才进下一轮 history。
       if (alive()) patchLast((msg) => {
         const { partial: _drop, ...rest } = msg;

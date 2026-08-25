@@ -46,13 +46,11 @@ def workflow_error(
     code: str,
     message: str,
     stage_id: str | None = None,
-    details: dict | None = None,
 ) -> WorkflowError:
     return WorkflowError(
         code=code,
         message=message,
         stage_id=stage_id,
-        details=details,
     )
 
 

@@ -102,6 +102,8 @@ WorkflowEventUnion = Annotated[
     Field(discriminator="type"),
 ]
 
+from langgraph.config import get_stream_writer
+
 _EVENT_ADAPTER = TypeAdapter(WorkflowEventUnion)
 
 
@@ -158,7 +160,17 @@ class WorkflowEventEmitter:
         }
         event = validate_workflow_event(data)
         serialized = event.model_dump(mode="json")
+        try:
+            writer = get_stream_writer()
+            if writer:
+                writer(serialized)
+        except Exception:
+            pass
+
         if self._dispatch_fn:
             self._dispatch_fn("workflow", serialized, self._config)
         elif self._config:
-            await adispatch_custom_event("workflow", serialized, config=self._config)
+            try:
+                await adispatch_custom_event("workflow", serialized, config=self._config)
+            except Exception:
+                pass
