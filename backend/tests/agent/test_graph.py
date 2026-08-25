@@ -11,15 +11,18 @@ from langchain.agents import create_agent as real_create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.skills import SkillsMiddleware
 from pydantic import SecretStr
 
-import chat
 import tools as legacy_tools
 from agent import graph as graph_module
+from agent.model_factory import build_model
+from agent.policy import fixed_system_policy
+from agent.reasoning_model import ReasoningChatOpenAI
 from agent.settings import AgentSettings
 from tests.agent.fakes import ScriptedChatModel
 
@@ -62,13 +65,22 @@ def duplicate_query_quote(codes: list[str]) -> str:
 async def test_build_graph_uses_fixed_prompt_and_complete_tool_surface(monkeypatch, settings):
     captured = {}
     compiled = object()
+    model_factory_calls = []
+
+    def mock_build_model(s):
+        model_factory_calls.append(s)
+        return ScriptedChatModel([AIMessage(content="客观回复")])
+
     monkeypatch.setattr(graph_module, "create_agent", lambda **kwargs: captured.update(kwargs) or compiled)
+    monkeypatch.setattr(graph_module, "build_model", mock_build_model)
     monkeypatch.setattr(graph_module.MultiServerMCPClient, "get_tools", AsyncMock(return_value=[fixture_echo]))
-    model = ScriptedChatModel([AIMessage(content="客观回复")])
-    assert await graph_module.build_graph(model=model, settings=settings) is compiled
-    assert captured["system_prompt"] == chat.SYSTEM_PROMPT.format(context="Agent 工作台")
+
+    assert await graph_module.build_graph(model=None, settings=settings) is compiled
+    assert len(model_factory_calls) == 1
+    assert captured["system_prompt"] == fixed_system_policy("Agent 工作台")
     assert {tool_.name for tool_ in captured["tools"]} == {*legacy_tools.TOOL_NAMES, "fixture_echo"}
     assert isinstance(captured["middleware"][0], SkillsMiddleware)
+    assert captured["middleware"][0].sources == ["/builtin/", "/user/"]
     assert isinstance(captured["middleware"][1], FilesystemMiddleware)
     assert [tool_.name for tool_ in captured["middleware"][1].tools] == ["ls", "read_file"]
     exposed = {tool_.name for tool_ in captured["tools"]}
@@ -104,19 +116,19 @@ async def test_duplicate_tool_names_fail_before_agent_creation(monkeypatch, sett
 
 def test_model_is_streaming_serial_and_secret_safe(settings):
     with pytest.warns(UserWarning, match="transferred to model_kwargs"):
-        model = graph_module._build_model(settings)
+        model = build_model(settings)
     assert model.model_kwargs["parallel_tool_calls"] is False
     assert model.streaming is True
     assert isinstance(model.openai_api_key, SecretStr)
     assert "test-secret-never-send" not in repr(model)
-    assert type(model) is graph_module.ChatOpenAI  # thinking 关闭时用原生类
+    assert type(model) is ChatOpenAI  # thinking 关闭时用原生类
 
 
 def test_model_thinking_uses_reasoning_subclass(settings):
     settings.model.thinking = True
     with pytest.warns(UserWarning, match="transferred to model_kwargs"):
-        model = graph_module._build_model(settings)
-    assert isinstance(model, graph_module.ReasoningChatOpenAI)
+        model = build_model(settings)
+    assert isinstance(model, ReasoningChatOpenAI)
     assert model.extra_body == {"thinking": {"type": "enabled"}}
 
 
@@ -206,14 +218,14 @@ async def test_skills_are_metadata_first_read_only_and_root_confined(monkeypatch
     monkeypatch.setattr(graph_module.MultiServerMCPClient, "get_tools", AsyncMock(return_value=[]))
     model = ScriptedChatModel([
         AIMessage(content="", tool_calls=[{
-            "id": "read-skill", "name": "read_file", "args": {"file_path": "/research/SKILL.md"},
+            "id": "read-skill", "name": "read_file", "args": {"file_path": "/user/research/SKILL.md"},
         }]),
         AIMessage(content="", tool_calls=[{
             "id": "read-reference", "name": "read_file",
-            "args": {"file_path": "/research/references/checklist.md"},
+            "args": {"file_path": "/user/research/references/checklist.md"},
         }]),
         AIMessage(content="", tool_calls=[{
-            "id": "escape-root", "name": "read_file", "args": {"file_path": "/../outside-secret.txt"},
+            "id": "escape-root", "name": "read_file", "args": {"file_path": "/user/../outside-secret.txt"},
         }]),
         AIMessage(content="完成"),
     ])
@@ -222,6 +234,7 @@ async def test_skills_are_metadata_first_read_only_and_root_confined(monkeypatch
 
     system_text = "\n".join(str(message.content) for message in model.invocations[0] if isinstance(message, SystemMessage))
     assert "research" in system_text and "客观核验步骤" in system_text
+    assert "stock-analysis" in system_text
     assert "FULL_SKILL_BODY_MARKER" not in system_text
     assert "REFERENCE_MARKER" not in system_text
     assert any(

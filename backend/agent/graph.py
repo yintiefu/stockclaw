@@ -9,40 +9,19 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from deepagents.backends import FilesystemBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.skills import SkillsMiddleware
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_openai import ChatOpenAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from pydantic import SecretStr
 
-import chat
-from agent.reasoning_model import ReasoningChatOpenAI
-from agent.settings import AgentSettings, load_agent_settings
+from agent.model_factory import build_model
+from agent.policy import fixed_system_policy
 from agent.session_trace import SessionTraceMiddleware
+from agent.settings import AgentSettings, load_agent_settings
+from agent.skill_backends import BUILTIN_SKILLS_DIR, build_skill_backend
 from agent.tool_registry import build_builtin_tools
-
-
-def _build_model(settings: AgentSettings) -> ChatOpenAI:
-    model = settings.model
-    # thinking 开启时换用保留 reasoning_content 的子类，并带上游思考参数；
-    # 默认关闭，避免不知不觉多耗 output tokens。
-    model_cls = ReasoningChatOpenAI if model.thinking else ChatOpenAI
-    extra_kwargs: dict[str, Any] = {}
-    if model.thinking:
-        extra_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-    return model_cls(
-        model=model.name,
-        base_url=model.base_url.rstrip("/"),
-        api_key=SecretStr(model.api_key.get_secret_value()),
-        temperature=model.temperature,
-        streaming=True,
-        parallel_tool_calls=False,
-        **extra_kwargs,
-    )
 
 
 def _require_unique_tool_names(tools: list[Any]) -> None:
@@ -60,7 +39,7 @@ async def build_graph(
     settings: AgentSettings | None = None,
 ):
     resolved = settings or load_agent_settings()
-    backend = FilesystemBackend(root_dir=resolved.skills.path)
+    backend = build_skill_backend(BUILTIN_SKILLS_DIR, resolved.skills.path)
     client = MultiServerMCPClient(resolved.mcp_connections(), tool_name_prefix=True)
     builtin_tools = build_builtin_tools()
     mcp_tools = await client.get_tools()
@@ -71,7 +50,7 @@ async def build_graph(
         # 追踪中间件置于列表第一位（wrap 链最外层，计时含其余中间件开销）
         middleware.append(SessionTraceMiddleware(resolved.trace))
     middleware += [
-        SkillsMiddleware(backend=backend, sources=["/"]),
+        SkillsMiddleware(backend=backend, sources=["/builtin/", "/user/"]),
         FilesystemMiddleware(backend=backend, tools=["ls", "read_file"]),
         HumanInTheLoopMiddleware({
             tool.name: {"allowed_decisions": ["approve", "reject"]}
@@ -79,10 +58,10 @@ async def build_graph(
         }),
     ]
     return create_agent(
-        model=model or _build_model(resolved),
+        model=model or build_model(resolved),
         tools=all_tools,
         middleware=middleware,
-        system_prompt=chat.SYSTEM_PROMPT.format(context="Agent 工作台"),
+        system_prompt=fixed_system_policy("Agent 工作台"),
     )
 
 
