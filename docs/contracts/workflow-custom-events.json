@@ -1,0 +1,95 @@
+[
+  {
+    "type": "workflow_started",
+    "workflow_id": "debate",
+    "workflow_type": "debate",
+    "run_id": "run-001",
+    "seq": 1,
+    "emitted_at": "2026-08-25T12:00:00Z",
+    "input": { "code": "600519" },
+    "variant": "standard"
+  },
+  {
+    "type": "dossier_progress",
+    "workflow_id": "debate",
+    "run_id": "run-001",
+    "seq": 2,
+    "emitted_at": "2026-08-25T12:00:01Z",
+    "title": "实时行情",
+    "section_id": "quote",
+    "tool": "query_quote",
+    "status": "ok",
+    "loaded": 1,
+    "total": 13
+  },
+  {
+    "type": "dossier_completed",
+    "workflow_id": "debate",
+    "run_id": "run-001",
+    "seq": 3,
+    "emitted_at": "2026-08-25T12:00:05Z",
+    "section_count": 13,
+    "missing_count": 0
+  },
+  {
+    "type": "stage_started",
+    "workflow_id": "debate",
+    "run_id": "run-001",
+    "seq": 4,
+    "emitted_at": "2026-08-25T12:00:06Z",
+    "stage_id": "bull"
+  },
+  {
+    "type": "stage_delta",
+    "workflow_id": "debate",
+    "run_id": "run-001",
+    "seq": 5,
+    "emitted_at": "2026-08-25T12:00:07Z",
+    "stage_id": "bull",
+    "delta": "多方论点开始"
+  },
+  {
+    "type": "stage_completed",
+    "workflow_id": "debate",
+    "run_id": "run-001",
+    "seq": 6,
+    "emitted_at": "2026-08-25T12:00:10Z",
+    "stage_id": "bull",
+    "truncated": false
+  },
+  {
+    "type": "stage_failed",
+    "workflow_id": "debate",
+    "run_id": "run-001",
+    "seq": 7,
+    "emitted_at": "2026-08-25T12:00:12Z",
+    "stage_id": "bear",
+    "error": {
+      "code": "MODEL_TIMEOUT",
+      "message": "模型响应超时",
+      "stage_id": "bear"
+    }
+  },
+  {
+    "type": "workflow_completed",
+    "workflow_id": "debate",
+    "workflow_type": "debate",
+    "run_id": "run-001",
+    "seq": 8,
+    "emitted_at": "2026-08-25T12:00:20Z",
+    "result_summary": "多空辩论完成：3 阶段完成，13 项底稿正常"
+  },
+  {
+    "type": "workflow_failed",
+    "workflow_id": "debate",
+    "workflow_type": "debate",
+    "run_id": "run-001",
+    "seq": 9,
+    "emitted_at": "2026-08-25T12:00:22Z",
+    "error": {
+      "code": "EXECUTION_ABORTED",
+      "message": "阶段失败导致工作流中断",
+      "stage_id": "referee"
+    }
+  }
+]
