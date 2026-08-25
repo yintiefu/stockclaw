@@ -1,0 +1,41 @@
+schema_version: 1
+config_version: 1
+id: staged_valid
+kind: staged_research
+input:
+  code:
+    type: string
+    pattern: "^[0-9]{6}$"
+dossier:
+  section_chars: 1800
+  dossier_summary_chars: 6000
+  sections:
+    - id: quote
+      tool: query_quote
+      args:
+        codes: ["${input.code}"]
+      empty_policy: gap_if_empty
+stages:
+  - id: bull
+    skill: builtin/debate
+    instruction: references/bull.md
+    on_error: continue
+    output_chars: 1200
+    context_chars: 24000
+  - id: bear
+    skill: builtin/debate
+    instruction: references/bear.md
+    on_error: continue
+    output_chars: 1200
+    context_chars: 24000
+  - id: referee
+    skill: builtin/debate
+    instruction: references/referee.md
+    on_error: fail
+    output_chars: 1200
+    context_chars: 24000
+variants:
+  standard:
+    - bull
+    - bear
+    - referee

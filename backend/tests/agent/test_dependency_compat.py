@@ -37,6 +37,7 @@ EXPECTED_AGENT_VERSIONS = {
     "deepagents": "0.7.7",
     "langchain-anthropic": "1.5.4",
     "langchain-google-genai": "4.3.1",
+    "PyYAML": "6.0.2",
 }
 
 
