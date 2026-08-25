@@ -8,7 +8,8 @@ import { GlassCard } from "@/components/ui/GlassCard";
 import { AskAiButton } from "@/components/ui/AskAiButton";
 import { Disclaimer } from "@/components/ui/Disclaimer";
 import { api, ApiError, type IndexQuote, type Quote, type MarketOverview, type ShortTermEmotion, type TurnoverTop, type GlobalIndex } from "@/lib/api";
-import { hasLlm, chatStream } from "@/lib/llm";
+import { hasLlm } from "@/lib/llm";
+import { dailyReviewStream } from "@/lib/agents";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
 import { loadWatch, saveWatch, addCodes } from "@/lib/watchlist";
 import { cn } from "@/lib/utils";
@@ -92,13 +93,10 @@ export function DailyReview() {
     if (!hasLlm()) { setNeedConfig(true); return; }
     setReviewLoading(true);
     setReview("");
-    const prompt =
-      `以下是今天 A 股大盘的客观数据：\n${dataSummary}\n\n` +
-      "请用中文做一段当天大盘复盘：整体涨跌、主要指数表现、盘面值得注意的点。" +
-      "只做客观陈述与多视角分析，不预测涨跌、不推荐任何标的、不构成投资建议。";
     try {
-      await chatStream([{ role: "user", content: prompt }], `今日大盘数据：${dataSummary}`, {
+      await dailyReviewStream(dataSummary, today, {
         onDelta: (t) => setReview((r) => r + t),
+        onError: (err) => setReviewErr(err),
       });
     } catch (e) {
       setReviewErr(e instanceof ApiError ? e.message : "复盘失败");

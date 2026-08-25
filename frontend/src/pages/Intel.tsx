@@ -8,8 +8,9 @@ import { GlassCard } from "@/components/ui/GlassCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
 import { api, ApiError, type RadarData, type Industry, type Announcement, type NewsItem } from "@/lib/api";
+import { hasLlm } from "@/lib/llm";
+import { newsDigestStream } from "@/lib/agents";
 import { loadWatch } from "@/lib/watchlist";
-import { hasLlm, chatStream } from "@/lib/llm";
 import { cn } from "@/lib/utils";
 
 const TABS = [
@@ -48,13 +49,11 @@ function InvestmentNewsPanel() {
     if (!hasLlm()) { setDigests((d) => ({ ...d, [ind.key]: { needKey: true } })); return; }
     setDigests((d) => ({ ...d, [ind.key]: { loading: true } }));
     const ctx = ind.items.slice(0, 25).map((it) => `[${it.time}] ${it.source}｜${it.zh || it.title}`).join("\n");
-    const prompt =
-      `以下是「${ind.name}」赛道近期资讯。请提炼「今日要点」3-5 条：每条一句话（≤40 字），` +
-      `只客观陈述重要事件 / 趋势，不推荐标的、不预测涨跌、不构成建议。直接用「- 」列点，不要多余前后缀。\n\n${ctx}`;
     try {
       let acc = "";
-      await chatStream([{ role: "user", content: prompt }], `${ind.name}赛道资讯`, {
+      await newsDigestStream(ctx, {
         onDelta: (t) => { acc += t; setDigests((d) => ({ ...d, [ind.key]: { text: acc } })); },
+        onError: (err) => { setDigests((d) => ({ ...d, [ind.key]: { err } })); },
       });
     } catch (e) {
       setDigests((d) => ({ ...d, [ind.key]: { err: e instanceof ApiError ? e.message : "生成失败" } }));

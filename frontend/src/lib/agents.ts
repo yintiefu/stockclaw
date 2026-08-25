@@ -1,5 +1,5 @@
-// 多 agent 能力的前端客户端：多空辩论 + 反思审计。
-// 两者都走后端 NDJSON 流；模型配置沿用「接入 AI」里存的那一份（用户自己的 key / 本机 CLI）。
+// 多 agent 与工作流能力的前端客户端：多空辩论 + 反思审计 + 每日复盘 + 资讯摘要。
+// 统一走后端流式端点，模型配置沿用「接入 AI」里存的那一份。
 
 import { ApiError } from "@/lib/api";
 import { loadLlm } from "@/lib/llm";
@@ -76,6 +76,44 @@ export async function reflectStream(
 ): Promise<void> {
   const llm = requireLlm();
   await streamNdjson("/api/reflect", { source, title, llm }, (ev) => {
+    if (ev.type === "status") handlers.onStatus?.(ev.message);
+    else if (ev.type === "delta") handlers.onDelta?.(ev.text);
+    else if (ev.type === "done") handlers.onDone?.(ev.content, !!ev.truncated);
+    else if (ev.type === "error") handlers.onError?.(ev.message);
+  }, signal);
+}
+
+export interface ReviewHandlers {
+  onStatus?: (message: string) => void;
+  onDelta?: (text: string) => void;
+  onDone?: (content: string, truncated: boolean) => void;
+  onError?: (message: string) => void;
+}
+
+/** 执行每日复盘工作流。 */
+export async function dailyReviewStream(
+  summary: string,
+  date: string = "",
+  handlers: ReviewHandlers = {},
+  signal?: AbortSignal,
+): Promise<void> {
+  const llm = requireLlm();
+  await streamNdjson("/api/daily-review", { summary, date, llm }, (ev) => {
+    if (ev.type === "status") handlers.onStatus?.(ev.message);
+    else if (ev.type === "delta") handlers.onDelta?.(ev.text);
+    else if (ev.type === "done") handlers.onDone?.(ev.content, !!ev.truncated);
+    else if (ev.type === "error") handlers.onError?.(ev.message);
+  }, signal);
+}
+
+/** 执行新闻摘要工作流。 */
+export async function newsDigestStream(
+  newsText: string,
+  handlers: ReviewHandlers = {},
+  signal?: AbortSignal,
+): Promise<void> {
+  const llm = requireLlm();
+  await streamNdjson("/api/news-digest", { news_text: newsText, llm }, (ev) => {
     if (ev.type === "status") handlers.onStatus?.(ev.message);
     else if (ev.type === "delta") handlers.onDelta?.(ev.text);
     else if (ev.type === "done") handlers.onDone?.(ev.content, !!ev.truncated);
