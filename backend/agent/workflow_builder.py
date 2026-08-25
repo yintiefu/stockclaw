@@ -55,9 +55,6 @@ def _load_instruction_text(skill_name: str, instruction_path: str, root: Path) -
     file_path = root / prefix / instruction_path
     if file_path.is_file():
         return file_path.read_text(encoding="utf-8")
-    skill_file = root / prefix / "SKILL.md"
-    if skill_file.is_file():
-        return skill_file.read_text(encoding="utf-8")
     raise WorkflowConfigError(f"未找到技能指令文件：{file_path} (skill={skill_name}, instruction={instruction_path})")
 
 
@@ -162,10 +159,16 @@ def _build_staged_graph(
                 dossier_sections = dossier.sections if dossier else []
                 dossier_missing = dossier.missing if dossier else []
 
+                # 严格实施提示词上下文总预算控制 (Hard Prompt Budgeting)
+                total_budget = min(stage_config.context_chars, HARD_LIMITS["stage_context_chars"])
+                facts_budget = total_budget // 2
+                context_budget = total_budget - facts_budget
+
                 if sid == "referee":
-                    facts_text = summarize_dossier(dossier_sections, dossier_missing, stage_config.context_chars)
+                    facts_text = summarize_dossier(dossier_sections, dossier_missing, facts_budget)
                 else:
-                    facts_text = format_full_dossier_text(dossier_sections, dossier_missing, code)
+                    full_facts = format_full_dossier_text(dossier_sections, dossier_missing, code)
+                    facts_text = full_facts[:facts_budget] if len(full_facts) > facts_budget else full_facts
 
                 # 计算前序阶段上下文
                 variant = state.get("variant") or list(cfg.variants.keys())[0]
@@ -179,7 +182,7 @@ def _build_staged_graph(
                 context_text, _ctx_truncated = serialize_stage_context(
                     state.get("stages", {}),
                     preceding_ids,
-                    stage_config.context_chars,
+                    context_budget,
                 )
 
                 policy_text = fixed_system_policy(f"工作流：{cfg.id} · 阶段：{sid}")

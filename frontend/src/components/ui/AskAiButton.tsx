@@ -4,7 +4,7 @@ import { Sparkles, X, Settings, Send, Loader2, Wrench, AlertCircle, Trash2 } fro
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { cn } from "@/lib/utils";
-import { streamEmbeddedChat } from "@/lib/agent/embedded-client";
+import { streamEmbeddedChat, clearEmbeddedThread } from "@/lib/agent/embedded-client";
 import { ApiError } from "@/lib/api";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
 import { storageGet, storageSet, storageRemove } from "@/lib/storage";
@@ -158,6 +158,7 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI", scope
     setLoading(false);
     setErr(null);
     setMsgs([]);          // saveChat 见空数组会 storageRemove，不留空壳
+    clearEmbeddedThread(pathname, scopeKey).catch(() => {});
   };
 
   const close = () => {

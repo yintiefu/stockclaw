@@ -62,14 +62,22 @@ export async function getOrCreateEmbeddedThread(route: string, scopeKey?: string
   return thread.thread_id;
 }
 
-export function clearEmbeddedThread(route: string, scopeKey?: string): void {
+export async function clearEmbeddedThread(route: string, scopeKey?: string): Promise<void> {
   const key = getThreadStorageKey(route, scopeKey);
+  const existingThreadId = storageGet(key);
   storageRemove(key);
+  if (existingThreadId) {
+    try {
+      await langGraphClient.threads.delete(existingThreadId);
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 /** 流式向 embedded_agent 发送提问并接收回答。 */
 export async function streamEmbeddedChat(options: AskAiStreamOptions): Promise<string> {
-  const { route, scopeKey = "", context, message, history = [], onDelta, onComplete, signal } = options;
+  const { route, scopeKey = "", context, message, onDelta, onComplete, signal } = options;
 
   const threadId = await getOrCreateEmbeddedThread(route, scopeKey);
   const apiUrl = resolveAgentApiUrl();
@@ -82,15 +90,10 @@ export async function streamEmbeddedChat(options: AskAiStreamOptions): Promise<s
     content: context,
   };
 
-  const messagesPayload = [
-    ...history.map((h) => ({ role: h.role, content: h.content })),
-    { role: "user", content: message },
-  ];
-
   const payload = {
     assistant_id: "embedded_agent",
     input: {
-      messages: messagesPayload,
+      messages: [{ role: "user", content: message }],
       page_context: pageContext,
     },
     stream_mode: ["messages", "updates"],

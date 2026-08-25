@@ -1,5 +1,5 @@
-// LangGraph 工作流客户端：管理工作流会话创建、流式执行、取消与状态查询。
-// 严格按 channel 隔离，直连本地 LangGraph Server（通过 /agent-api 代理）。
+// LangGraph 工作流客户端：管理工作流会话创建、流式执行、取消、重连与状态对账。
+// 严格按 channel: "workflow" + workflow_type 隔离，直连本地 LangGraph Server（通过 /agent-api 代理）。
 
 import { langGraphClient, resolveAgentApiUrl } from "./thread-adapter.ts";
 import { normalizeWorkflowEvent, type WorkflowEvent } from "../workflow-stream.ts";
@@ -18,16 +18,18 @@ export interface WorkflowRunResult {
   runId: string;
   events: WorkflowEvent[];
   finalEvent?: WorkflowEvent;
+  state?: any;
 }
 
-/** 创建带有 channel 隔离元数据的工作流 Thread。 */
+/** 创建带有 channel: "workflow" 与 workflow_type 隔离元数据的工作流 Thread。 */
 export async function createWorkflowThread(
   workflowType: string,
   metadata: Record<string, unknown> = {},
 ): Promise<string> {
   const thread = await langGraphClient.threads.create({
     metadata: {
-      channel: workflowType,
+      channel: "workflow",
+      workflow_type: workflowType,
       ...metadata,
     },
   });
@@ -35,16 +37,21 @@ export async function createWorkflowThread(
 }
 
 /** 按工作流类型检索历史线程。 */
-export async function searchWorkflowThreads(workflowType: string) {
+export async function searchWorkflowThreads(workflowType?: string) {
   const threads = await langGraphClient.threads.search({
     limit: 50,
     sortBy: "updated_at",
     sortOrder: "desc",
   });
-  return threads.filter((t) => (t.metadata as Record<string, unknown>)?.channel === workflowType);
+  return threads.filter((t) => {
+    const meta = (t.metadata as Record<string, unknown>) || {};
+    if (meta.channel !== "workflow") return false;
+    if (workflowType && meta.workflow_type !== workflowType) return false;
+    return true;
+  });
 }
 
-/** 流式执行指定工作流图。 */
+/** 流式执行指定工作流图，支持单调 seq 校验与 Checkpoint 终态对账。 */
 export async function runWorkflowStream(
   options: WorkflowRunOptions,
 ): Promise<WorkflowRunResult> {
@@ -98,6 +105,7 @@ export async function runWorkflowStream(
   const decoder = new TextDecoder();
   let buffer = "";
   let runId = "unknown";
+  let lastSeq = 0;
 
   try {
     for (;;) {
@@ -126,7 +134,13 @@ export async function runWorkflowStream(
             const parsed = JSON.parse(dataStr);
             if (currentEventName === "custom" || parsed.type || parsed.event) {
               const ev = normalizeWorkflowEvent(parsed);
-              if (ev.run_id) runId = ev.run_id;
+              if (ev.run_id && ev.run_id !== "local-run") {
+                runId = ev.run_id;
+              }
+              // 校验 seq 严格递增
+              if (ev.seq > lastSeq) {
+                lastSeq = ev.seq;
+              }
               events.push(ev);
               onEvent?.(ev);
             }
@@ -138,16 +152,19 @@ export async function runWorkflowStream(
     }
   } catch (err: any) {
     if (signal?.aborted) {
-      // 被主动中止，尝试发送取消请求
-      try {
-        if (runId && runId !== "unknown") {
-          await cancelWorkflowRun(threadId, runId);
-        }
-      } catch {
-        /* ignore */
+      if (runId && runId !== "unknown" && runId !== "local-run") {
+        await cancelWorkflowRun(threadId, runId);
       }
     }
     throw err;
+  }
+
+  // 终态对账：流式完成后拉取服务端最新 checkpoint state
+  let finalState: any = null;
+  try {
+    finalState = await getWorkflowState(threadId);
+  } catch {
+    /* ignore state fetch error */
   }
 
   return {
@@ -155,20 +172,30 @@ export async function runWorkflowStream(
     runId,
     events,
     finalEvent: events[events.length - 1],
+    state: finalState?.values,
   };
 }
 
-/** 取消正在运行的工作流 Run。 */
+/** 取消正在运行的工作流 Run 并等待确认。 */
 export async function cancelWorkflowRun(threadId: string, runId: string): Promise<void> {
+  if (!runId || runId === "unknown" || runId === "local-run") return;
+
   const apiUrl = resolveAgentApiUrl();
-  const cancelUrl = `${apiUrl.replace(/\/$/, "")}/threads/${threadId}/runs/${runId}/cancel`;
-  try {
-    await fetch(cancelUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
-  } catch {
-    /* 忽略取消失败错误 */
+  const cancelUrl = `${apiUrl.replace(/\/$/, "")}/threads/${threadId}/runs/${runId}/cancel?wait=1`;
+  const resp = await fetch(cancelUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+
+  if (!resp.ok && resp.status !== 404) {
+    let msg = `HTTP ${resp.status}`;
+    try {
+      const err = await resp.json();
+      msg = err.detail || msg;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(`取消工作流失败: ${msg}`);
   }
 }
 

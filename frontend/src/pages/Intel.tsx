@@ -8,7 +8,6 @@ import { GlassCard } from "@/components/ui/GlassCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
 import { api, ApiError, type RadarData, type Industry, type Announcement, type NewsItem } from "@/lib/api";
-import { hasLlm } from "@/lib/llm";
 import { newsDigestStream } from "@/lib/agents";
 import { loadWatch } from "@/lib/watchlist";
 import { cn } from "@/lib/utils";
@@ -46,7 +45,6 @@ function InvestmentNewsPanel() {
   const hasData = !!data?.generated_at;
 
   const genDigest = async (ind: Industry) => {
-    if (!hasLlm()) { setDigests((d) => ({ ...d, [ind.key]: { needKey: true } })); return; }
     setDigests((d) => ({ ...d, [ind.key]: { loading: true } }));
     const ctx = ind.items.slice(0, 25).map((it) => `[${it.time}] ${it.source}｜${it.zh || it.title}`).join("\n");
     try {
@@ -62,7 +60,6 @@ function InvestmentNewsPanel() {
 
   // 一键提炼全部赛道要点（串行，带进度；单赛道按需的按钮仍保留）
   const genAll = async () => {
-    if (!hasLlm()) { if (cur) setDigests((d) => ({ ...d, [cur.key]: { needKey: true } })); return; }
     const targets = industries.filter((i) => i.items.length > 0);
     setBulk({ running: true, done: 0, total: targets.length });
     for (const ind of targets) {

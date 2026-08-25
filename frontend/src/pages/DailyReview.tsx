@@ -8,7 +8,6 @@ import { GlassCard } from "@/components/ui/GlassCard";
 import { AskAiButton } from "@/components/ui/AskAiButton";
 import { Disclaimer } from "@/components/ui/Disclaimer";
 import { api, ApiError, type IndexQuote, type Quote, type MarketOverview, type ShortTermEmotion, type TurnoverTop, type GlobalIndex } from "@/lib/api";
-import { hasLlm } from "@/lib/llm";
 import { dailyReviewStream } from "@/lib/agents";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
 import { loadWatch, saveWatch, addCodes } from "@/lib/watchlist";
@@ -90,7 +89,6 @@ export function DailyReview() {
   const runReview = async () => {
     setReviewErr(null);
     setNeedConfig(false);
-    if (!hasLlm()) { setNeedConfig(true); return; }
     setReviewLoading(true);
     setReview("");
     try {

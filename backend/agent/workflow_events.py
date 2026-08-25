@@ -137,9 +137,21 @@ class WorkflowEventEmitter:
     ) -> "WorkflowEventEmitter":
         run_id = None
         if config and hasattr(config, "get"):
-            configurable = config.get("configurable", {})
-            if isinstance(configurable, dict) or hasattr(configurable, "get"):
-                run_id = configurable.get("run_id")
+            top_run_id = config.get("run_id")
+            if top_run_id is not None:
+                run_id = str(top_run_id)
+            if not run_id:
+                configurable = config.get("configurable", {})
+                if isinstance(configurable, dict) or hasattr(configurable, "get"):
+                    c_run_id = configurable.get("run_id")
+                    if c_run_id is not None:
+                        run_id = str(c_run_id)
+            if not run_id:
+                metadata = config.get("metadata", {})
+                if isinstance(metadata, dict) or hasattr(metadata, "get"):
+                    m_run_id = metadata.get("run_id")
+                    if m_run_id is not None:
+                        run_id = str(m_run_id)
         if not isinstance(run_id, str) or not run_id:
             run_id = "local-run"
         return cls(workflow_id, run_id, starting_seq, config)

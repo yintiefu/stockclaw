@@ -57,11 +57,25 @@ export async function debateStream(
   signal?: AbortSignal,
 ): Promise<void> {
   const variant = rounds > 1 ? "cross_exam" : "standard";
+  const stageAccumulator: Record<string, string> = {};
+
   await runWorkflowStream({
     assistantId: "debate",
     input: { code },
     variant,
-    onEvent: (ev) => dispatchDebateEvent(ev, handlers),
+    onEvent: (ev) => {
+      if (ev.type === "stage_delta") {
+        const sid = ev.stage_id;
+        stageAccumulator[sid] = (stageAccumulator[sid] || "") + ev.delta;
+      }
+      if (ev.type === "stage_completed") {
+        const sid = ev.stage_id;
+        const finalContent = stageAccumulator[sid] || "";
+        handlers.onStageDone?.(sid as DebateStage, sid, finalContent);
+        return;
+      }
+      dispatchDebateEvent(ev, handlers);
+    },
     signal,
   });
 }

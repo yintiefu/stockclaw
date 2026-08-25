@@ -64,7 +64,7 @@ export function Debate() {
         onDelta: (stage, text) =>
           setStages((s) => s.map((b) => (b.stage === stage && !b.done ? { ...b, content: b.content + text } : b))),
         onStageDone: (stage, _label, content) =>
-          setStages((s) => s.map((b) => (b.stage === stage && !b.done ? { ...b, content, done: true } : b))),
+          setStages((s) => s.map((b) => (b.stage === stage && !b.done ? { ...b, content: content || b.content, done: true } : b))),
         onError: (message, stage) => setError(stage ? `${stage}：${message}` : message),
       }, ctrl.signal);
       setStatus("辩论完成");

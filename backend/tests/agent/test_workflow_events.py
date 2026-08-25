@@ -85,3 +85,11 @@ async def test_event_emitter_monotonic_sequence() -> None:
     assert emitter.last_seq == 12
     assert dispatched[-1][1]["seq"] == 12
     assert dispatched[-1][1]["delta"] == "text chunk"
+
+
+def test_event_emitter_top_level_run_id() -> None:
+    import uuid
+    real_uuid = uuid.uuid4()
+    cfg = {"run_id": real_uuid}
+    emitter = WorkflowEventEmitter.from_config("debate", starting_seq=0, config=cfg)  # type: ignore
+    assert emitter.run_id == str(real_uuid)

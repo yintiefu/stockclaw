@@ -113,6 +113,6 @@ describe("createLangGraphThreadAdapter", () => {
       remoteId: "018f4f4e-7b2d-7f2a-8000-123456789abc",
       externalId: "018f4f4e-7b2d-7f2a-8000-123456789abc",
     });
-    expect(client.threads.create).toHaveBeenCalledWith();
+    expect(client.threads.create).toHaveBeenCalledWith({ metadata: { channel: "workspace" } });
   });
 });

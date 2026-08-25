@@ -15,7 +15,7 @@ from deepagents.backends import CompositeBackend, FilesystemBackend, StateBacken
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.skills import SkillsMiddleware
 from langchain.agents import AgentState, create_agent
-from langchain.agents.middleware import ModelRequest, dynamic_prompt
+from langchain.agents.middleware import ModelRequest, dynamic_prompt, after_agent
 from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -225,6 +225,30 @@ def embedded_context_prompt(request: ModelRequest) -> str:
     return f"{policy}\n\n{snapshot_block}\n\n{instruction}"
 
 
+@after_agent(state_schema=EmbeddedAgentState)
+def record_snapshot_ref(state: EmbeddedAgentState, runtime: Any) -> dict[str, Any]:
+    """在对话轮次结束时将助手回答归属到当前页面快照版本。"""
+    snap = state.get("page_context")
+    if snap:
+        if isinstance(snap, PageContextSnapshot):
+            version = snap.version
+            captured_at = snap.captured_at
+        elif isinstance(snap, dict):
+            version = snap.get("version", 1)
+            captured_at = snap.get("captured_at", utc_now())
+        else:
+            version = getattr(snap, "version", 1)
+            captured_at = getattr(snap, "captured_at", utc_now())
+        turn_index = len(state.get("messages", []))
+        ref = AssistantContextRef(
+            turn_index=turn_index,
+            snapshot_version=version,
+            captured_at=captured_at,
+        )
+        return {"assistant_context_refs": [ref]}
+    return {}
+
+
 async def build_embedded_graph(
     model: BaseChatModel | None = None,
     *,
@@ -246,6 +270,7 @@ async def build_embedded_graph(
         SkillsMiddleware(backend=backend, sources=["/builtin/"]),
         FilesystemMiddleware(backend=backend, tools=["ls", "read_file"]),
         embedded_context_prompt,
+        record_snapshot_ref,
     ]
 
     tools = build_builtin_tools()

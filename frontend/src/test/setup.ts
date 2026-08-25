@@ -35,3 +35,11 @@ if (!window.matchMedia) {
     }),
   });
 }
+
+// jsdom 没有 scrollTo，assistant-ui 自动滚屏需要
+if (typeof Element !== "undefined" && !Element.prototype.scrollTo) {
+  Element.prototype.scrollTo = () => {};
+}
+if (typeof window !== "undefined" && window.HTMLElement && !window.HTMLElement.prototype.scrollTo) {
+  window.HTMLElement.prototype.scrollTo = () => {};
+}

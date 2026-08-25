@@ -185,9 +185,7 @@ def _verify_path_safety(instruction: str, skill_prefix: str, root: Path | None) 
         prefix = skill_prefix.removeprefix("builtin/").removeprefix("/builtin/")
         file_path = root / prefix / instruction
         if not file_path.is_file():
-            skill_md = root / prefix / "SKILL.md"
-            if not skill_md.is_file():
-                raise WorkflowConfigError(f"引用的内置技能指令文件不存在：{file_path} (skill={skill_prefix}, instruction={instruction})")
+            raise WorkflowConfigError(f"引用的内置技能指令文件不存在：{file_path} (skill={skill_prefix}, instruction={instruction})")
 
 
 def validate_workflow_config(

@@ -62,21 +62,37 @@ def is_payload_empty(value: Any) -> bool:
     return False
 
 
-def sanitize_error_string(raw: str) -> str:
-    """严格脱敏错误文本，消除 Bearer 凭据、API Key、内部 IP 及敏感查询参数。"""
-    if not raw:
-        return ""
-    # 替换 Bearer token
-    redacted = re.sub(r"(?i)bearer\s+[A-Za-z0-9_\-\.]+", "Bearer [REDACTED]", raw)
-    # 替换各种常见 API Key 格式
-    redacted = re.sub(r"(?i)(?:key|token|password|secret|apikey|api_key)[\"':= ]+([A-Za-z0-9_\-\.]{6,})", r"key=[REDACTED]", redacted)
-    redacted = re.sub(r"sk-[A-Za-z0-9_\-]{8,}", "[REDACTED_KEY]", redacted)
-    # 替换内部 IP 地址
-    redacted = re.sub(r"\b(?:10|172\.(?:1[6-9]|2[0-9]|3[01])|192\.168)\.\d{1,3}\.\d{1,3}\b", "[INTERNAL_IP]", redacted)
-    # 截短长度防超长 payload
-    if len(redacted) > 200:
-        redacted = redacted[:190] + "...[redacted]"
-    return redacted
+ERROR_CODE_MESSAGES: dict[str, str] = {
+    "AUTH_ERROR": "模型服务鉴权失败，请检查 API Key 或访问权限",
+    "RATE_LIMITED": "上游接口请求被限流，请稍后重试",
+    "NETWORK_TIMEOUT": "网络连接超时或上游服务无响应",
+    "MODEL_UNAVAILABLE": "模型服务不可用或返回格式异常",
+    "DATA_SOURCE_ERROR": "客观数据源查询失败或无有效数据",
+    "NO_SUBSTANTIVE_DATA": "全部客观数据源抓取失败或为空，分析必须有客观底稿支撑",
+    "CONTEXT_OVERFLOW": "上下文或提示词长度超出最大允许预算",
+    "EXECUTION_ERROR": "工作流执行阶段发生内部异常",
+    "MODEL_ERROR": "模型推理执行异常",
+    "CANCELLED": "工作流已由用户取消",
+}
+
+
+def classify_error(err: Exception | str, default_code: str = "EXECUTION_ERROR") -> tuple[str, str]:
+    """将任意异常安全归类为稳定错误码与固定安全中文文案，严禁泄露原始报错与上游正文。"""
+    err_str = str(err).lower()
+
+    if "auth" in err_str or "unauthorized" in err_str or "401" in err_str or "403" in err_str or "api_key" in err_str:
+        return "AUTH_ERROR", ERROR_CODE_MESSAGES["AUTH_ERROR"]
+    elif "rate" in err_str or "429" in err_str or "quota" in err_str or "throttle" in err_str or "限流" in err_str:
+        return "RATE_LIMITED", ERROR_CODE_MESSAGES["RATE_LIMITED"]
+    elif "timeout" in err_str or "timed out" in err_str or "connect" in err_str or "econn" in err_str or "超时" in err_str:
+        return "NETWORK_TIMEOUT", ERROR_CODE_MESSAGES["NETWORK_TIMEOUT"]
+    elif "model" in err_str or "bad gateway" in err_str or "502" in err_str or "503" in err_str:
+        return "MODEL_UNAVAILABLE", ERROR_CODE_MESSAGES["MODEL_UNAVAILABLE"]
+    elif "dossier" in err_str or "tool" in err_str:
+        return "DATA_SOURCE_ERROR", ERROR_CODE_MESSAGES["DATA_SOURCE_ERROR"]
+
+    code = default_code or "EXECUTION_ERROR"
+    return code, ERROR_CODE_MESSAGES.get(code, "执行异常")
 
 
 def redact_workflow_error(
@@ -84,11 +100,11 @@ def redact_workflow_error(
     stage_id: str | None = None,
     code: str = "EXECUTION_ERROR",
 ) -> WorkflowError:
-    """脱敏错误信息并生成严格白名单的 WorkflowError。"""
-    redacted = sanitize_error_string(str(err))
+    """脱敏错误信息并生成严格白名单的 WorkflowError（纯稳定错误码与固定中文文案）。"""
+    resolved_code, message = classify_error(err, default_code=code)
     return WorkflowError(
-        code=code,
-        message=redacted or "执行异常",
+        code=resolved_code,
+        message=message,
         stage_id=stage_id,
     )
 
@@ -118,7 +134,8 @@ async def collect_dossier_sections(
     """确定性执行底稿抓取并上报进度。"""
     input_dict = {"code": code}
     sections_by_id: dict[str, DossierSection] = {}
-    total = len(config.sections)
+    all_sections: list[DossierSection] = []
+    total_count = len(config.sections)
     loaded_count = 0
 
     # 分离 parallel_safe 与 serial
@@ -152,8 +169,7 @@ async def collect_dossier_sections(
                 status = "gap"
                 summary = "数据缺失"
                 body = NO_RECORD_TEXT
-                raw_err = str(raw_result.get("error")) if is_err else "数据为空"
-                err_msg = sanitize_error_string(raw_err)
+                err_msg = "客观数据源查询异常或无记录" if is_err else "数据为空"
         else:
             status = "ok"
             err_msg = None
@@ -183,39 +199,33 @@ async def collect_dossier_sections(
                 tool=sec_cfg.tool,
                 status=status,
                 loaded=loaded_count,
-                total=total,
+                total=total_count,
             )
         return section
 
-    # 并行执行 parallel_safe 项
+    # 并行执行 non-throttled sections
     if parallel_sections:
-        par_results = await asyncio.gather(*[_fetch_one(s) for s in parallel_sections])
-        for s in par_results:
-            sections_by_id[s.id] = s
+        results = await asyncio.gather(*[_fetch_one(s) for s in parallel_sections])
+        all_sections.extend(results)
 
-    # 串行执行 serial 项
-    for s_cfg in serial_sections:
-        s = await _fetch_one(s_cfg)
-        sections_by_id[s.id] = s
+    # 串行执行 throttled sections (严守东财串行限流纪律)
+    for s in serial_sections:
+        res = await _fetch_one(s)
+        all_sections.extend([res])
 
-    # 按配置原始顺序还原
-    ordered_sections: list[DossierSection] = []
-    missing: list[str] = []
-    for s_cfg in config.sections:
-        sec = sections_by_id.get(s_cfg.id)
-        if sec:
-            ordered_sections.append(sec)
-            if sec.status == "gap":
-                missing.append(sec.title)
+    # 按照原始 sections 声明顺序重排
+    order_map = {s.id: i for i, s in enumerate(config.sections)}
+    all_sections.sort(key=lambda x: order_map.get(x.id, 999))
 
+    missing = [s.title for s in all_sections if s.status == "gap"]
     if emitter:
         await emitter.emit(
             "dossier_completed",
-            section_count=len(ordered_sections),
+            section_count=len(all_sections),
             missing_count=len(missing),
         )
 
-    return ordered_sections, missing
+    return all_sections, missing
 
 
 def summarize_dossier(
@@ -274,7 +284,7 @@ async def run_stage(
     emitter: WorkflowEventEmitter | None = None,
     stage_id: str = "",
 ) -> tuple[str, bool]:
-    """流式执行单个阶段模型推理并向 emitter 发送增量事件（硬上限控制）。"""
+    """流式执行单个阶段模型推理并向 emitter 发送增量事件（硬上限控制与连接生命周期管理）。"""
     buf: list[str] = []
     current_len = 0
     truncated = False
@@ -282,27 +292,35 @@ async def run_stage(
     suffix_len = len(suffix)
     effective_max = max(0, max_chars - suffix_len) if max_chars > suffix_len else max_chars
 
-    async for chunk in model.astream(messages):
-        piece = chunk.content if isinstance(chunk, BaseMessage) else str(chunk)
-        if isinstance(piece, list):
-            piece = "".join(str(p) for p in piece)
-        if not piece:
-            continue
+    stream = model.astream(messages)
+    try:
+        async for chunk in stream:
+            piece = chunk.content if isinstance(chunk, BaseMessage) else str(chunk)
+            if isinstance(piece, list):
+                piece = "".join(str(p) for p in piece)
+            if not piece:
+                continue
 
-        if current_len + len(piece) > effective_max:
-            allowed = max(0, effective_max - current_len)
-            if allowed > 0:
-                buf.append(piece[:allowed])
-                current_len += allowed
-                if emitter and stage_id:
-                    await emitter.emit("stage_delta", stage_id=stage_id, delta=piece[:allowed])
-            truncated = True
-            break
+            if current_len + len(piece) > effective_max:
+                allowed = max(0, effective_max - current_len)
+                if allowed > 0:
+                    buf.append(piece[:allowed])
+                    current_len += allowed
+                    if emitter and stage_id:
+                        await emitter.emit("stage_delta", stage_id=stage_id, delta=piece[:allowed])
+                truncated = True
+                break
 
-        buf.append(piece)
-        current_len += len(piece)
-        if emitter and stage_id:
-            await emitter.emit("stage_delta", stage_id=stage_id, delta=piece)
+            buf.append(piece)
+            current_len += len(piece)
+            if emitter and stage_id:
+                await emitter.emit("stage_delta", stage_id=stage_id, delta=piece)
+    finally:
+        if hasattr(stream, "aclose"):
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
 
     full_output = "".join(buf).strip()
     if truncated:
