@@ -239,3 +239,13 @@ def test_reflect_route_rejects_empty_source():
 def test_reflect_route_requires_llm_config():
     r = client.post("/api/reflect", json={"source": "一段分析", "llm": {**_LLM, "baseURL": ""}})
     assert r.status_code == 400
+
+
+def test_daily_review_route_validation():
+    assert client.post("/api/daily-review", json={"summary": "  ", "llm": _LLM}).status_code == 400
+    assert client.post("/api/daily-review", json={"summary": "今日复盘", "llm": {**_LLM, "apiKey": ""}}).status_code == 400
+
+
+def test_news_digest_route_validation():
+    assert client.post("/api/news-digest", json={"news_text": "  ", "llm": _LLM}).status_code == 400
+    assert client.post("/api/news-digest", json={"news_text": "新闻快讯", "llm": {**_LLM, "apiKey": ""}}).status_code == 400

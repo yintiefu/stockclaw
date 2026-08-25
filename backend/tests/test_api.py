@@ -87,4 +87,6 @@ def test_fastapi_keeps_legacy_ai_and_has_no_agent_control_plane():
     assert client.post("/api/chat", json={}).status_code in {400, 422}
     assert client.post("/api/debate", json={}).status_code in {400, 422}
     assert client.post("/api/reflect", json={}).status_code in {400, 422}
+    assert client.post("/api/daily-review", json={}).status_code in {400, 422}
+    assert client.post("/api/news-digest", json={}).status_code in {400, 422}
     assert client.get("/api/agent/threads").status_code == 404

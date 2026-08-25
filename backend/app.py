@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 
@@ -146,9 +147,19 @@ def _check_llm(llm: LLMConfig) -> dict:
 
 def _ndjson(events):
     """把事件生成器包成 NDJSON 流；运行时异常转成流内 error 事件，不中断连接。"""
+    if inspect.isasyncgenfunction(events) or hasattr(events, "__aiter__"):
+        async def gen_async():
+            try:
+                gen_obj = events() if callable(events) else events
+                async for ev in gen_obj:
+                    yield json.dumps(ev, ensure_ascii=False) + "\n"
+            except Exception as e:  # noqa: BLE001
+                yield json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False) + "\n"
+        return StreamingResponse(gen_async(), media_type="application/x-ndjson")
+
     def gen():
         try:
-            for ev in events():
+            for ev in (events() if callable(events) else events):
                 yield json.dumps(ev, ensure_ascii=False) + "\n"
         except Exception as e:  # noqa: BLE001
             yield json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False) + "\n"
@@ -187,6 +198,35 @@ def reflect(req: ReflectReq):
         raise HTTPException(400, "source 不能为空")
     cfg = _check_llm(req.llm)
     return _ndjson(lambda: reflect_layer.run_reflection_stream(cfg, req.source, req.title))
+
+
+class DailyReviewReq(BaseModel):
+    summary: str
+    date: str = ""
+    llm: LLMConfig
+
+
+@app.post("/api/daily-review")
+def daily_review(req: DailyReviewReq):
+    """每日复盘：结构化分析与多维风险提示，流式 NDJSON。"""
+    if not (req.summary or "").strip():
+        raise HTTPException(400, "summary 不能为空")
+    cfg = _check_llm(req.llm)
+    return _ndjson(lambda: reflect_layer.run_reflection_stream(cfg, req.summary, f"每日复盘 {req.date}".strip()))
+
+
+class NewsDigestReq(BaseModel):
+    news_text: str
+    llm: LLMConfig
+
+
+@app.post("/api/news-digest")
+def news_digest(req: NewsDigestReq):
+    """新闻摘要：多维事件提炼与逻辑推演，流式 NDJSON。"""
+    if not (req.news_text or "").strip():
+        raise HTTPException(400, "news_text 不能为空")
+    cfg = _check_llm(req.llm)
+    return _ndjson(lambda: reflect_layer.run_reflection_stream(cfg, req.news_text, "新闻简报"))
 
 
 class HoldingIn(BaseModel):
