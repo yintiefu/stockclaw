@@ -10,7 +10,9 @@
 - 非法 empty_policy / on_error；
 - 软限制超出代码硬上限（HARD_LIMITS）；
 - 禁止 result.field 动态属性；
-- 错误信息脱敏，不泄漏输入值或敏感信息。
+- 生产 4 个工作流（debate / reflection / daily_review / news_digest）加载与完整性；
+- 13 项底稿抓取清单与 5 个辩论阶段、2 种变体（standard / cross_exam）；
+- 技能与引用文本中立规则与边界词汇（分歧点、验证清单、不给买卖结论、不判胜负）。
 """
 from __future__ import annotations
 
@@ -18,17 +20,20 @@ from pathlib import Path
 import pytest
 import yaml
 
+from agent.skill_backends import BUILTIN_SKILLS_DIR
 from agent.workflow_loader import (
     HARD_LIMITS,
     SinglePassConfig,
     StagedResearchConfig,
     WorkflowConfigError,
+    load_all_production_workflows,
     load_workflow_config_from_file,
     load_workflow_config_from_string,
     validate_workflow_config,
 )
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "workflows"
+PRODUCTION_WORKFLOWS_DIR = Path(__file__).resolve().parents[2] / "agent" / "workflows"
 
 
 def test_load_valid_staged_workflow_file(tmp_path: Path) -> None:
@@ -293,3 +298,83 @@ def test_reject_forbidden_result_field() -> None:
     }
     with pytest.raises(WorkflowConfigError, match="Extra inputs are not permitted|result"):
         validate_workflow_config(doc, workflow_id="test_wf")
+
+
+# ---------------------------------------------------------------------------
+# 生产配置与技能内容契约测试
+# ---------------------------------------------------------------------------
+
+def test_load_all_production_workflows_returns_four_configs() -> None:
+    configs = load_all_production_workflows(PRODUCTION_WORKFLOWS_DIR, BUILTIN_SKILLS_DIR)
+    assert set(configs.keys()) == {"debate", "reflection", "daily_review", "news_digest"}
+
+    debate = configs["debate"]
+    assert isinstance(debate, StagedResearchConfig)
+    assert debate.id == "debate"
+    assert debate.variants == {
+        "standard": ["bull", "bear", "referee"],
+        "cross_exam": ["bull", "bear", "bull_rebut", "bear_rebut", "referee"],
+    }
+
+    # 13 items mapping
+    expected_sections = [
+        ("quote", "query_quote", "gap_if_empty"),
+        ("valuation", "query_valuation", "gap_if_empty"),
+        ("valuation_percentile", "query_valuation_percentile", "gap_if_empty"),
+        ("financials", "query_financials", "gap_if_empty"),
+        ("kline", "query_kline", "gap_if_empty"),
+        ("fund_flow", "query_fund_flow", "gap_if_empty"),
+        ("margin", "query_margin", "allow_no_record"),
+        ("holders", "query_holders", "allow_no_record"),
+        ("announcements", "query_announcements", "allow_no_record"),
+        ("lockup", "query_lockup", "allow_no_record"),
+        ("concepts", "query_concepts", "gap_if_empty"),
+        ("reports", "query_reports", "allow_no_record"),
+        ("news", "query_news", "allow_no_record"),
+    ]
+    assert len(debate.dossier.sections) == 13
+    for i, (sid, tool, empty_policy) in enumerate(expected_sections):
+        sec = debate.dossier.sections[i]
+        assert sec.id == sid
+        assert sec.tool == tool
+        assert sec.empty_policy == empty_policy
+
+    # Single pass configs
+    assert isinstance(configs["reflection"], SinglePassConfig)
+    assert configs["reflection"].input.text_field == "source"
+    assert isinstance(configs["daily_review"], SinglePassConfig)
+    assert configs["daily_review"].input.text_field == "market_snapshot"
+    assert isinstance(configs["news_digest"], SinglePassConfig)
+    assert configs["news_digest"].input.text_field == "news_snapshot"
+
+
+def test_production_skills_contain_neutral_boundaries() -> None:
+    # 检查 debate 裁判与角色
+    referee_path = BUILTIN_SKILLS_DIR / "debate" / "references" / "referee.md"
+    assert referee_path.exists()
+    ref_text = referee_path.read_text(encoding="utf-8")
+    assert "分歧点" in ref_text
+    assert "验证清单" in ref_text
+    assert "绝对不要" in ref_text or "不给出" in ref_text
+    for winner_word in ("谁赢了", "哪方获胜", "多方胜", "空方胜", "判定胜者"):
+        assert winner_word not in ref_text
+
+    # 检查 reflection-audit
+    reflect_path = BUILTIN_SKILLS_DIR / "reflection-audit" / "SKILL.md"
+    assert reflect_path.exists()
+    reflect_text = reflect_path.read_text(encoding="utf-8")
+    assert "审计已有文本" in reflect_text or "审计已有" in reflect_text
+    assert "验证清单" in reflect_text
+    assert "不要给出你自己的投资判断" in reflect_text
+
+    # 检查 market-review
+    review_path = BUILTIN_SKILLS_DIR / "market-review" / "SKILL.md"
+    assert review_path.exists()
+    review_text = review_path.read_text(encoding="utf-8")
+    assert "不推荐买卖" in review_text
+
+    # 检查 news-digest
+    news_path = BUILTIN_SKILLS_DIR / "news-digest" / "SKILL.md"
+    assert news_path.exists()
+    news_text = news_path.read_text(encoding="utf-8")
+    assert "不推荐买卖" in news_text
