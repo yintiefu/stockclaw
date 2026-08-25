@@ -271,26 +271,30 @@ release to confirm none are staged.
   **no `tailwind.config.ts`** (removed in the v4 upgrade, commit `8834859`). Follow the
   existing glass-card / warm-orange design language.
 
-## AI layer (three exits, one tool set)
+## AI layer (Unified LangGraph AI Workflows)
 
 `tools.py` defines the 24 function-calling tools and is the **only** place to add new
-ones — `chat.py`, `mcp_server.py`, `debate.py`, and the Agent workspace graph
-(`agent/tool_registry.py` adapts them to LangChain) all share it. Each tool trims output
-(take recent-N + key fields + summary) before feeding the model; on failure it returns
-`{"error": ...}` instead of raising, so the conversation loop continues.
+ones — shared across all LangGraph graphs, MCP, and legacy endpoints:
+- `agent/tool_executor.py` classifies tools into `parallel_safe` (7 tools guarded by `BoundedSemaphore(4)`)
+  and `eastmoney_serial` (guarded by process-wide `threading.Lock()`).
+- `agent/policy.py` (`fixed_system_policy()`) defines the universal neutrality red-line
+  and tool grounding rules across all graphs and workflows.
+- `agent/skill_backends.py` enforces read-only virtual filesystem access to `/builtin/`
+  and `/user/` Skills.
 
-The **Agent workspace** runs on a separate local LangGraph Server (`langgraph dev`,
-:2024, loopback only) that imports the same `tools.py`; model / MCP / Skills config comes
-from the static settings file (`agent/settings.py`), and every built-in tool call runs
-under one process-wide `asyncio.Lock` (Eastmoney throttle must stay serial — never
-parallelize `em_get`-backed tools). MCP tools are server-name-prefixed and every call
-requires an approve/reject interrupt decision.
+### Six registered LangGraph graphs (`langgraph.json` :2024):
+1. **`agent`** (`agent/graph.py`): Full workspace interactive agent with HITL approval
+   for MCP tool calls, Skills `/builtin/` + `/user/`, and SessionTrace middleware.
+2. **`embedded_agent`** (`agent/embedded_graph.py`): Isolated page-level Ask-AI agent.
+   Built-in tools and `/builtin/` Skills only; no MCP, no HITL, no `/user/` skills.
+   Manages versioned `page_context` snapshots with non-empty overwrite semantics and scope guard.
+3. **`debate`** (`agent/workflows_graph.py`): Multi-stage debate workflow (`debate.yaml`).
+   Serializes objective dossier, executes `bull` -> `bear` -> `referee` (`standard`)
+   or with cross-examination (`cross_exam`), emitting typed monotonic custom events.
+4. **`reflection`** (`agent/workflows_graph.py`): Reasoning audit workflow (`reflection.yaml`).
+5. **`daily_review`** (`agent/workflows_graph.py`): Market daily review workflow (`daily_review.yaml`).
+6. **`news_digest`** (`agent/workflows_graph.py`): Multi-track news digest workflow (`news_digest.yaml`).
 
-Two access modes for the legacy exits (configured in the frontend "接入 AI" page):
-- **API** (`provider` not `cli-*`): OpenAI-compatible, user's own key, supports
-  function-calling.
-- **Subscription** (`provider` = `cli-*`): spawns a local, already-logged-in CLI
-  (claude / qwen / codex / deepseek) via `cli_runtime.py`. **No function-calling** —
-  one-shot text answer, so it only suits contexts where data is already in the prompt
-  (daily review, today's highlights, stock-page "ask AI"). Backend must run on the
-  user's own machine (cloud can't see local CLIs).
+### Legacy FastAPI Bridge (:8900):
+`/api/debate`, `/api/reflect`, `/api/daily-review`, `/api/news-digest`, and `/api/chat`
+bridge stream execution to the graphs and translate custom events to frontend NDJSON streams.
