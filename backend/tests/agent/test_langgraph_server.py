@@ -24,7 +24,14 @@ def test_production_langgraph_config_is_local_and_persistent_ready():
     config = json.loads((BACKEND / "langgraph.json").read_text(encoding="utf-8"))
     assert config == {
         "dependencies": ["./"],
-        "graphs": {"agent": "./agent/graph.py:graph"},
+        "graphs": {
+            "agent": "./agent/graph.py:graph",
+            "embedded_agent": "./agent/embedded_graph.py:graph",
+            "debate": "./agent/workflows_graph.py:debate_graph",
+            "reflection": "./agent/workflows_graph.py:reflection_graph",
+            "daily_review": "./agent/workflows_graph.py:daily_review_graph",
+            "news_digest": "./agent/workflows_graph.py:news_digest_graph",
+        },
         "env": {"CORS_ALLOW_ORIGINS": "http://127.0.0.1:5899"},
     }
     # 通配形态覆盖 migrate_agent_data 留下的 .langgraph_api.bak 等残留
