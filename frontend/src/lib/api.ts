@@ -2,8 +2,11 @@
 // 后端未启动或数据源异常时抛 ApiError，页面据此优雅降级。
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number) {
+  readonly status: number;
+  constructor(message: string, status: number) {
     super(message);
+    this.status = status;
+    this.name = "ApiError";
   }
 }
 
