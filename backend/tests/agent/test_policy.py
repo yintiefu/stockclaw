@@ -19,6 +19,26 @@ def test_policy_handles_empty_context() -> None:
     assert "（无）" in text
 
 
+def test_policy_without_tools_neither_advertises_tools_nor_loses_red_lines() -> None:
+    # 工作流阶段不绑定工具：提示词绝不能宣传「你可以调用工具 / query_*」，
+    # 否则强 agentic 模型会整场输出「我要先调 query_market」式的叙述而不产出分析；
+    # 中立红线与数据缺口标注必须原样保留。
+    text = fixed_system_policy("工作流：daily_review", tools=False)
+    for phrase in ("不推荐买卖", "不预测涨跌", "不给目标价", "不评级", "不排名", "不给交易时机"):
+        assert phrase in text
+    assert "标注数据缺口" in text
+    assert "工作流：daily_review" in text
+    assert "query_" not in text
+    assert "调用工具" not in text
+    assert "不调用任何工具" in text
+
+
+def test_policy_with_tools_keeps_tool_catalog_by_default() -> None:
+    text = fixed_system_policy("Agent 工作台")
+    assert "query_quote" in text
+    assert "你可以调用工具" in text
+
+
 def test_skill_backend_exposes_separate_read_only_namespaces(tmp_path: Path) -> None:
     builtin = tmp_path / "builtin"
     user = tmp_path / "user"

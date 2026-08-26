@@ -114,3 +114,46 @@ async def test_embedded_graph_has_no_mcp_hitl_or_user_skills():
     # Inspect nodes / tools if exposed
     # Built-in tools and /builtin/ skills only
     assert graph is not None
+
+
+@pytest.mark.asyncio
+async def test_embedded_graph_attributes_history_turns_to_compact_snapshot_refs():
+    """历史助手回答在后续模型输入中只带紧凑快照版本/时间标记，不重复旧快照正文。"""
+    model = ScriptedChatModel([
+        AIMessage(content="基于 v1 快照的回答。"),
+        AIMessage(content="基于 v2 快照的回答。"),
+    ])
+    graph = await build_embedded_graph(model=model, checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
+    config = {"configurable": {"thread_id": "test-context-refs"}}
+
+    await graph.ainvoke(
+        {
+            "messages": [HumanMessage(content="当前价格如何？")],
+            "page_context": PageContextInput(route="/stock", scope_key="600519", source_as_of="15:00", content="茅台现价 1800"),
+        },
+        config=config,
+    )
+    state = await graph.aget_state(config)
+    refs = state.values.get("assistant_context_refs")
+    assert refs, "首轮结束后必须记录 assistant_context_refs"
+    first_ref = refs[-1]
+    assert first_ref.snapshot_version == 1
+    assert first_ref.captured_at
+
+    await graph.ainvoke(
+        {
+            "messages": [HumanMessage(content="价格有变化吗？")],
+            "page_context": PageContextInput(route="/stock", scope_key="600519", source_as_of="15:05", content="茅台现价 1810"),
+        },
+        config=config,
+    )
+
+    sys2 = [m.content for m in model.invocations[1] if isinstance(m, SystemMessage)][0]
+    # 紧凑版本/时间标记必须进入后续 prompt
+    assert "v1" in sys2
+    assert first_ref.captured_at in sys2
+    # 旧快照正文不得重复注入（当前快照 v2 全文照常注入）
+    assert "茅台现价 1800" not in sys2
+    assert "茅台现价 1810" in sys2
+    # 历史标记必须声明「不得当作当前数据」
+    assert "不代表当前" in sys2 or "不是当前" in sys2

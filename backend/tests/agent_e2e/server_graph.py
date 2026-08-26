@@ -9,7 +9,7 @@ from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain_core.messages import AIMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-import chat
+from agent.policy import fixed_system_policy
 from agent.settings import load_agent_settings
 from agent.session_trace import SessionTraceMiddleware
 from tests.agent.fakes import ScriptedChatModel
@@ -38,7 +38,7 @@ async def build_fixture_graph():
             tool.name: {"allowed_decisions": ["approve", "reject"]}
             for tool in tools
         })],
-        system_prompt=chat.SYSTEM_PROMPT.format(context="Agent 工作台"),
+        system_prompt=fixed_system_policy("Agent 工作台"),
     )
 
 

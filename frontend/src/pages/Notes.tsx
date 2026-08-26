@@ -1,13 +1,13 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { Trash2, ChevronDown, ChevronRight, NotebookPen, ScanSearch, Save } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
+import { WorkflowHistory } from "@/components/workflow/WorkflowHistory";
+import { useWorkflowRun } from "@/hooks/useWorkflowRun";
 import { loadNotes, deleteNote, clearNotes, addNote, type Note } from "@/lib/notes";
-import { reflectStream } from "@/lib/agents";
-import { ApiError } from "@/lib/api";
 
 const KIND_COLOR: Record<string, string> = {
   复盘: "bg-primary/15 text-primary",
@@ -22,29 +22,21 @@ export function Notes() {
   const [openId, setOpenId] = useState<string | null>(null);
   // 反思：对某条记录做推理审计。只保留「当前这条」的结果，避免一堆长文同时挂在页面上。
   const [reflectId, setReflectId] = useState<string | null>(null);
-  const [reflectText, setReflectText] = useState("");
-  const [reflectErr, setReflectErr] = useState("");
-  const [reflecting, setReflecting] = useState(false);
   const [reflectSaved, setReflectSaved] = useState(false);
-  const abortRef = useRef<AbortController | null>(null);
+
+  // 反思工作流：thread 按 subject=<note.id> 隔离，历史只挂在对应记录下。
+  const run = useWorkflowRun({ assistantId: "reflection" });
+  const reflecting = run.running;
+  const reflectText = run.state?.result ?? run.transient.reflection ?? "";
+  const reflectErr = run.error ?? "";
 
   async function runReflect(n: Note) {
-    abortRef.current?.abort();
-    const ctrl = new AbortController();
-    abortRef.current = ctrl;
-    setReflectId(n.id); setReflectText(""); setReflectErr(""); setReflectSaved(false); setReflecting(true);
-    try {
-      await reflectStream(n.content, n.title, {
-        onDelta: (t) => setReflectText((s) => s + t),
-        onError: setReflectErr,
-      }, ctrl.signal);
-    } catch (e) {
-      if (!(e instanceof DOMException && e.name === "AbortError")) {
-        setReflectErr(e instanceof ApiError ? e.message : String(e));
-      }
-    } finally {
-      setReflecting(false);
-    }
+    setReflectId(n.id);
+    setReflectSaved(false);
+    await run.start({
+      input: { source: n.content },
+      metadata: { title: `反思 · ${n.title}`, subject: n.id },
+    });
   }
 
   function saveReflection(n: Note) {
@@ -98,7 +90,7 @@ export function Notes() {
                     </div>
 
                     <div className="mt-3 flex items-center gap-2 border-t border-border/40 pt-3">
-                      <button onClick={() => runReflect(n)} disabled={reflecting}
+                      <button onClick={() => void runReflect(n)} disabled={reflecting}
                         className="inline-flex items-center gap-1.5 rounded-lg border border-border/60 px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground disabled:opacity-50">
                         <ScanSearch className="h-3.5 w-3.5" />
                         {reflecting && reflectId === n.id ? "审计中…" : "反思审计"}
@@ -107,6 +99,21 @@ export function Notes() {
                         让 AI 回头审这段推理：哪些有数据撑着、哪些是脑补、最脆弱的一环在哪
                       </span>
                     </div>
+
+                    {/* 本条记录的反思历史（subject=note.id 隔离）；打开即从 checkpoint 恢复 */}
+                    {reflectId !== n.id && (
+                      <div className="mt-3">
+                        <WorkflowHistory
+                          workflowType="reflection"
+                          subject={n.id}
+                          onOpen={(thread) => {
+                            setReflectId(n.id);
+                            setReflectSaved(false);
+                            void run.restore(thread.threadId);
+                          }}
+                        />
+                      </div>
+                    )}
 
                     {reflectId === n.id && (reflectText || reflectErr) && (
                       <div className="mt-3 rounded-lg border border-violet-500/30 bg-violet-500/5 p-3">
@@ -125,6 +132,16 @@ export function Notes() {
                             )}
                           </>
                         )}
+                        <div className="mt-3">
+                          <WorkflowHistory
+                            workflowType="reflection"
+                            subject={n.id}
+                            onOpen={(thread) => {
+                              setReflectSaved(false);
+                              void run.restore(thread.threadId);
+                            }}
+                          />
+                        </div>
                       </div>
                     )}
                   </div>

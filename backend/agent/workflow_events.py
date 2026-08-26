@@ -1,17 +1,14 @@
-"""工作流自定义事件模式与单调自增发射器。
-
-定义 9 类固定自定义事件的 Pydantic Discriminated Union，与前端 SDK 保持逐字段严格一致；
-提供 WorkflowEventEmitter 保证单 run 内事件序号 seq 严格递增且不分叉。
-"""
+"""工作流固定自定义事件契约与单调发射器。"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, Union
+
 from langchain_core.callbacks.manager import adispatch_custom_event
 from langchain_core.runnables import RunnableConfig
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
-
-from agent.workflow_state import WorkflowError
+from langgraph.config import get_stream_writer
+from langgraph.runtime import get_runtime
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter
 
 
 def utc_now() -> str:
@@ -19,79 +16,85 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
+EmittedAt = Annotated[str, StringConstraints(pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")]
+DossierSectionStatus = Literal["completed", "no_record", "gap", "failed"]
+
+
 class _EventBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: str
-    workflow_id: str
-    run_id: str
-    seq: int
-    emitted_at: str = Field(default_factory=utc_now)
+    workflow_id: NonEmptyString
+    run_id: NonEmptyString
+    seq: int = Field(ge=1)
+    emitted_at: EmittedAt
 
 
-class WorkflowStartedEvent(_EventBase):
-    type: Literal["workflow_started"] = "workflow_started"
-    workflow_type: str
-    input: dict[str, Any]
-    variant: str | None = None
+class WorkflowStatusEvent(_EventBase):
+    type: Literal["workflow.status"] = "workflow.status"
+    status: Literal["pending", "running", "completed", "partial", "failed", "cancelled", "interrupted"]
+    message: str
 
 
 class DossierProgressEvent(_EventBase):
-    type: Literal["dossier_progress"] = "dossier_progress"
-    title: str
-    section_id: str
-    tool: str
-    status: Literal["ok", "no_record", "gap"]
-    loaded: int
-    total: int
+    type: Literal["dossier.progress"] = "dossier.progress"
+    section_id: NonEmptyString
+    section_status: DossierSectionStatus
+    completed: int = Field(ge=0)
+    total: int = Field(ge=0)
 
 
-class DossierCompletedEvent(_EventBase):
-    type: Literal["dossier_completed"] = "dossier_completed"
-    section_count: int
-    missing_count: int
+class DossierReadyEvent(_EventBase):
+    type: Literal["dossier.ready"] = "dossier.ready"
+    completed: int = Field(ge=0)
+    missing: list[str]
+    has_substantive_data: bool
 
 
 class StageStartedEvent(_EventBase):
-    type: Literal["stage_started"] = "stage_started"
-    stage_id: str
+    type: Literal["stage.started"] = "stage.started"
+    stage_id: NonEmptyString
+    label: NonEmptyString
 
 
 class StageDeltaEvent(_EventBase):
-    type: Literal["stage_delta"] = "stage_delta"
-    stage_id: str
+    type: Literal["stage.delta"] = "stage.delta"
+    stage_id: NonEmptyString
     delta: str
 
 
 class StageCompletedEvent(_EventBase):
-    type: Literal["stage_completed"] = "stage_completed"
-    stage_id: str
-    truncated: bool = False
+    type: Literal["stage.completed"] = "stage.completed"
+    stage_id: NonEmptyString
+    truncated: bool
 
 
 class StageFailedEvent(_EventBase):
-    type: Literal["stage_failed"] = "stage_failed"
-    stage_id: str
-    error: WorkflowError
+    type: Literal["stage.failed"] = "stage.failed"
+    stage_id: NonEmptyString
+    error_code: NonEmptyString
+    message: NonEmptyString
+    retryable: bool
 
 
 class WorkflowCompletedEvent(_EventBase):
-    type: Literal["workflow_completed"] = "workflow_completed"
-    workflow_type: str
-    result_summary: str
+    type: Literal["workflow.completed"] = "workflow.completed"
+    status: Literal["completed", "partial"]
 
 
 class WorkflowFailedEvent(_EventBase):
-    type: Literal["workflow_failed"] = "workflow_failed"
-    workflow_type: str
-    error: WorkflowError
+    type: Literal["workflow.failed"] = "workflow.failed"
+    error_code: NonEmptyString
+    message: NonEmptyString
+    retryable: bool
 
 
 WorkflowEventUnion = Annotated[
     Union[
-        WorkflowStartedEvent,
+        WorkflowStatusEvent,
         DossierProgressEvent,
-        DossierCompletedEvent,
+        DossierReadyEvent,
         StageStartedEvent,
         StageDeltaEvent,
         StageCompletedEvent,
@@ -102,18 +105,40 @@ WorkflowEventUnion = Annotated[
     Field(discriminator="type"),
 ]
 
-from langgraph.config import get_stream_writer
-
 _EVENT_ADAPTER = TypeAdapter(WorkflowEventUnion)
 
 
 def validate_workflow_event(raw: dict[str, Any]) -> WorkflowEventUnion:
-    """使用 Discriminated Union 校验并实例化工作流事件。"""
+    """使用固定 discriminated union 校验工作流事件。"""
     return _EVENT_ADAPTER.validate_python(raw)
 
 
+def _read_run_id(config: RunnableConfig | None) -> str | None:
+    try:
+        execution_info = get_runtime().execution_info
+    except RuntimeError:
+        execution_info = None
+    if execution_info is not None and execution_info.run_id:
+        return str(execution_info.run_id)
+
+    if not config or not hasattr(config, "get"):
+        return None
+    configurable = config.get("configurable", {})
+    if hasattr(configurable, "get"):
+        value = configurable.get("run_id")
+        if value is not None and str(value).strip():
+            return str(value)
+    for container in (config, config.get("metadata", {})):
+        if not hasattr(container, "get"):
+            continue
+        value = container.get("run_id")
+        if value is not None and str(value).strip():
+            return str(value)
+    return None
+
+
 class WorkflowEventEmitter:
-    """每个 Graph Node 内的单调自增事件发射器。"""
+    """为一个 run 分配连续序号并发射类型化事件。"""
 
     def __init__(
         self,
@@ -135,25 +160,9 @@ class WorkflowEventEmitter:
         starting_seq: int,
         config: RunnableConfig | None = None,
     ) -> "WorkflowEventEmitter":
-        run_id = None
-        if config and hasattr(config, "get"):
-            top_run_id = config.get("run_id")
-            if top_run_id is not None:
-                run_id = str(top_run_id)
-            if not run_id:
-                configurable = config.get("configurable", {})
-                if isinstance(configurable, dict) or hasattr(configurable, "get"):
-                    c_run_id = configurable.get("run_id")
-                    if c_run_id is not None:
-                        run_id = str(c_run_id)
-            if not run_id:
-                metadata = config.get("metadata", {})
-                if isinstance(metadata, dict) or hasattr(metadata, "get"):
-                    m_run_id = metadata.get("run_id")
-                    if m_run_id is not None:
-                        run_id = str(m_run_id)
-        if not isinstance(run_id, str) or not run_id:
-            run_id = "local-run"
+        run_id = _read_run_id(config)
+        if run_id is None:
+            raise RuntimeError("LangGraph run_id 缺失")
         return cls(workflow_id, run_id, starting_seq, config)
 
     @property
@@ -161,28 +170,27 @@ class WorkflowEventEmitter:
         return self._seq
 
     async def emit(self, event_type: str, **payload: Any) -> None:
-        self._seq += 1
-        data = {
+        next_seq = self._seq + 1
+        event = validate_workflow_event({
             "type": event_type,
             "workflow_id": self.workflow_id,
             "run_id": self.run_id,
-            "seq": self._seq,
+            "seq": next_seq,
             "emitted_at": utc_now(),
             **payload,
-        }
-        event = validate_workflow_event(data)
+        })
+        self._seq = next_seq
         serialized = event.model_dump(mode="json")
+
+        if self._dispatch_fn is not None:
+            self._dispatch_fn("workflow", serialized, self._config)
+            return
         try:
             writer = get_stream_writer()
-            if writer:
-                writer(serialized)
-        except Exception:
-            pass
-
-        if self._dispatch_fn:
-            self._dispatch_fn("workflow", serialized, self._config)
-        elif self._config:
-            try:
-                await adispatch_custom_event("workflow", serialized, config=self._config)
-            except Exception:
-                pass
+        except RuntimeError:
+            writer = None
+        if writer is not None:
+            writer(serialized)
+            return
+        if self._config is not None:
+            await adispatch_custom_event("workflow", serialized, config=self._config)

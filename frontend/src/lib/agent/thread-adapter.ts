@@ -32,13 +32,30 @@ async function mergeMetadata(client: AgentThreadClient, id: string, patch: Recor
 export function createLangGraphThreadAdapter(client: AgentThreadClient): RemoteThreadListAdapter {
   return {
     async list() {
-      const threads = await client.threads.search({ limit: 100, sortBy: "updated_at", sortOrder: "desc" });
-      // 仅展示工作台会话 (channel: "workspace") 或存量无 channel 会话，隔离 embedded / workflow 会话
-      const filtered = threads.filter((t) => {
-        const ch = metadataOf(t).channel;
-        return ch === "workspace" || !ch;
-      });
-      return { threads: filtered.map(toRemote) };
+      const query = { limit: 100, sortBy: "updated_at" as const, sortOrder: "desc" as const };
+      const [workspace, firstGlobalPage] = await Promise.all([
+        client.threads.search({ ...query, metadata: { channel: "workspace" } }),
+        client.threads.search({ ...query, offset: 0 }),
+      ]);
+      const legacy = new Map<string, Thread>();
+      let globalPage = firstGlobalPage;
+      let offset = 0;
+      for (;;) {
+        for (const candidate of globalPage) {
+          if (!metadataOf(candidate).channel) legacy.set(candidate.thread_id, candidate);
+        }
+        offset += globalPage.length;
+        if (legacy.size >= 100 || globalPage.length < query.limit) break;
+        globalPage = await client.threads.search({ ...query, offset });
+      }
+      const merged = new Map<string, Thread>();
+      for (const item of [...workspace, ...legacy.values()]) {
+        merged.set(item.thread_id, item);
+      }
+      const threads = [...merged.values()]
+        .sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at))
+        .slice(0, 100);
+      return { threads: threads.map(toRemote) };
     },
     async fetch(id) { return toRemote(await client.threads.get(id)); },
     async initialize() {

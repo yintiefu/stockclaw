@@ -246,8 +246,21 @@ export interface HkCashflow {
   currency: string | null; item_order: string[]; periods: HkCashflowPeriod[];
 }
 
+export interface AgentStatusSummary {
+  configured: boolean;
+  settings_path: string;
+  model_name: string | null;
+  base_url_host: string | null;
+  builtin_skill_count: number;
+  mcp_server_count: number;
+  restart_required: boolean;
+  config_template: string;
+  reason?: string;
+}
+
 export const api = {
   health: () => get<{ ok: boolean }>("/health"),
+  agentStatus: () => get<AgentStatusSummary>("/agent/status"),
   indices: () => get<IndexQuote[]>("/indices"),
   marketOverview: () => get<MarketOverview>("/market/overview"),
   emotion: () => get<ShortTermEmotion>("/market/emotion"),

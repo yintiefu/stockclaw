@@ -1,13 +1,16 @@
-import { useRef, useState } from "react";
-import { Swords, Play, Square, Save, CheckCircle2, Circle, AlertTriangle } from "lucide-react";
+import { useState } from "react";
+import { Swords, Play, Square, Save, CheckCircle2, Circle, AlertTriangle, RotateCcw } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
-import { debateStream, type DebateStage } from "@/lib/agents";
+import { WorkflowHistory } from "@/components/workflow/WorkflowHistory";
+import { useWorkflowRun } from "@/hooks/useWorkflowRun";
+import type { WorkflowClientEvent } from "@/lib/agent/workflow-client";
 import { addNote } from "@/lib/notes";
-import { ApiError } from "@/lib/api";
+
+type DebateStage = "bull" | "bear" | "bull_rebut" | "bear_rebut" | "referee";
 
 interface StageBox {
   stage: DebateStage;
@@ -26,69 +29,133 @@ const STAGE_TONE: Record<DebateStage, string> = {
   referee: "border-border bg-background/40",
 };
 
+// 阶段展示顺序固定为配置顺序（standard / cross_exam 都是它的子序列）。
+const STAGE_ORDER: DebateStage[] = ["bull", "bear", "bull_rebut", "bear_rebut", "referee"];
+const STAGE_LABEL: Record<DebateStage, string> = {
+  bull: "多方研究员",
+  bear: "空方研究员",
+  bull_rebut: "多方反驳",
+  bear_rebut: "空方反驳",
+  referee: "中立主持",
+};
+
+// 底稿 section id → 展示标题（与 debate.yaml 的 13 项一一对应）。
+const SECTION_TITLE: Record<string, string> = {
+  quote: "实时行情",
+  valuation: "估值与一致预期",
+  valuation_percentile: "估值历史分位",
+  financials: "最新财报关键指标",
+  kline: "近 60 日价格走势",
+  fund_flow: "资金流向",
+  margin: "融资融券",
+  holders: "股东户数",
+  announcements: "近期公告",
+  lockup: "限售解禁",
+  concepts: "板块与概念归属",
+  reports: "近期研报",
+  news: "近期新闻",
+};
+
 const DOSSIER_HINT = "多空双方拿到的是同一份接口实时拉取的数据，谁也不能靠编数字赢。";
 
 export function Debate() {
   const [code, setCode] = useState("");
   const [rounds, setRounds] = useState(1);
-  const [running, setRunning] = useState(false);
   const [status, setStatus] = useState("");
-  const [progress, setProgress] = useState<{ title: string; ok: boolean }[]>([]);
+  const [progress, setProgress] = useState<{ id: string; title: string; ok: boolean }[]>([]);
   const [missing, setMissing] = useState<string[]>([]);
-  const [stages, setStages] = useState<StageBox[]>([]);
-  const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
-  const abortRef = useRef<AbortController | null>(null);
+  const [historyKey, setHistoryKey] = useState(0);
+  const [pageError, setPageError] = useState("");
 
-  const reset = () => {
-    setStatus(""); setProgress([]); setMissing([]); setStages([]); setError(""); setSaved(false);
+  const run = useWorkflowRun({
+    assistantId: "debate",
+    onEvent: (event: WorkflowClientEvent) => {
+      switch (event.type) {
+        case "dossier.progress":
+          setStatus(`正在拉取客观事实底稿… ${event.completed}/${event.total}`);
+          setProgress((p) => [
+            ...p.filter((t) => t.id !== event.section_id),
+            {
+              id: event.section_id,
+              title: SECTION_TITLE[event.section_id] ?? event.section_id,
+              ok: event.section_status === "completed" || event.section_status === "no_record",
+            },
+          ]);
+          break;
+        case "dossier.ready":
+          setMissing(event.missing);
+          setStatus("底稿就绪，辩论开始");
+          break;
+        case "stage.started":
+          setStatus(`${event.label} 正在生成…`);
+          break;
+        case "stage.failed":
+          setStatus(`${event.stage_id} 阶段失败`);
+          break;
+        case "workflow.failed":
+          setStatus("");
+          break;
+      }
+    },
+  });
+
+  const running = run.running || run.status === "running";
+  const stageState = run.state?.stages ?? {};
+  // 底稿展示优先用权威 checkpoint（历史恢复也完整），运行中回落到事件累积的进度。
+  const dossierTicks = run.state?.dossier?.sections.map((s) => ({
+    id: s.id,
+    title: s.title,
+    ok: s.status === "completed" || s.status === "no_record",
+  })) ?? progress;
+  const missingShown = run.state?.dossier?.missing ?? missing;
+  const stageBoxes: StageBox[] = STAGE_ORDER
+    .filter((id) => stageState[id] || run.transient[id] !== undefined)
+    .map((id) => ({
+      stage: id,
+      label: STAGE_LABEL[id],
+      content: stageState[id]?.content ?? run.transient[id] ?? "",
+      done: stageState[id] != null && stageState[id].status !== "pending" && stageState[id].status !== "running",
+    }));
+
+  const finished = stageBoxes.length > 0
+    && stageBoxes.every((s) => s.done)
+    && (run.status === "completed" || run.status === "partial");
+
+  const startDebate = (c: string, variant: "standard" | "cross_exam") => {
+    setStatus("");
+    setProgress([]);
+    setMissing([]);
+    setSaved(false);
+    void run.start({
+      input: { code: c },
+      variant,
+      metadata: { title: `多空辩论 · ${c}`, subject: c },
+    }).finally(() => setHistoryKey((k) => k + 1));
   };
 
-  async function start() {
+  const start = () => {
     const c = code.trim();
-    if (!/^\d{6}$/.test(c)) { setError("请输入 6 位 A 股代码"); return; }
-    reset();
-    setRunning(true);
-    const ctrl = new AbortController();
-    abortRef.current = ctrl;
-    try {
-      await debateStream(c, rounds, {
-        onStatus: setStatus,
-        onDossierProgress: (title, ok, loaded, total) => {
-          setStatus(`正在拉取客观事实底稿… ${loaded}/${total}`);
-          setProgress((p) => [...p, { title, ok }]);
-        },
-        onDossierReady: (_sections, miss) => { setMissing(miss); setStatus("底稿就绪，辩论开始"); },
-        onStageStart: (stage, label) =>
-          setStages((s) => [...s, { stage, label, content: "", done: false }]),
-        onDelta: (stage, text) =>
-          setStages((s) => s.map((b) => (b.stage === stage && !b.done ? { ...b, content: b.content + text } : b))),
-        onStageDone: (stage, _label, content) =>
-          setStages((s) => s.map((b) => (b.stage === stage && !b.done ? { ...b, content: content || b.content, done: true } : b))),
-        onError: (message, stage) => setError(stage ? `${stage}：${message}` : message),
-      }, ctrl.signal);
-      setStatus("辩论完成");
-    } catch (e) {
-      if (e instanceof DOMException && e.name === "AbortError") setStatus("已中止");
-      else setError(e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setRunning(false);
-      abortRef.current = null;
+    if (!/^\d{6}$/.test(c)) {
+      setPageError("请输入 6 位 A 股代码");
+      return;
     }
-  }
+    setPageError("");
+    startDebate(c, rounds > 1 ? "cross_exam" : "standard");
+  };
 
-  function stop() {
-    abortRef.current?.abort();
-    setRunning(false);
-  }
+  const stop = () => { void run.stop().finally(() => setHistoryKey((k) => k + 1)); };
+  const retry = () => { void run.retry().finally(() => setHistoryKey((k) => k + 1)); };
 
-  function save() {
-    const body = stages.map((s) => `## ${s.label}\n\n${s.content}`).join("\n\n---\n\n");
+  const save = () => {
+    const body = stageBoxes.map((s) => `## ${s.label}\n\n${s.content}`).join("\n\n---\n\n");
     addNote("多空辩论", `多空辩论 · ${code.trim()}`, body);
     setSaved(true);
-  }
+  };
 
-  const finished = stages.length > 0 && stages.every((s) => s.done);
+  const errorText = pageError || run.error;
+  const retryable = !running && run.threadId != null
+    && ["failed", "interrupted", "cancelled"].includes(run.status);
 
   return (
     <div>
@@ -133,6 +200,12 @@ export function Debate() {
               <Play className="h-4 w-4" /> 开始辩论
             </button>
           )}
+          {retryable && (
+            <button onClick={retry}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border/60 px-4 py-2 text-sm text-muted-foreground hover:text-foreground">
+              <RotateCcw className="h-4 w-4" /> 从失败阶段重试
+            </button>
+          )}
           {finished && !running && (
             <button onClick={save} disabled={saved}
               className="inline-flex items-center gap-1.5 rounded-lg border border-border/60 px-4 py-2 text-sm text-muted-foreground hover:text-foreground disabled:opacity-50">
@@ -142,29 +215,28 @@ export function Debate() {
         </div>
 
         {/* 开销提示：辩论比问答重得多，让用户在点下去之前就知道要花多久、调几次模型 */}
-        {!running && !status && (
+        {!running && !status && !errorText && (
           <p className="mt-3 text-[11px] leading-relaxed text-muted-foreground/70">
             ⏱ {rounds === 2
               ? "两轮约 3 分钟 · 5 次模型调用 · 约 6 万字进上下文"
               : "一轮约 100 秒 · 3 次模型调用 · 约 3.5 万字进上下文"}
             （每个角色都会带上完整底稿）。其中拉底稿约 35 秒、走公开数据接口，不消耗 token。
-            省额度可用「订阅接入」的本机 CLI，或选中档模型——数据已备齐，模型只做组织和表达。
           </p>
         )}
 
         {status && <p className="mt-3 text-xs text-muted-foreground">{status}</p>}
-        {error && (
+        {errorText && (
           <p className="mt-3 flex items-start gap-1.5 text-xs text-destructive">
-            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" /> {error}
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" /> {errorText}
           </p>
         )}
 
-        {progress.length > 0 && (
+        {dossierTicks.length > 0 && (
           <div className="mt-4 border-t border-border/40 pt-3">
             <p className="mb-2 text-[11px] text-muted-foreground">{DOSSIER_HINT}</p>
             <div className="flex flex-wrap gap-x-4 gap-y-1.5">
-              {progress.map((p) => (
-                <span key={p.title} className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
+              {dossierTicks.map((p) => (
+                <span key={p.id} className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
                   {p.ok
                     ? <CheckCircle2 className="h-3 w-3 text-primary/70" />
                     : <Circle className="h-3 w-3 text-muted-foreground/40" />}
@@ -172,9 +244,9 @@ export function Debate() {
                 </span>
               ))}
             </div>
-            {missing.length > 0 && (
+            {missingShown.length > 0 && (
               <p className="mt-2 text-[11px] text-warning">
-                未取到：{missing.join("、")}（双方立论时不得臆测这部分）
+                未取到：{missingShown.join("、")}（双方立论时不得臆测这部分）
               </p>
             )}
           </div>
@@ -182,7 +254,7 @@ export function Debate() {
       </GlassCard>
 
       <div className="mt-4 space-y-4">
-        {stages.map((s) => (
+        {stageBoxes.map((s) => (
           <div key={s.stage} className={`rounded-xl border p-4 ${STAGE_TONE[s.stage]}`}>
             <div className="mb-2 flex items-center gap-2">
               <Swords className="h-4 w-4 text-muted-foreground" />
@@ -196,7 +268,7 @@ export function Debate() {
         ))}
       </div>
 
-      {stages.length === 0 && !running && (
+      {stageBoxes.length === 0 && !running && (
         <GlassCard className="mt-4">
           <div className="flex flex-col items-center gap-2 py-10 text-center text-sm text-muted-foreground">
             <Swords className="h-8 w-8 text-muted-foreground/40" />
@@ -205,6 +277,29 @@ export function Debate() {
           </div>
         </GlassCard>
       )}
+
+      {/* 辩论历史只在辩论页查看；打开恢复 checkpoint，重新运行创建新 thread 保留旧结果 */}
+      <div className="mt-4">
+        <WorkflowHistory
+          workflowType="debate"
+          refreshKey={historyKey}
+          onOpen={(thread) => {
+            const historicCode = typeof thread.subject === "string" ? thread.subject : "";
+            if (historicCode) setCode(historicCode);
+            setStatus("");
+            setProgress([]);
+            setMissing([]);
+            setSaved(false);
+            void run.restore(thread.threadId).finally(() => setHistoryKey((k) => k + 1));
+          }}
+          onRerun={(thread, state) => {
+            const historicCode = typeof state.input?.code === "string" ? state.input.code : thread.subject ?? "";
+            if (historicCode) setCode(historicCode);
+            if (!/^\d{6}$/.test(historicCode)) return;
+            startDebate(historicCode, state.variant === "cross_exam" ? "cross_exam" : "standard");
+          }}
+        />
+      </div>
 
       <Disclaimer />
     </div>

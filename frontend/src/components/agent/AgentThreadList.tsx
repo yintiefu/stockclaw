@@ -1,5 +1,5 @@
 /** 会话列表：assistant-ui 原生原语（新建/切换/重命名/删除），无归档控件。 */
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { MessageSquarePlus, Pencil, Trash2 } from "lucide-react";
 import {
   ThreadListItemPrimitive,
@@ -7,12 +7,16 @@ import {
   useAui,
   useAuiState,
 } from "@assistant-ui/react";
+import { cn } from "@/lib/utils";
 
-function RenameThreadButton() {
+function RenameThreadButton({ onEditingChange }: { onEditingChange?: (editing: boolean) => void }) {
   const aui = useAui();
   const currentTitle = useAuiState((state) => state.threadListItem.title ?? "");
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
+
+  const startEditing = () => { setDraft(currentTitle); setEditing(true); onEditingChange?.(true); };
+  const stopEditing = () => { setEditing(false); onEditingChange?.(false); };
 
   if (!editing) {
     return (
@@ -22,8 +26,7 @@ function RenameThreadButton() {
         title="重命名会话"
         onClick={(event) => {
           event.stopPropagation();
-          setDraft(currentTitle);
-          setEditing(true);
+          startEditing();
         }}
         className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-muted/60 hover:text-foreground"
       >
@@ -41,7 +44,7 @@ function RenameThreadButton() {
         const title = draft.trim();
         if (!title) return;
         await aui.threadListItem.rename(title);
-        setEditing(false);
+        stopEditing();
       }}
     >
       <input
@@ -52,7 +55,7 @@ function RenameThreadButton() {
         onKeyDown={(event) => {
           if (event.key === "Escape") {
             event.preventDefault();
-            setEditing(false);
+            stopEditing();
           }
         }}
         className="min-w-0 flex-1 rounded-md border border-border bg-black/20 px-2 py-1 text-sm outline-hidden focus:border-primary/50"
@@ -72,24 +75,46 @@ function RenameThreadButton() {
 
 function ThreadListItem() {
   const itemId = useAuiState((state) => state.threadListItem.id);
+  const [hovered, setHovered] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const onEnter = useCallback(() => setHovered(true), []);
+  const onLeave = useCallback(() => setHovered(false), []);
+  const showActions = hovered || editing;
+
   return (
     <ThreadListItemPrimitive.Root
       data-testid={`agent-thread-${itemId}`}
-      className="group relative mb-0.5 flex items-center rounded-md pr-1 data-[active=true]:bg-primary/10 data-[active=true]:ring-1 data-[active=true]:ring-primary/30 hover:bg-muted/50"
+      className="relative mb-0.5 flex items-center rounded-md pr-1 data-[active=true]:bg-primary/10 data-[active=true]:ring-1 data-[active=true]:ring-primary/30 hover:bg-muted/50"
+      onMouseEnter={onEnter}
+      onMouseLeave={onLeave}
+      onFocus={onEnter}
+      onBlur={onLeave}
     >
-      <ThreadListItemPrimitive.Trigger className="min-w-0 flex-1 px-2.5 py-2 text-left focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/60">
+      <ThreadListItemPrimitive.Trigger className={cn(
+        "min-w-0 flex-1 py-2 text-left transition-[padding] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/60",
+        showActions ? "pl-2.5 pr-16" : "px-2.5",
+      )}>
         <span className="block truncate text-sm font-medium">
           <ThreadListItemPrimitive.Title fallback="新会话" />
         </span>
       </ThreadListItemPrimitive.Trigger>
-      <RenameThreadButton />
-      <ThreadListItemPrimitive.Delete
-        aria-label="删除会话"
-        title="删除会话"
-        className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+      <div
+        className={cn(
+          "absolute inset-y-0 right-0 flex items-center pr-1 transition-opacity",
+          showActions ? "opacity-100 pointer-events-auto" : "opacity-0 pointer-events-none",
+        )}
+        onMouseEnter={onEnter}
+        onMouseLeave={onLeave}
       >
-        <Trash2 className="size-4" aria-hidden />
-      </ThreadListItemPrimitive.Delete>
+        <RenameThreadButton onEditingChange={setEditing} />
+        <ThreadListItemPrimitive.Delete
+          aria-label="删除会话"
+          title="删除会话"
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+        >
+          <Trash2 className="size-4" aria-hidden />
+        </ThreadListItemPrimitive.Delete>
+      </div>
     </ThreadListItemPrimitive.Root>
   );
 }

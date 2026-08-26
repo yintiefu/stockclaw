@@ -173,12 +173,34 @@ class EmbeddedAgentState(AgentState):
     assistant_context_refs: Annotated[list[AssistantContextRef], append_context_refs]
 
 
+def _compact_context_refs(state: Any) -> list[str]:
+    """把 assistant_context_refs 压成紧凑版本/时间标记行。
+
+    历史回答只保留快照版本与时间归属，不重复注入旧快照正文——
+    多轮上下文不会按快照大小线性膨胀。
+    """
+    refs = state.get("assistant_context_refs") if isinstance(state, dict) else None
+    if not refs:
+        return []
+    lines: list[str] = []
+    for ref in refs:
+        if isinstance(ref, AssistantContextRef):
+            lines.append(f"- 第 {ref.turn_index} 条助手回答基于页面快照 v{ref.snapshot_version} · {ref.captured_at}")
+        elif isinstance(ref, dict):
+            lines.append(
+                f"- 第 {ref.get('turn_index', '?')} 条助手回答基于页面快照 "
+                f"v{ref.get('snapshot_version', '?')} · {ref.get('captured_at', '?')}"
+            )
+    return lines
+
+
 @dynamic_prompt
 def embedded_context_prompt(request: ModelRequest) -> str:
-    """动态注入最新页面数据快照与中立系统策略。"""
+    """动态注入最新页面数据快照、历史回答的快照归属与中立系统策略。"""
     snap = None
-    if hasattr(request, "state") and request.state:
-        snap = request.state.get("page_context")
+    state = request.state if hasattr(request, "state") and request.state else {}
+    if state:
+        snap = state.get("page_context")
 
     if snap is None:
         raise ValueError("缺少页面快照输入 (page_context)，首轮对话必须提供当前页面数据快照。")
@@ -218,11 +240,17 @@ def embedded_context_prompt(request: ModelRequest) -> str:
         f"- 数据时间: {source_as_of}\n\n"
         f"{content}"
     )
+    parts = [policy, snapshot_block]
+    ref_lines = _compact_context_refs(state)
+    if ref_lines:
+        attribution = "【历史回答快照归属】\n" + "\n".join(ref_lines)
+        parts.append(attribution)
     instruction = (
-        "说明：历史对话中的助手回答可能基于较早版本的页面快照生成，不代表当前即时事实。"
-        "请始终以最新页面快照与工具查询结果为准。"
+        "说明：历史对话中的助手回答可能基于较早版本的页面快照生成，不代表当前数据；"
+        "旧快照正文不再重复提供。请始终以最新页面快照与工具查询结果为准。"
     )
-    return f"{policy}\n\n{snapshot_block}\n\n{instruction}"
+    parts.append(instruction)
+    return "\n\n".join(parts)
 
 
 @after_agent(state_schema=EmbeddedAgentState)

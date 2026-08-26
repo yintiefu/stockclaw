@@ -2,6 +2,7 @@ schema_version: 1
 config_version: 1
 id: debate
 kind: staged_research
+result_stage: referee
 input:
   code:
     type: string
@@ -92,32 +93,42 @@ dossier:
       empty_policy: allow_no_record
 stages:
   - id: bull
+    label: 多方研究员
     skill: builtin/debate
     instruction: references/bull.md
+    context: [dossier]
     on_error: continue
     output_chars: 1200
     context_chars: 24000
   - id: bear
+    label: 空方研究员
     skill: builtin/debate
     instruction: references/bear.md
+    context: [dossier, stage.bull]
     on_error: continue
     output_chars: 1200
     context_chars: 24000
   - id: bull_rebut
+    label: 多方反驳
     skill: builtin/debate
     instruction: references/bull-rebut.md
+    context: [dossier, stage.bull, stage.bear]
     on_error: continue
     output_chars: 1200
     context_chars: 24000
   - id: bear_rebut
+    label: 空方反驳
     skill: builtin/debate
     instruction: references/bear-rebut.md
+    context: [dossier, stage.bull, stage.bear, stage.bull_rebut]
     on_error: continue
     output_chars: 1200
     context_chars: 24000
   - id: referee
+    label: 中立主持
     skill: builtin/debate
     instruction: references/referee.md
+    context: [dossier.summary, dossier.missing, stages]
     on_error: fail
     output_chars: 1200
     context_chars: 24000

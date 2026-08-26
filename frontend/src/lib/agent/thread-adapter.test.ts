@@ -44,13 +44,19 @@ describe("createLangGraphThreadAdapter", () => {
   });
 
   it("lists and fetches threads mapped onto remote metadata", async () => {
-    client.threads.search.mockResolvedValue([
-      thread({ metadata: { title: "标题" } }),
-      thread({ thread_id: "th-2", metadata: { archived: true } }),
-    ]);
+    client.threads.search
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        thread({ metadata: { title: "标题" } }),
+        thread({ thread_id: "th-2", metadata: { archived: true } }),
+      ]);
     const listed = await adapter.list();
-    expect(client.threads.search).toHaveBeenCalledWith({
+    expect(client.threads.search).toHaveBeenNthCalledWith(1, {
+      metadata: { channel: "workspace" },
       limit: 100, sortBy: "updated_at", sortOrder: "desc",
+    });
+    expect(client.threads.search).toHaveBeenNthCalledWith(2, {
+      limit: 100, offset: 0, sortBy: "updated_at", sortOrder: "desc",
     });
     expect(listed.threads[0]).toMatchObject({ remoteId: "th-1", externalId: "th-1", status: "regular", title: "标题" });
     expect(listed.threads[1]).toMatchObject({ remoteId: "th-2", status: "archived" });
@@ -62,13 +68,72 @@ describe("createLangGraphThreadAdapter", () => {
     expect(client.threads.get).toHaveBeenCalledWith("th-1");
   });
 
+  it("lists only workspace and legacy unchannelled threads", async () => {
+    client.threads.search
+      .mockResolvedValueOnce([thread({ thread_id: "workspace", metadata: { channel: "workspace" } })])
+      .mockResolvedValueOnce([
+        thread({ thread_id: "legacy", metadata: {} }),
+        thread({ thread_id: "embedded", metadata: { channel: "embedded" } }),
+        thread({ thread_id: "workflow", metadata: { channel: "workflow" } }),
+      ]);
+    const listed = await adapter.list();
+    expect(listed.threads.map((item) => item.remoteId)).toEqual(["workspace", "legacy"]);
+  });
+
+  it("keeps server-filtered workspace threads when the global window contains only workflows", async () => {
+    client.threads.search
+      .mockResolvedValueOnce([thread({
+        thread_id: "workspace-visible", updated_at: "2026-08-20T00:00:00Z",
+        metadata: { channel: "workspace" },
+      })])
+      .mockResolvedValueOnce(Array.from({ length: 100 }, (_, index) => thread({
+        thread_id: `workflow-${index}`,
+        metadata: { channel: "workflow" },
+      })))
+      .mockResolvedValueOnce([]);
+    const listed = await adapter.list();
+    expect(listed.threads.map((item) => item.remoteId)).toEqual(["workspace-visible"]);
+  });
+
+  it("pages past a full global workflow page to discover legacy unchannelled threads", async () => {
+    const pagedClient = makeClient();
+    const pagedAdapter = createLangGraphThreadAdapter(pagedClient);
+    pagedClient.threads.search
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(Array.from({ length: 100 }, (_, index) => thread({
+        thread_id: `workflow-${index}`,
+        metadata: { channel: "workflow" },
+      })))
+      .mockResolvedValueOnce([thread({
+        thread_id: "legacy-second-page",
+        updated_at: "2026-08-22T00:00:00Z",
+        metadata: {},
+      })]);
+
+    const listed = await pagedAdapter.list();
+
+    expect(pagedClient.threads.search).toHaveBeenNthCalledWith(1, {
+      metadata: { channel: "workspace" },
+      limit: 100, sortBy: "updated_at", sortOrder: "desc",
+    });
+    expect(pagedClient.threads.search).toHaveBeenNthCalledWith(2, {
+      limit: 100, offset: 0, sortBy: "updated_at", sortOrder: "desc",
+    });
+    expect(pagedClient.threads.search).toHaveBeenNthCalledWith(3, {
+      limit: 100, offset: 100, sortBy: "updated_at", sortOrder: "desc",
+    });
+    expect(listed.threads.map((item) => item.remoteId)).toEqual(["legacy-second-page"]);
+  });
+
   it("merges metadata and maps archived status", async () => {
     client.threads.get.mockResolvedValue(thread({ metadata: { title: "标题", source: "studio" } }));
     await adapter.archive("th-1");
     expect(client.threads.update).toHaveBeenCalledWith("th-1", {
       metadata: { title: "标题", source: "studio", archived: true },
     });
-    client.threads.search.mockResolvedValue([thread({ metadata: { title: "标题", archived: true } })]);
+    client.threads.search
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([thread({ metadata: { title: "标题", archived: true } })]);
     expect((await adapter.list()).threads[0]).toMatchObject({ remoteId: "th-1", externalId: "th-1", status: "archived", title: "标题" });
   });
 

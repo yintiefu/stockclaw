@@ -45,7 +45,12 @@ export default defineConfig({
     {
       command: `cd ../backend && exec .venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port ${BACKEND_PORT} --log-level warning`,
       url: `http://127.0.0.1:${BACKEND_PORT}/api/health`,
-      env: { VR_DATA_DIR: dataRoot, VR_REPORTS_DIR: path.join(dataRoot, "myreports") },
+      env: {
+        VR_DATA_DIR: dataRoot,
+        VR_REPORTS_DIR: path.join(dataRoot, "myreports"),
+        // /api/agent/status 只读摘要也要走隔离配置：绝不读真实 ~/.vibe-research
+        VR_AGENT_SETTINGS: path.join(dataRoot, "fastapi-agent-settings.json"),
+      },
       reuseExistingServer: false,
       stdout: "ignore",
       stderr: "pipe",

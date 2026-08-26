@@ -67,7 +67,7 @@ It does not make decisions for you. It pulls together quotes, analyst reports, v
 | 💼&nbsp;**Portfolio** | Enter cost and size, see live P&L · closed-position log (local only, never uploaded) |
 | 📄&nbsp;**My Reports** | Drag-and-drop your own research PDFs / Word / spreadsheets · auto-filed by industry from the filename · download or delete. **Stored in your local deploy directory only** |
 | 📝&nbsp;**Research Notes** | Save AI reviews, takeaways, Q&A and debates locally · **reflection audit**: have the AI audit its own reasoning — which claims are backed by data, which are speculation, where the weakest link is, and what to check next |
-| 🔌&nbsp;**Bring Your AI** | Subscription mode (local CLI, no API key) · API mode (any OpenAI-compatible endpoint) · MCP (mount into Claude Code and other agents) |
+| 🔌&nbsp;**AI Status** | Read-only status page: models are configured only in the server-side `settings.json` (chmod 600) · copyable config template + startup guidance · MCP (mount into Claude Code and other agents) |
 
 > **Built-in analysis framework**: when your AI analyzes a stock it organizes findings across five dimensions — valuation, fund flows, earnings quality, industry cycle, catalysts and risks. The framework only prescribes *how to read the data*, never what to buy. The direction still comes from your own model.
 >
@@ -107,19 +107,18 @@ One data layer, three AI outlets:
 Vibe-Research/
 ├── a-stock-data/      A-share data toolkit (vendored v3.6.0, ready to use)
 ├── global-stock-data/ US / HK data toolkit (vendored v2.0.3, ready to use)
-├── backend/           FastAPI :8900 + local LangGraph Server :2024 (Agent workspace)
+├── backend/           FastAPI :8900 (data/business APIs) + local LangGraph Server :2024 (all AI)
 │   ├── astock.py        A-share data
 │   ├── gstock.py        US / HK data
 │   ├── newsradar.py     News radar
 │   ├── market.py        Market breadth + sector fund flows + global indices
 │   ├── portfolio.py     Portfolio (stored in your local user directory)
-│   ├── tools.py         AI tool layer (24 data tools, shared by chat / MCP / debate / Agent)
-│   ├── chat.py          In-app AI (OpenAI-compatible function calling)
-│   ├── debate.py        Bull-vs-bear orchestration (dossier → bull / bear / moderator)
-│   ├── reflection.py    Reflection audit (audits reasoning in existing analysis)
+│   ├── tools.py         AI tool layer (24 data tools shared by every graph and MCP)
 │   ├── mcp_server.py    MCP server (for Claude Code and other agents)
-│   ├── langgraph.json   Agent workspace graph registration (agent/graph.py → langgraph dev)
-│   └── agent/           Agent graph assembly: static settings + tool adapter + graph build
+│   ├── langgraph.json   Six LangGraph graphs (agent / embedded_agent / debate /
+│   │                    reflection / daily_review / news_digest)
+│   └── agent/           Unified AI runtime: model factory + neutral policy + tool executor
+│                        + Skills + workflow YAML loading/compiling (agent/workflows/*.yaml)
 └── frontend/          Vite + React 19 + TS + Tailwind :5899
 ```
 
@@ -131,11 +130,11 @@ Requires **Python 3.11+** (the Agent workspace LangGraph runtime). `langgraph de
 requirements for you — run `pip install -r requirements.txt` first.
 
 ```bash
-# Data + legacy AI backend (FastAPI :8900)
+# Data / business backend (FastAPI :8900 — quotes, portfolio, reports, …)
 cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8900
 
-# Agent workspace backend (local LangGraph Server :2024, loopback only — never bind LAN/public addresses)
+# AI runtime (local LangGraph Server :2024, six graphs; loopback only — never bind LAN/public addresses)
 .venv/bin/langgraph dev --host 127.0.0.1 --port 2024 --no-browser
 
 # Frontend (:5899, /api proxied to 8900 and /agent-api to 2024)
@@ -145,23 +144,49 @@ cd ../frontend && npm install && npm run dev
 
 ## Bring Your Own AI
 
-Configure once on the "Bring your AI" page and every AI feature across the dashboard uses your model. **All analysis comes from your model — this project does not tune or bias it.** Three options:
+Every model call runs on the local LangGraph Server (`127.0.0.1:2024`) through six graphs:
+`agent` (workspace), `embedded_agent` (page ask-AI), `debate`, `reflection`, `daily_review`
+and `news_digest`. Models and keys come **only** from a local static settings file (default
+`~/.vibe-research/agent/settings.json`, override with `VR_AGENT_SETTINGS`); it is read once
+when the Agent Server starts:
 
-### 1. Subscription mode (uses a CLI you're already logged into — no API key)
+```bash
+mkdir -p ~/.vibe-research/agent/skills
+# write the template below to ~/.vibe-research/agent/settings.json (apiKey = your own)
+chmod 600 ~/.vibe-research/agent/settings.json
+```
 
-Uses your existing subscription instead of paying per API call. Supported: **Claude Code · Codex · Qwen Code · DeepSeek CLI**.
+```json
+{
+  "model": {
+    "provider": "openai",
+    "name": "your-model",
+    "apiKey": "YOUR_API_KEY",
+    "baseURL": "https://your-provider.example/v1",
+    "temperature": 0.2,
+    "thinking": false
+  },
+  "skills": { "path": "~/.vibe-research/agent/skills" },
+  "mcpServers": {}
+}
+```
 
-- **Requirements**: the backend runs on your own machine, and the CLI is installed, logged in and on your `PATH`.
-- Pick one on the "Bring your AI" page — no key needed.
-- ⚠️ CLIs answer in one shot without multi-step tool calls, so this suits flows where the data is already prepared (daily review, takeaways, asking about the stock currently on screen). For open-ended questions where the AI should fetch data itself, use API mode.
+Notes:
 
-### 2. API mode (bring your own key)
-
-Pick a model and the base URL is filled in for you — just paste the key. Built-in presets for **DeepSeek / Doubao / MiniMax / OpenAI / OpenRouter / Groq / Together / MiMo / any OpenAI-compatible endpoint**. This mode supports function calling, so the AI fetches quotes, valuation, reports and news on its own. Your key stays in your browser's local storage and is sent only to your own backend.
-
-### 3. MCP (for Claude Code and other agents)
-
-Mount the backend as an MCP server so your agent can call Vibe-Research's data tools with its own subscription. See [`backend/README.md`](backend/README.md).
+- **No model keys in the browser anymore.** The settings page is read-only: it shows a
+  redacted summary (model name / host / Skill & MCP counts / config path + restart
+  guidance); `YOUR_API_KEY` in the template is a placeholder only. Old `vr-llm` /
+  `vr-askai-chat:*` browser values are pre-migration data — never read, migrated or deleted.
+- **FastAPI keeps data/business APIs only** (quotes, portfolio, reports, news radar and the
+  read-only `/api/agent/status`). `VR_API_KEY` protects FastAPI in public deployments; it
+  does **not** protect LangGraph — `/agent-api` is a local dev proxy and must never be
+  reverse-proxied publicly.
+- **MCP (for Claude Code and other agents)**: mount the backend as an MCP server so your
+  agent can call Vibe-Research's data tools with its own subscription. See
+  [`backend/README.md`](backend/README.md).
+- **Histories stay on your machine**: ask-AI / debate / reflection / review / digest
+  histories live in local LangGraph checkpoints (recoverable after page refresh; each
+  business page has its own history section to view / rerun / explicitly delete).
 
 ## How the Multi-Agent Part Is Designed
 
@@ -202,7 +227,6 @@ Roughly 35s of that is fetching the dossier — a dozen public endpoints, **zero
 **To keep costs down:**
 
 1. **One round is usually enough.** Two rounds doubles everything.
-2. **Prefer subscription mode** (local CLI) over an API key.
 3. **A debate doesn't need an expensive model.** The data is already in the dossier; the model only organizes and expresses it. Save your budget for your own deep questions.
 4. **Don't spam it.** The dossier hits a dozen throttled endpoints.
 
@@ -212,55 +236,27 @@ The same idea applied to writing you already have: audit the reasoning and surfa
 
 Much cheaper — **a single model call** over the text you selected.
 
-## Agent Workspace
+## Agent Workspace and Unified AI Workflows
 
-The **Agent Workspace** is powered by a **local LangGraph Server** (`127.0.0.1:2024`, started separately
-from FastAPI): threads, runs, checkpoints and human-in-the-loop approvals are persisted natively — after a
-process restart both ordinary conversations and a pending approval checkpoint are restored. The agent runs
-rounds of model + tool calls (built-in market/news tools plus MCP servers you connect, alongside a local
-Skills library). Like the rest of the product it **organizes objective data and analysis frameworks — it
-never gives buy/sell conclusions**.
+The **Agent Workspace** and every AI conversation/analysis workflow run on the same **local
+LangGraph Server** (`127.0.0.1:2024`, started separately from FastAPI): threads, runs,
+checkpoints and human-in-the-loop approvals are persisted natively. The workspace is the
+general-purpose agent (free conversation + MCP / Skills); page ask-AI, debate, reflection,
+daily review and news digest are five dedicated graphs with isolated persistence — workflow
+histories appear only on their own business pages (debate on the debate page, reflection on
+the research-notes page, review/digest on their pages), never in the workspace list, and
+there is no global history page.
 
-Model, MCP and Skills configuration all come from one **local static settings file**
-(default `~/.vibe-research/agent/settings.json`, override with `VR_AGENT_SETTINGS`), read once when the
-Agent server starts — restart it after edits:
-
-```json
-{
-  "model": {
-    "provider": "openai",
-    "name": "gpt-5",
-    "apiKey": "sk-...",
-    "baseURL": "https://api.openai.com/v1",
-    "temperature": 0.2
-  },
-  "skills": {
-    "path": "/absolute/path/to/skills"
-  },
-  "mcpServers": {
-    "example": {
-      "transport": "stdio",
-      "command": "uvx",
-      "args": ["example-mcp"],
-      "env": {}
-    },
-    "remote-example": {
-      "transport": "http",
-      "url": "https://example.com/mcp",
-      "headers": {
-        "Authorization": "Bearer ..."
-      }
-    }
-  }
-}
-```
+Like the rest of the product the agent **organizes objective data and analysis frameworks —
+it never gives buy/sell conclusions**. Configuration comes from the settings file described
+in "Bring Your Own AI" above.
 
 Highlights:
 
 - **Keys stay in the local settings file**: model/MCP keys are stored in plaintext inside `settings.json`;
   run `chmod 600 ~/.vibe-research/agent/settings.json` (the server warns on stderr if the permissions are
-  too broad). They never enter thread metadata, checkpoints, logs or frontend requests. The legacy
-  "Bring your AI" page keeps using browser localStorage (`vr-llm`).
+  too broad). They never enter thread metadata, checkpoints, logs or frontend requests. Old `vr-llm`
+  browser values are no longer read (left on disk, unused).
 - **Per-call MCP approval**: external MCP tools require approval, with exactly two decisions each time —
   approve or reject. Rejected calls return to the conversation as rejections, never executing silently.
 - **Read-only Skills confined to the configured root**: the model explores the local skill library via

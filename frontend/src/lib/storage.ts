@@ -29,3 +29,42 @@ export function storageRemove(key: string): void {
     /* 同上 */
   }
 }
+
+export interface WorkflowStreamCursor {
+  runId: string;
+  eventId: string;
+  lastSeq: number;
+}
+
+const workflowStreamKey = (threadId: string) => `vr-workflow-stream:${threadId}`;
+
+export function loadWorkflowStreamCursor(threadId: string): WorkflowStreamCursor | null {
+  const raw = storageGet(workflowStreamKey(threadId));
+  if (raw === null) return null;
+  try {
+    const value = JSON.parse(raw) as unknown;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+    const cursor = value as Record<string, unknown>;
+    if (Object.keys(cursor).sort().join(",") !== "eventId,lastSeq,runId"
+      || typeof cursor.runId !== "string" || cursor.runId.length === 0
+      || typeof cursor.eventId !== "string" || cursor.eventId.length === 0
+      || !Number.isInteger(cursor.lastSeq) || Number(cursor.lastSeq) < 0) {
+      return null;
+    }
+    return cursor as unknown as WorkflowStreamCursor;
+  } catch {
+    return null;
+  }
+}
+
+export function saveWorkflowStreamCursor(threadId: string, cursor: WorkflowStreamCursor): void {
+  storageSet(workflowStreamKey(threadId), JSON.stringify({
+    runId: cursor.runId,
+    eventId: cursor.eventId,
+    lastSeq: cursor.lastSeq,
+  }));
+}
+
+export function clearWorkflowStreamCursor(threadId: string): void {
+  storageRemove(workflowStreamKey(threadId));
+}

@@ -2,6 +2,11 @@
 
 定义所有 LangGraph Graph 共享的客观数据工具调用准则与中立红线。
 框架方法与具体分析维度下沉至 Skills（如 stock-analysis），不在底层系统提示词中硬编码。
+
+两套模板：绑定了工具的交互式图（agent / embedded_agent）用完整版；工作流阶段
+（debate / reflection / daily_review / news_digest）不绑定任何工具，必须用
+`tools=False` 的无工具版——否则强 agentic 模型会照着工具目录输出「我要先调
+query_market」式的叙述而不产出分析（glm-5.2 实测）。中立红线两版完全一致。
 """
 from __future__ import annotations
 
@@ -27,7 +32,19 @@ FIXED_SYSTEM_POLICY = """你是 Vibe-Research 里的投研助理。你可以调�
 当前页面上下文：
 {context}"""
 
+FIXED_SYSTEM_POLICY_NO_TOOLS = """你是 Vibe-Research 里的投研助理。本次任务不调用任何工具：所需的全部客观数据与背景都已包含在下面的输入内容中，请直接基于它们一次性输出完整分析，不要请求工具、不要描述你打算调用什么工具。
 
-def fixed_system_policy(context: str = "") -> str:
-    """返回填充上下文后的固定中立系统提示词。"""
-    return FIXED_SYSTEM_POLICY.format(context=context or "（无）")
+硬性合规与中立红线（务必严格遵守）：
+- 只做客观信息整理、数据解读与多视角分析；不推荐买卖、不预测涨跌、不给目标价、不评级、不排名、不给交易时机、不承诺收益。
+- 严格基于输入内容中提供的客观数据，不要陈述未核实的事实或编造数字；对缺失数据需明确标注数据缺口。
+- 涉及个股与市场观点时客观呈现多空各方视角与风险，让用户自己做决策。
+- 用简洁中文回答。
+
+当前页面上下文：
+{context}"""
+
+
+def fixed_system_policy(context: str = "", *, tools: bool = True) -> str:
+    """返回填充上下文后的固定中立系统提示词；无工具绑定的调用方传 tools=False。"""
+    template = FIXED_SYSTEM_POLICY if tools else FIXED_SYSTEM_POLICY_NO_TOOLS
+    return template.format(context=context or "（无）")

@@ -9,25 +9,19 @@
 
 from __future__ import annotations
 
-import inspect
-import json
 import os
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 import astock
-import chat as chat_layer
-import cli_runtime
-import debate as debate_layer
 import gstock
 import newsradar
 import portfolio as pf
 import market
 import myreports as mr
-import reflection as reflect_layer
 
 
 from version import read_version
@@ -82,151 +76,21 @@ def health():
     return {"ok": True, "service": "vibe-research-api", "version": __version__}
 
 
-class LLMConfig(BaseModel):
-    provider: str = ""       # cli-* = 订阅接入（调本机 CLI）；其余 = API 接入
-    baseURL: str = ""        # 订阅接入时留空
-    apiKey: str = ""         # 订阅接入时留空
-    model: str
+def _agent_status_payload() -> dict:
+    """Agent 只读状态：读取静态设置并脱敏；配置缺失/无效返回安全形状，不抛异常。"""
+    from agent.settings import AgentSettingsError, agent_settings_path, agent_status_summary, load_agent_settings
+
+    path = agent_settings_path()
+    try:
+        return agent_status_summary(load_agent_settings(path), path=path)
+    except AgentSettingsError:
+        return agent_status_summary(None, path=path)
 
 
-class ChatReq(BaseModel):
-    messages: list[dict]
-    context: str = ""
-    llm: LLMConfig
-
-
-@app.post("/api/chat")
-def chat(req: ChatReq):
-    """系统 AI 对话，**流式** NDJSON（每行一个事件 {type: tool|delta|done|error}）。
-
-    - API 接入：OpenAI 兼容 function-calling，边流答案边推工具调用事件。
-    - 订阅接入（provider=cli-*）：调本机已登录的 CLI，stdout 边出边流（数据靠 context）。
-    配置错误（缺 key / 未装 CLI）走 HTTP 400；运行时错误走流内 error 事件。用户配置随请求传入，后端不持久化。
-    """
-    if not req.messages:
-        raise HTTPException(400, "messages 不能为空")
-    if not req.llm.model:
-        raise HTTPException(400, "缺少模型配置，请先在「接入 AI」里选择")
-
-    is_cli = req.llm.provider.startswith("cli-")
-    if is_cli:
-        kind = req.llm.provider[4:]
-        if not cli_runtime.detect_cli(kind):
-            raise HTTPException(400, f"未检测到「{kind}」对应的本机命令。请先安装并登录该 CLI，或改用「API 接入」。")
-    elif not req.llm.apiKey or not req.llm.baseURL:
-        raise HTTPException(400, "缺少 Base URL 或 API Key，请先在「接入 AI」里填写")
-
-    cfg = req.llm.model_dump()
-
-    def gen():
-        try:
-            events = (chat_layer.run_chat_cli_stream if is_cli else chat_layer.run_chat_stream)(cfg, req.messages, req.context)
-            for ev in events:
-                yield json.dumps(ev, ensure_ascii=False) + "\n"
-        except Exception as e:  # noqa: BLE001 — 运行时错误以流内事件上报，不中断连接
-            yield json.dumps({"type": "error", "message": f"对话失败：{e}"}, ensure_ascii=False) + "\n"
-
-    return StreamingResponse(gen(), media_type="application/x-ndjson")
-
-
-def _check_llm(llm: LLMConfig) -> dict:
-    """校验模型配置并返回 cfg（chat / debate / reflect 三个流式端点共用）。
-
-    配置问题走 HTTP 400（前端能弹提示引导去「接入 AI」页），运行时错误留给流内 error 事件。
-    """
-    if not llm.model:
-        raise HTTPException(400, "缺少模型配置，请先在「接入 AI」里选择")
-    if llm.provider.startswith("cli-"):
-        kind = llm.provider[4:]
-        if not cli_runtime.detect_cli(kind):
-            raise HTTPException(400, f"未检测到「{kind}」对应的本机命令。请先安装并登录该 CLI，或改用「API 接入」。")
-    elif not llm.apiKey or not llm.baseURL:
-        raise HTTPException(400, "缺少 Base URL 或 API Key，请先在「接入 AI」里填写")
-    return llm.model_dump()
-
-
-def _ndjson(events):
-    """把事件生成器包成 NDJSON 流；运行时异常转成流内 error 事件，不中断连接。"""
-    if inspect.isasyncgenfunction(events) or hasattr(events, "__aiter__"):
-        async def gen_async():
-            try:
-                gen_obj = events() if callable(events) else events
-                async for ev in gen_obj:
-                    yield json.dumps(ev, ensure_ascii=False) + "\n"
-            except Exception as e:  # noqa: BLE001
-                yield json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False) + "\n"
-        return StreamingResponse(gen_async(), media_type="application/x-ndjson")
-
-    def gen():
-        try:
-            for ev in (events() if callable(events) else events):
-                yield json.dumps(ev, ensure_ascii=False) + "\n"
-        except Exception as e:  # noqa: BLE001
-            yield json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False) + "\n"
-
-    return StreamingResponse(gen(), media_type="application/x-ndjson")
-
-
-class DebateReq(BaseModel):
-    code: str
-    rounds: int = 1
-    llm: LLMConfig
-
-
-@app.post("/api/debate")
-def debate(req: DebateReq):
-    """多空辩论：后端先拉客观事实底稿，再让多方 / 空方 / 中立主持依次发言，**流式** NDJSON。
-
-    刻意不产出买卖结论——终点是「分歧点 + 验证清单」，判断留给用户自己。
-    """
-    code = _validate(req.code)
-    cfg = _check_llm(req.llm)
-    rounds = 2 if req.rounds >= 2 else 1
-    return _ndjson(lambda: debate_layer.run_debate_stream(cfg, code, rounds))
-
-
-class ReflectReq(BaseModel):
-    source: str
-    title: str = ""
-    llm: LLMConfig
-
-
-@app.post("/api/reflect")
-def reflect(req: ReflectReq):
-    """反思：对一段已写好的分析做推理审计（哪些有数据支撑、最脆弱一环、验证清单），流式 NDJSON。"""
-    if not (req.source or "").strip():
-        raise HTTPException(400, "source 不能为空")
-    cfg = _check_llm(req.llm)
-    return _ndjson(lambda: reflect_layer.run_reflection_stream(cfg, req.source, req.title))
-
-
-class DailyReviewReq(BaseModel):
-    summary: str
-    date: str = ""
-    llm: LLMConfig
-
-
-@app.post("/api/daily-review")
-def daily_review(req: DailyReviewReq):
-    """每日复盘：结构化分析与多维风险提示，流式 NDJSON。"""
-    if not (req.summary or "").strip():
-        raise HTTPException(400, "summary 不能为空")
-    cfg = _check_llm(req.llm)
-    return _ndjson(lambda: reflect_layer.run_reflection_stream(cfg, req.summary, f"每日复盘 {req.date}".strip()))
-
-
-class NewsDigestReq(BaseModel):
-    news_text: str
-    llm: LLMConfig
-
-
-@app.post("/api/news-digest")
-def news_digest(req: NewsDigestReq):
-    """新闻摘要：多维事件提炼与逻辑推演，流式 NDJSON。"""
-    if not (req.news_text or "").strip():
-        raise HTTPException(400, "news_text 不能为空")
-    cfg = _check_llm(req.llm)
-    return _ndjson(lambda: reflect_layer.run_reflection_stream(cfg, req.news_text, "新闻简报"))
+@app.get("/api/agent/status")
+def agent_status():
+    """Agent 配置只读摘要（脱敏；受 VR_API_KEY 中间件保护，不调用模型）。"""
+    return _agent_status_payload()
 
 
 class HoldingIn(BaseModel):

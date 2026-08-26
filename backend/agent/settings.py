@@ -12,6 +12,7 @@ import stat
 import sys
 from pathlib import Path
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
@@ -105,3 +106,67 @@ def load_agent_settings(path: Path | None = None) -> AgentSettings:
     except OSError:
         pass
     return settings
+
+
+# 缺配置时给用户复制的最小模板：api_key 只能是显式占位符，绝不预填真实密钥。
+CONFIG_TEMPLATE = (
+    '{\n  "model": {\n    "provider": "openai",\n    "name": "your-model",\n'
+    '    "apiKey": "YOUR_API_KEY",\n'
+    '    "baseURL": "https://your-provider.example/v1"\n  },\n'
+    '  "skills": {\n    "path": "~/.vibe-research/agent/skills"\n  },\n'
+    '  "mcpServers": {}\n}'
+)
+
+
+def _builtin_skill_count() -> int:
+    """统计仓库内置 Skill 目录数（只数目录，不读内容）。"""
+    builtin_root = Path(__file__).resolve().parent / "builtin_skills"
+    try:
+        return sum(1 for child in builtin_root.iterdir() if child.is_dir())
+    except OSError:
+        return 0
+
+
+def _base_url_host(base_url: str) -> str | None:
+    try:
+        host = urlsplit(base_url).hostname
+    except ValueError:
+        return None
+    return host or None
+
+
+def agent_status_summary(
+    settings: AgentSettings | None,
+    *,
+    path: Path | None = None,
+) -> dict[str, object]:
+    """只读脱敏摘要：FastAPI `/api/agent/status` 的唯一数据源。
+
+    - settings 为 None（配置缺失/无效）时返回安全形状与中文原因，不抛异常；
+    - 永不包含 api_key、MCP header / env 等任何密钥；
+    - 模板 api_key 固定为 YOUR_API_KEY 占位符。
+    """
+    resolved = (path or agent_settings_path()).expanduser().resolve()
+    base: dict[str, object] = {
+        "configured": False,
+        "settings_path": str(resolved),
+        "model_name": None,
+        "base_url_host": None,
+        "builtin_skill_count": 0,
+        "mcp_server_count": 0,
+        "restart_required": True,
+        "config_template": CONFIG_TEMPLATE,
+        "reason": "Agent 配置缺失或无效，LangGraph Server 未就绪；请按模板创建配置后重启。",
+    }
+    if settings is None:
+        return base
+    return {
+        "configured": True,
+        "settings_path": str(resolved),
+        "model_name": settings.model.name,
+        "base_url_host": _base_url_host(settings.model.base_url),
+        "builtin_skill_count": _builtin_skill_count(),
+        "mcp_server_count": len(settings.mcp_servers),
+        "restart_required": True,
+        "config_template": CONFIG_TEMPLATE,
+    }

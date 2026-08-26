@@ -71,7 +71,7 @@ Vibe-Research 是一个开源的「个人 AI 投研看板」，**主推 A 股、
 | 💼&nbsp;**我&#8288;的&#8288;持&#8288;仓** | 录入即实时盈亏 · 已清仓记录（只存本地、不上传）|
 | 📄&nbsp;**我&#8288;的&#8288;研&#8288;报** | **拖拽 / 多选上传**自己的研报（PDF / Word / txt / 表格 / 图片）· 按文件名**自动分行业**归档 · 下载 / 删除。**只存本地部署目录、不上传、不进仓库** |
 | 📝&nbsp;**研&#8288;究&#8288;记&#8288;录** | 复盘 / 今日要点 / 问 AI / 辩论结果本地沉淀，随时回看 · **反思审计**：让 AI 回头审这段推理——哪些结论有数据撑着、哪些是脑补、最脆弱的一环在哪、要验证得看什么 |
-| 🔌&nbsp;**接&#8288;入&nbsp;AI** | 订阅接入（本机 CLI，免 key）· API 多模型（自动填 baseURL）· MCP（挂进 Claude Code 等 agent）|
+| 🔌&nbsp;**接&#8288;入&nbsp;AI** | 只读状态页：模型只配置在服务端 `settings.json`（权限 0600）· 缺配置时一键复制模板 + 启动指引 · MCP（挂进 Claude Code 等 agent）|
 
 > **投研分析框架**：让 AI 分析个股时，自动按 估值 / 资金面 / 财报质量 / 行业景气 / 事件催化与风险 五维组织结论——框架只规定「怎么读数据」、不规定买卖，方向仍由你自己的 AI 决定。
 >
@@ -111,19 +111,18 @@ Vibe-Research 把三套公开数据源**直接集成进仓库**——`git clone`
 Vibe-Research/
 ├── a-stock-data/      A 股全栈数据工具箱（数据源，v3.6.0，自带即用）
 ├── global-stock-data/ 美股 / 港股数据工具箱（数据源，v2.0.3，自带即用）
-├── backend/           FastAPI :8900 + 本地 LangGraph Server :2024（Agent 工作台）
+├── backend/           FastAPI :8900（数据/业务 API）+ 本地 LangGraph Server :2024（全部 AI）
 │   ├── astock.py        A 股数据（移植自 a-stock-data）
 │   ├── gstock.py        美股 / 港股数据（移植自 global-stock-data）
 │   ├── newsradar.py     资讯雷达（移植自 investment-news）
 │   ├── market.py        市场情绪 + 板块资金流 + 全球指数
 │   ├── portfolio.py     持仓 + 已清仓（存本地用户目录）
-│   ├── tools.py         AI 工具层（24 个数据工具，chat / MCP / debate / Agent 共用）
-│   ├── chat.py          系统 AI（OpenAI 兼容 function-calling）
-│   ├── debate.py        多空辩论编排（事实底稿 → 多方 / 空方 / 中立主持）
-│   ├── reflection.py    反思审计（对已有分析做推理审计）
+│   ├── tools.py         AI 工具层（24 个数据工具，全部 Graph 与 MCP 共用）
 │   ├── mcp_server.py    MCP server（给 Claude Code 等 agent）
-│   ├── langgraph.json   Agent 工作台图注册（agent/graph.py → langgraph dev）
-│   └── agent/           Agent 图组装：静态设置 + 工具适配 + 图构建
+│   ├── langgraph.json   六个 LangGraph 图注册（agent / embedded_agent / debate /
+│   │                    reflection / daily_review / news_digest）
+│   └── agent/           统一 AI 运行时：模型工厂 + 中立策略 + 工具执行器 + Skill 库
+│                        + 工作流 YAML 加载/编译（agent/workflows/*.yaml）
 └── frontend/          Vite + React 19 + TS + Tailwind（玻璃暖橙主题）:5899
 ```
 
@@ -135,11 +134,11 @@ Vibe-Research/
 务必先 `pip install -r requirements.txt`。
 
 ```bash
-# 数据 + 传统 AI 后端（FastAPI :8900）
+# 数据 / 业务后端（FastAPI :8900，客观行情、持仓、研报等）
 cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8900
 
-# Agent 工作台后端（本地 LangGraph Server :2024，只用 127.0.0.1，绝不绑局域网/公网地址）
+# AI 运行时（本地 LangGraph Server :2024，六个图；只用 127.0.0.1，绝不绑局域网/公网地址）
 .venv/bin/langgraph dev --host 127.0.0.1 --port 2024 --no-browser
 
 # 前端（Vite :5899，/api 代理到 8900、/agent-api 代理到 2024）
@@ -149,26 +148,50 @@ cd ../frontend && npm install && npm run dev
 
 ## 接入 AI
 
-在「接入 AI」页配置一次，全站的「问 AI / 复盘 / 今日要点」就都用你自己的模型。**分析都由你的模型给出，本产品不校准、无倾向。** 三种方式：
+所有模型调用统一走**本地 LangGraph Server**（`127.0.0.1:2024`）上的六个图：
+`agent`（工作台）、`embedded_agent`（页面问 AI）、`debate`（多空辩论）、
+`reflection`（反思审计）、`daily_review`（每日复盘）、`news_digest`（资讯提炼）。
+模型与密钥**只**来自一份本地静态配置文件（默认 `~/.vibe-research/agent/settings.json`，
+可用 `VR_AGENT_SETTINGS` 覆盖），Agent Server 启动时读取一次，修改后需重启：
 
-### 1. 订阅接入（调本机已登录的 CLI，免 API key）
+```bash
+mkdir -p ~/.vibe-research/agent/skills
+# 把下面模板写到 ~/.vibe-research/agent/settings.json（apiKey 填你自己的）
+chmod 600 ~/.vibe-research/agent/settings.json
+```
 
-用你自己的**订阅额度**，不用付 API 费。已支持：**Claude Code · Codex · Qwen Code · DeepSeek CLI**。
+```json
+{
+  "model": {
+    "provider": "openai",
+    "name": "your-model",
+    "apiKey": "YOUR_API_KEY",
+    "baseURL": "https://your-provider.example/v1",
+    "temperature": 0.2,
+    "thinking": false
+  },
+  "skills": { "path": "~/.vibe-research/agent/skills" },
+  "mcpServers": {}
+}
+```
 
-- **前提**：① 后端跑在你本机（云端读不到你本机 CLI）；② 对应 CLI 已安装并登录，命令在 `PATH` 上。例如：
-  - Claude Code：`npm i -g @anthropic-ai/claude-code` → `claude`（用 Claude 订阅登录）
-  - Codex：装 OpenAI Codex CLI → `codex login`（用 ChatGPT 订阅）
-  - Qwen / DeepSeek：装各自 CLI 并登录
-- 在「接入 AI 页 → 订阅接入」选一个即可，**无需填 key**。
-- 原理：后端 `cli_runtime.py` 检测本机命令并 `spawn` 它一次性作答（数据已在提示词里）。⚠️ CLI 不做多轮工具调用，适合「复盘 / 今日要点 / 个股页问 AI」这类**数据已备好**的场景；要 AI 自己现场调数据工具的自由问答，用下面的「API 接入」。
+要点：
 
-### 2. API 接入（填自己的 key）
-
-「接入 AI 页 → API 接入」选一个模型，**baseURL 自动填好**，只需粘 key。内置 **DeepSeek / 豆包 / MiniMax / OpenAI / OpenRouter / Groq / Together / MiMo / 任意 OpenAI 兼容端点**。这条支持 function-calling——AI 会自己调数据工具（行情/估值/研报/新闻）再作答。key 只存你本地浏览器、随请求发给你自己的后端、不上传、不进仓库。
-
-### 3. MCP（给 Claude Code / 高手 agent）
-
-把后端挂成 MCP server，agent 用自己的订阅额度调 Vibe-Research 的数据工具、多步分析。命令见 [`backend/README.md`](backend/README.md)。要更全量的 A 股数据端点，用根目录 [`a-stock-data/`](a-stock-data/SKILL.md) 工具箱。
+- **浏览器不再保存任何模型密钥**。前端「AI 接入状态」页只读展示脱敏摘要
+  （模型名 / 主机 / Skill 与 MCP 数量 / 配置路径 + 重启指引），模板里的
+  `YOUR_API_KEY` 只是占位符。旧版浏览器里的 `vr-llm` / `vr-askai-chat:*`
+  值属于迁移前数据：新代码不读取、不迁移、也不删除。
+- **FastAPI 只保留数据 / 业务 API**（行情、持仓、研报、资讯雷达、只读
+  `/api/agent/status`）。公网部署设 `VR_API_KEY` 保护的是 FastAPI；
+  它**不**保护 LangGraph——`/agent-api` 只是本机开发代理，公网部署
+  绝不要把它反代出去。
+- **MCP（给 Claude Code / 高手 agent）**：把后端挂成 MCP server，agent 用自己的
+  订阅额度调 Vibe-Research 的数据工具、多步分析。命令见
+  [`backend/README.md`](backend/README.md)。要更全量的 A 股数据端点，用根目录
+  [`a-stock-data/`](a-stock-data/SKILL.md) 工具箱。
+- **会话与历史就在本机**：问 AI / 辩论 / 反思 / 复盘 / 提炼的历史保存在 LangGraph
+  的本地检查点里（页面刷新可恢复，各业务页面自己的历史区可查看 / 重新运行 /
+  显式删除）；旧浏览器对话键不迁移。
 
 ## 多 agent 是怎么设计的
 
@@ -209,10 +232,9 @@ portfolio_manager 角色，产出「买 / 卖 / 仓位多少」。**本项目刻
 **想省钱 / 省额度，按这个顺序：**
 
 1. **默认用一轮就够**。两轮只在你真想看双方对轰时用——它把开销直接翻倍。
-2. **用「订阅接入」（本机 CLI）而不是 API key**。走 Claude Code / Codex 等已登录的 CLI，不额外花钱。
-3. **辩论不需要贵模型**。数据已经在底稿里备齐了，模型只做组织和表达，中档模型足够；
+2. **辩论不需要贵模型**。数据已经在底稿里备齐了，模型只做组织和表达，中档模型足够；
    把预算留给你自己的深度提问。
-4. **别连续狂点**。底稿要打十几个公开接口且带节流，短时间反复触发既慢也容易被上游限流。
+3. **别连续狂点**。底稿要打十几个公开接口且带节流，短时间反复触发既慢也容易被上游限流。
 
 > 换算成 token 大致是：一轮约 3–4 万输入 + 4–5 千输出（中文按 1 字≈1 token 粗估，
 > 实际随模型 tokenizer 浮动）。按主流模型的价格，一轮通常在几分钱到几毛钱之间——
@@ -225,57 +247,24 @@ portfolio_manager 角色，产出「买 / 卖 / 仓位多少」。**本项目刻
 
 开销小得多——**只有 1 次模型调用**，输入就是你选中的那段文本（超过 1.2 万字会自动截断并提示）。
 
-## Agent 工作台
+## Agent 工作台与统一 AI 工作流
 
-「Agent 工作台」由一个**本地 LangGraph Server**（`127.0.0.1:2024`，与 FastAPI 分离启动）驱动：
-线程、运行、检查点与人工审批（HITL）全部由它原生持久化，进程重启后普通会话与待审批断点都能恢复。
-Agent 按轮调用你配置的模型与工具（内置行情/资讯工具 + 你接入的 MCP 服务器，配合本地 Skills 库）。
-它和整个产品一样**只整理客观数据与分析框架，不给买卖结论**——辩论止于分歧点，工作台止于
-「可核对的事实」。
+「Agent 工作台」和全部 AI 对话 / 分析工作流都由同一个**本地 LangGraph Server**
+（`127.0.0.1:2024`，与 FastAPI 分离启动）驱动：线程、运行、检查点与人工审批（HITL）
+全部由它原生持久化。工作台是自由对话 + MCP / Skills 的通用 agent；页面内「问 AI」、
+多空辩论、反思审计、每日复盘、资讯提炼是五个独立图，各自隔离持久化——工作流历史只在
+对应业务页面查看（辩论在辩论页、反思在研究记录页、复盘 / 提炼在各自页面），不进工作台
+会话列表，也没有全局历史页。
 
-模型、MCP 与 Skills 全部来自一份**本地静态配置文件**（默认 `~/.vibe-research/agent/settings.json`，
-可用 `VR_AGENT_SETTINGS` 覆盖），Agent Server 启动时读取一次，修改后需重启：
-
-```json
-{
-  "model": {
-    "provider": "openai",
-    "name": "gpt-5",
-    "apiKey": "sk-...",
-    "baseURL": "https://api.openai.com/v1",
-    "temperature": 0.2,
-    "thinking": false
-  },
-  "skills": {
-    "path": "/absolute/path/to/skills"
-  },
-  "mcpServers": {
-    "example": {
-      "transport": "stdio",
-      "command": "uvx",
-      "args": ["example-mcp"],
-      "env": {}
-    },
-    "remote-example": {
-      "transport": "http",
-      "url": "https://example.com/mcp",
-      "headers": {
-        "Authorization": "Bearer ..."
-      }
-    }
-  },
-  "trace": {
-    "enabled": true,
-    "dir": "~/.vibe-research/agent/traces"
-  }
-}
-```
+Agent 按轮调用你配置的模型与工具（内置行情/资讯工具 + 你接入的 MCP 服务器，配合本地
+Skills 库）。它和整个产品一样**只整理客观数据与分析框架，不给买卖结论**——辩论止于
+分歧点，工作台止于「可核对的事实」。配置文件见上文「接入 AI」。
 
 要点：
 
 - **密钥只在本地设置文件**：模型/MCP 密钥以明文保存在 `settings.json`，请执行
   `chmod 600 ~/.vibe-research/agent/settings.json`（权限过宽时服务启动会在 stderr 提醒）。
-  它们不进入线程元数据、检查点、日志或前端请求；传统「接入 AI」页的 `vr-llm` 仍存浏览器 localStorage。
+  它们不进入线程元数据、检查点、日志或前端请求；旧版浏览器里的 `vr-llm` 等键不再被读取（保留在磁盘、无人使用）。
 - **会话数据在用户目录**：`scripts/dev` 托管启动的 Agent Server 以
   `~/.vibe-research/agent/server/` 为工作目录——里面是自动生成的绝对路径
   `langgraph.json` 与 `.langgraph_api/` 会话数据（运行时把存储路径硬编码为

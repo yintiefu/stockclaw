@@ -19,6 +19,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Overwrite
 
 from agent.model_factory import build_model
 from agent.policy import fixed_system_policy
@@ -31,13 +32,14 @@ from agent.workflow_loader import (
     StagedResearchConfig,
     WorkflowConfig,
     WorkflowConfigError,
+    validate_staged_input,
 )
 from agent.workflow_runtime import (
+    WorkflowContextOverflow,
+    build_stage_messages,
     collect_dossier_sections,
-    format_full_dossier_text,
     redact_workflow_error,
     run_stage,
-    serialize_stage_context,
     summarize_dossier,
 )
 from agent.workflow_state import (
@@ -46,7 +48,31 @@ from agent.workflow_state import (
     WorkflowError,
     WorkflowState,
     WorkflowStatus,
+    coerce_stage_map,
+    coerce_stage_result,
 )
+
+
+class WorkflowGraphState(WorkflowState, total=False):
+    """增加仅供事件续号使用的内部 checkpoint 字段。"""
+
+    event_run_id: str
+
+
+def _event_emitter(
+    workflow_id: str,
+    state: WorkflowGraphState,
+    config: RunnableConfig,
+) -> WorkflowEventEmitter:
+    """同一 run 续号；新 run 即使从中间 checkpoint 恢复也从 1 开始。"""
+    emitter = WorkflowEventEmitter.from_config(
+        workflow_id,
+        state.get("event_seq", 0),
+        config,
+    )
+    if state.get("event_run_id") != emitter.run_id:
+        return WorkflowEventEmitter.from_config(workflow_id, 0, config)
+    return emitter
 
 
 def _load_instruction_text(skill_name: str, instruction_path: str, root: Path) -> str:
@@ -64,66 +90,82 @@ def _build_staged_graph(
     checkpointer: BaseCheckpointSaver | None,
     builtin_skills_root: Path,
 ) -> CompiledStateGraph:
-    builder = StateGraph(WorkflowState)
+    builder = StateGraph(WorkflowGraphState)
 
     # 1. 校验与初始化节点
-    async def validate_input(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
+    async def validate_input(state: WorkflowGraphState, config: RunnableConfig) -> dict[str, Any]:
         variant = state.get("variant") or list(cfg.variants.keys())[0]
         if variant not in cfg.variants:
             raise ValueError(f"未知的变体：'{variant}'，有效变体：{list(cfg.variants.keys())}")
 
-        code = state.get("input", {}).get("code", "")
-        if not code or not isinstance(code, str):
-            raise ValueError(f"缺少必要输入字段 'code': {state.get('input')}")
+        validate_staged_input(cfg, state.get("input", {}))
 
-        emitter = WorkflowEventEmitter.from_config(cfg.id, state.get("event_seq", 0), config)
+        emitter = _event_emitter(cfg.id, state, config)
         await emitter.emit(
-            "workflow_started",
-            workflow_type=cfg.id,
-            input=state.get("input", {}),
-            variant=variant,
+            "workflow.status",
+            status="running",
+            message="工作流已启动",
         )
         return {
             "workflow_id": cfg.id,
-            "workflow_type": cfg.id,
             "workflow_status": "running",
             "config_version": cfg.config_version,
             "variant": variant,
-            "stages": {},
-            "errors": [],
+            "started_at": utc_now(),
+            "dossier": None,
+            "stages": Overwrite(value={}),
+            "current_stage": None,
+            "result": None,
+            "result_summary": None,
+            "completed_at": None,
+            "errors": Overwrite(value=[]),
+            "event_run_id": emitter.run_id,
             "event_seq": emitter.last_seq,
         }
 
     builder.add_node("validate_input", validate_input)
 
     # 2. 收集底稿节点
-    async def collect_dossier(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
+    async def collect_dossier(state: WorkflowGraphState, config: RunnableConfig) -> dict[str, Any]:
         code = state["input"]["code"]
-        emitter = WorkflowEventEmitter.from_config(cfg.id, state.get("event_seq", 0), config)
+        emitter = _event_emitter(cfg.id, state, config)
         sections, missing = await collect_dossier_sections(code, cfg.dossier, emitter)
         summary = summarize_dossier(sections, missing, cfg.dossier.dossier_summary_chars)
-        dossier_res = DossierResult(sections=sections, summary=summary, missing=missing)
+        dossier_res = DossierResult(
+            sections=sections,
+            summary=summary,
+            missing=missing,
+            has_substantive_data=any(section.status == "completed" for section in sections),
+        )
         return {
             "dossier": dossier_res,
+            "event_run_id": emitter.run_id,
             "event_seq": emitter.last_seq,
         }
 
     builder.add_node("collect_dossier", collect_dossier)
 
     # 2.5 底稿全空熔断节点
-    async def abort_no_data(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
+    async def abort_no_data(state: WorkflowGraphState, config: RunnableConfig) -> dict[str, Any]:
         err = WorkflowError(
             code="NO_SUBSTANTIVE_DATA",
             message="全部客观数据源抓取失败或为空，分析必须有客观底稿支撑，辩论中止。",
             stage_id=None,
         )
-        emitter = WorkflowEventEmitter.from_config(cfg.id, state.get("event_seq", 0), config)
-        await emitter.emit("workflow_failed", workflow_type=cfg.id, error=err)
+        emitter = _event_emitter(cfg.id, state, config)
+        await emitter.emit(
+            "workflow.failed",
+            error_code=err.code,
+            message=err.message,
+            retryable=err.retryable,
+        )
         return {
             "workflow_status": "failed",
+            "completed_at": utc_now(),
             "result_summary": "多空辩论中止：无客观底稿数据",
             "result": None,
             "errors": [err],
+            "event_run_id": emitter.run_id,
             "event_seq": emitter.last_seq,
         }
 
@@ -135,13 +177,14 @@ def _build_staged_graph(
         stage_id = s_cfg.id
         instruction_text = _load_instruction_text(s_cfg.skill, s_cfg.instruction, builtin_skills_root)
 
-        def make_start_fn(sid: str):
-            async def start_fn(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
-                emitter = WorkflowEventEmitter.from_config(cfg.id, state.get("event_seq", 0), config)
-                await emitter.emit("stage_started", stage_id=sid)
+        def make_start_fn(sid: str, label: str):
+            async def start_fn(state: WorkflowGraphState, config: RunnableConfig) -> dict[str, Any]:
+                emitter = _event_emitter(cfg.id, state, config)
+                await emitter.emit("stage.started", stage_id=sid, label=label)
                 return {
                     "current_stage": sid,
-                    "stages": {sid: StageResult(stage_id=sid, status="running")},
+                    "stages": {sid: StageResult(id=sid, status="running", started_at=utc_now())},
+                    "event_run_id": emitter.run_id,
                     "event_seq": emitter.last_seq,
                 }
             return start_fn
@@ -149,28 +192,12 @@ def _build_staged_graph(
         def make_run_fn(stage_config, instr: str):
             sid = stage_config.id
 
-            async def run_fn(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
-                current_st = state.get("stages", {}).get(sid)
+            async def run_fn(state: WorkflowGraphState, config: RunnableConfig) -> dict[str, Any]:
+                current_st = coerce_stage_result(state.get("stages", {}).get(sid), sid)
                 if current_st and current_st.status == "completed":
                     return {}
 
-                code = state.get("input", {}).get("code", "")
                 dossier = state.get("dossier")
-                dossier_sections = dossier.sections if dossier else []
-                dossier_missing = dossier.missing if dossier else []
-
-                # 严格实施提示词上下文总预算控制 (Hard Prompt Budgeting)
-                total_budget = min(stage_config.context_chars, HARD_LIMITS["stage_context_chars"])
-                facts_budget = total_budget // 2
-                context_budget = total_budget - facts_budget
-
-                if sid == "referee":
-                    facts_text = summarize_dossier(dossier_sections, dossier_missing, facts_budget)
-                else:
-                    full_facts = format_full_dossier_text(dossier_sections, dossier_missing, code)
-                    facts_text = full_facts[:facts_budget] if len(full_facts) > facts_budget else full_facts
-
-                # 计算前序阶段上下文
                 variant = state.get("variant") or list(cfg.variants.keys())[0]
                 variant_stages = cfg.variants.get(variant, [])
                 preceding_ids: list[str] = []
@@ -179,22 +206,18 @@ def _build_staged_graph(
                         break
                     preceding_ids.append(vid)
 
-                context_text, _ctx_truncated = serialize_stage_context(
-                    state.get("stages", {}),
-                    preceding_ids,
-                    context_budget,
-                )
-
-                policy_text = fixed_system_policy(f"工作流：{cfg.id} · 阶段：{sid}")
-                messages = [
-                    SystemMessage(
-                        content=f"{policy_text}\n\n【角色任务与指引】\n{instr}\n\n{facts_text}\n\n【前序讨论上下文】\n{context_text}"
-                    ),
-                    HumanMessage(content=f"请基于客观底稿与前序上下文，针对标的 {code} 进行分析并输出。"),
-                ]
-
-                emitter = WorkflowEventEmitter.from_config(cfg.id, state.get("event_seq", 0), config)
+                emitter = _event_emitter(cfg.id, state, config)
                 try:
+                    code = state.get("input", {}).get("code", "")
+                    messages, context_truncated = build_stage_messages(
+                        workflow_id=cfg.id,
+                        stage=stage_config,
+                        instruction_text=instr,
+                        user_text=f"请基于允许的客观底稿与前序上下文，针对标的 {code} 进行分析并输出。",
+                        dossier=dossier,
+                        stages=coerce_stage_map(state.get("stages")),
+                        preceding_stage_ids=preceding_ids,
+                    )
                     content, truncated = await run_stage(
                         model=model,
                         messages=messages,
@@ -202,48 +225,64 @@ def _build_staged_graph(
                         emitter=emitter,
                         stage_id=sid,
                     )
-                    await emitter.emit("stage_completed", stage_id=sid, truncated=truncated)
+                    await emitter.emit("stage.completed", stage_id=sid, truncated=truncated)
                     return {
                         "stages": {
                             sid: StageResult(
-                                stage_id=sid,
+                                id=sid,
                                 status="completed",
                                 content=content,
                                 truncated=truncated,
+                                context_truncated=context_truncated,
+                                started_at=current_st.started_at if current_st else None,
                                 completed_at=utc_now(),
                             )
                         },
-                        "context_truncated": _ctx_truncated or truncated,
+                        "event_run_id": emitter.run_id,
                         "event_seq": emitter.last_seq,
                     }
                 except Exception as e:
-                    err = redact_workflow_error(e, stage_id=sid, code="MODEL_ERROR")
-                    await emitter.emit("stage_failed", stage_id=sid, error=err)
+                    error_code = "CONTEXT_OVERFLOW" if isinstance(e, WorkflowContextOverflow) else "MODEL_ERROR"
+                    err = redact_workflow_error(e, stage_id=sid, code=error_code)
+                    await emitter.emit(
+                        "stage.failed",
+                        stage_id=sid,
+                        error_code=err.code,
+                        message=err.message,
+                        retryable=err.retryable,
+                    )
                     return {
-                        "stages": {sid: StageResult(stage_id=sid, status="failed", error=err)},
+                        "stages": {sid: StageResult(
+                            id=sid,
+                            status="failed",
+                            started_at=current_st.started_at if current_st else None,
+                            completed_at=utc_now(),
+                            error=err,
+                        )},
                         "errors": [err],
+                        "event_run_id": emitter.run_id,
                         "event_seq": emitter.last_seq,
                     }
 
             return run_fn
 
-        builder.add_node(f"start_{stage_id}", make_start_fn(stage_id))
+        builder.add_node(f"start_{stage_id}", make_start_fn(stage_id, s_cfg.label))
         builder.add_node(f"run_{stage_id}", make_run_fn(s_cfg, instruction_text))
 
     # 4. 汇总与终态节点
-    async def finalize(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
-        stages = state.get("stages", {})
+    async def finalize(state: WorkflowGraphState, config: RunnableConfig) -> dict[str, Any]:
+        stages = coerce_stage_map(state.get("stages"))
         errors = state.get("errors", [])
         variant = state.get("variant") or list(cfg.variants.keys())[0]
         expected_stages = cfg.variants.get(variant, [])
 
-        completed_count = sum(1 for sid in expected_stages if stages.get(sid, StageResult(stage_id=sid, status="pending")).status == "completed")
-        failed_count = sum(1 for sid in expected_stages if stages.get(sid, StageResult(stage_id=sid, status="pending")).status == "failed")
+        completed_count = sum(1 for sid in expected_stages if stages.get(sid, StageResult(id=sid, status="pending")).status == "completed")
+        failed_count = sum(1 for sid in expected_stages if stages.get(sid, StageResult(id=sid, status="pending")).status == "failed")
 
-        referee_st = stages.get("referee")
-        referee_failed = ("referee" in expected_stages) and (not referee_st or referee_st.status != "completed")
+        result_stage = stages.get(cfg.result_stage)
+        result_stage_failed = not result_stage or result_stage.status != "completed"
 
-        if referee_failed or (failed_count > 0 and completed_count == 0):
+        if result_stage_failed or (failed_count > 0 and completed_count == 0):
             final_status: WorkflowStatus = "failed"
         elif failed_count > 0:
             final_status = "partial"
@@ -254,31 +293,46 @@ def _build_staged_graph(
         missing_count = len(dossier.missing) if dossier else 0
 
         if final_status == "failed":
-            if referee_failed:
-                summary = f"多空辩论失败：中立主持阶段未能正常产出"
+            if result_stage_failed:
+                summary = f"{cfg.id} 失败：结果阶段未能正常产出"
             else:
-                summary = f"多空辩论失败：{failed_count} 个阶段报错中断"
+                summary = f"{cfg.id} 失败：{failed_count} 个阶段报错中断"
         elif final_status == "partial":
-            summary = f"多空辩论部分完成：{completed_count}/{len(expected_stages)} 阶段完成（含错误）"
+            summary = f"{cfg.id} 部分完成：{completed_count}/{len(expected_stages)} 阶段完成（含错误）"
         else:
-            summary = f"多空辩论完成：{completed_count}/{len(expected_stages)} 阶段完成，{missing_count} 项缺口"
+            summary = f"{cfg.id} 完成：{completed_count}/{len(expected_stages)} 阶段完成，{missing_count} 项缺口"
 
         if len(summary) > 80:
             summary = summary[:77] + "..."
 
-        emitter = WorkflowEventEmitter.from_config(cfg.id, state.get("event_seq", 0), config)
+        completed_at = utc_now()
+        skipped_stages = {
+            sid: StageResult(id=sid, status="skipped", completed_at=completed_at)
+            for sid in expected_stages
+            if sid not in stages
+        }
+
+        emitter = _event_emitter(cfg.id, state, config)
         if final_status in ("completed", "partial"):
-            await emitter.emit("workflow_completed", workflow_type=cfg.id, result_summary=summary)
+            await emitter.emit("workflow.completed", status=final_status)
         else:
             err = errors[-1] if errors else WorkflowError(code="EXECUTION_FAILED", message="工作流执行失败")
-            await emitter.emit("workflow_failed", workflow_type=cfg.id, error=err)
+            await emitter.emit(
+                "workflow.failed",
+                error_code=err.code,
+                message=err.message,
+                retryable=err.retryable,
+            )
 
-        result_text = referee_st.content if (referee_st and referee_st.status == "completed") else None
+        result_text = result_stage.content if (result_stage and result_stage.status == "completed") else None
 
         return {
             "workflow_status": final_status,
+            "completed_at": completed_at,
+            "stages": skipped_stages,
             "result_summary": summary,
             "result": result_text,
+            "event_run_id": emitter.run_id,
             "event_seq": emitter.last_seq,
         }
 
@@ -288,9 +342,9 @@ def _build_staged_graph(
     builder.set_entry_point("validate_input")
     builder.add_edge("validate_input", "collect_dossier")
 
-    def route_after_dossier(state: WorkflowState) -> str:
+    def route_after_dossier(state: WorkflowGraphState) -> str:
         dossier = state.get("dossier")
-        if not dossier or not any(s.status == "ok" for s in dossier.sections):
+        if not dossier or not dossier.has_substantive_data:
             return "abort_no_data"
         variant = state.get("variant") or list(cfg.variants.keys())[0]
         v_stages = cfg.variants.get(variant, [])
@@ -308,10 +362,10 @@ def _build_staged_graph(
             curr_id = current_stage_cfg.id
             on_err = current_stage_cfg.on_error
 
-            def stage_router(state: WorkflowState) -> str:
+            def stage_router(state: WorkflowGraphState) -> str:
                 variant = state.get("variant") or list(cfg.variants.keys())[0]
                 v_stages = cfg.variants.get(variant, [])
-                st_res = state.get("stages", {}).get(curr_id)
+                st_res = coerce_stage_result(state.get("stages", {}).get(curr_id), curr_id)
 
                 if st_res and st_res.status == "failed" and on_err == "fail":
                     return "finalize"
@@ -337,62 +391,76 @@ def _build_single_pass_graph(
     checkpointer: BaseCheckpointSaver | None,
     builtin_skills_root: Path,
 ) -> CompiledStateGraph:
-    builder = StateGraph(WorkflowState)
+    builder = StateGraph(WorkflowGraphState)
     instruction_text = _load_instruction_text(cfg.skill, cfg.instruction, builtin_skills_root)
 
     # 1. 校验与初始化节点
-    async def validate_input(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
+    async def validate_input(state: WorkflowGraphState, config: RunnableConfig) -> dict[str, Any]:
         text_field = cfg.input.text_field
-        inp_text = state.get("input", {}).get(text_field, "")
+        input_values = state.get("input")
+        inp_text = input_values.get(text_field) if isinstance(input_values, dict) else None
         if not inp_text or not isinstance(inp_text, str):
-            raise ValueError(f"缺少必要输入文本字段 '{text_field}': {state.get('input')}")
+            raise ValueError(f"输入字段 input.{text_field} 缺失或类型错误")
 
-        emitter = WorkflowEventEmitter.from_config(cfg.id, state.get("event_seq", 0), config)
+        emitter = _event_emitter(cfg.id, state, config)
         await emitter.emit(
-            "workflow_started",
-            workflow_type=cfg.id,
-            input=state.get("input", {}),
-            variant=None,
+            "workflow.status",
+            status="running",
+            message="工作流已启动",
         )
         return {
             "workflow_id": cfg.id,
-            "workflow_type": cfg.id,
             "workflow_status": "running",
             "config_version": cfg.config_version,
             "variant": None,
-            "stages": {},
-            "errors": [],
+            "started_at": utc_now(),
+            "dossier": None,
+            "stages": Overwrite(value={}),
+            "current_stage": None,
+            "result": None,
+            "result_summary": None,
+            "completed_at": None,
+            "errors": Overwrite(value=[]),
+            "event_run_id": emitter.run_id,
             "event_seq": emitter.last_seq,
         }
 
     builder.add_node("validate_input", validate_input)
 
     # 2. 启动阶段节点
-    async def start_stage(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
-        emitter = WorkflowEventEmitter.from_config(cfg.id, state.get("event_seq", 0), config)
-        await emitter.emit("stage_started", stage_id=cfg.id)
+    async def start_stage(state: WorkflowGraphState, config: RunnableConfig) -> dict[str, Any]:
+        emitter = _event_emitter(cfg.id, state, config)
+        await emitter.emit("stage.started", stage_id=cfg.id, label=cfg.id)
         return {
             "current_stage": cfg.id,
-            "stages": {cfg.id: StageResult(stage_id=cfg.id, status="running")},
+            "stages": {cfg.id: StageResult(id=cfg.id, status="running", started_at=utc_now())},
+            "event_run_id": emitter.run_id,
             "event_seq": emitter.last_seq,
         }
 
     builder.add_node("start_stage", start_stage)
 
     # 3. 运行阶段节点
-    async def run_stage_fn(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
+    async def run_stage_fn(state: WorkflowGraphState, config: RunnableConfig) -> dict[str, Any]:
         raw_inp = state["input"].get(cfg.input.text_field, "")
-        inp_truncated = len(raw_inp) > cfg.input.max_chars
-        inp_text = raw_inp[:cfg.input.max_chars] if inp_truncated else raw_inp
+        # 单阶段模型不绑定工具：用无工具版策略，避免模型输出「要先调工具」的叙述。
+        policy_text = fixed_system_policy(f"工作流：{cfg.id}", tools=False)
+        system_text = f"{policy_text}\n\n【分析任务与指引】\n{instruction_text}"
+        human_prefix = "【待分析输入内容】\n"
+        human_suffix = "\n\n请按指引进行结构化分析与审计。"
 
-        policy_text = fixed_system_policy(f"工作流：{cfg.id}")
-        messages = [
-            SystemMessage(content=f"{policy_text}\n\n【分析任务与指引】\n{instruction_text}"),
-            HumanMessage(content=f"【待分析输入内容】\n{inp_text}\n\n请按指引进行结构化分析与审计。"),
-        ]
-
-        emitter = WorkflowEventEmitter.from_config(cfg.id, state.get("event_seq", 0), config)
+        emitter = _event_emitter(cfg.id, state, config)
         try:
+            fixed_chars = len(system_text) + len(human_prefix) + len(human_suffix)
+            if fixed_chars > cfg.input.max_chars:
+                raise WorkflowContextOverflow()
+            input_chars = cfg.input.max_chars - fixed_chars
+            inp_truncated = len(raw_inp) > input_chars
+            inp_text = raw_inp[:input_chars]
+            messages = [
+                SystemMessage(content=system_text),
+                HumanMessage(content=f"{human_prefix}{inp_text}{human_suffix}"),
+            ]
             content, truncated = await run_stage(
                 model=model,
                 messages=messages,
@@ -400,35 +468,53 @@ def _build_single_pass_graph(
                 emitter=emitter,
                 stage_id=cfg.id,
             )
-            await emitter.emit("stage_completed", stage_id=cfg.id, truncated=truncated)
+            await emitter.emit("stage.completed", stage_id=cfg.id, truncated=truncated)
+            running_stage = coerce_stage_result(state.get("stages", {}).get(cfg.id), cfg.id)
             return {
                 "result": content,
                 "stages": {
                     cfg.id: StageResult(
-                        stage_id=cfg.id,
+                        id=cfg.id,
                         status="completed",
                         content=content,
                         truncated=truncated,
+                        context_truncated=inp_truncated,
+                        started_at=running_stage.started_at if running_stage else None,
                         completed_at=utc_now(),
                     )
                 },
-                "context_truncated": inp_truncated or truncated,
+                "event_run_id": emitter.run_id,
                 "event_seq": emitter.last_seq,
             }
         except Exception as e:
-            err = redact_workflow_error(e, stage_id=cfg.id, code="MODEL_ERROR")
-            await emitter.emit("stage_failed", stage_id=cfg.id, error=err)
+            error_code = "CONTEXT_OVERFLOW" if isinstance(e, WorkflowContextOverflow) else "MODEL_ERROR"
+            err = redact_workflow_error(e, stage_id=cfg.id, code=error_code)
+            await emitter.emit(
+                "stage.failed",
+                stage_id=cfg.id,
+                error_code=err.code,
+                message=err.message,
+                retryable=err.retryable,
+            )
+            running_stage = coerce_stage_result(state.get("stages", {}).get(cfg.id), cfg.id)
             return {
-                "stages": {cfg.id: StageResult(stage_id=cfg.id, status="failed", error=err)},
+                "stages": {cfg.id: StageResult(
+                    id=cfg.id,
+                    status="failed",
+                    started_at=running_stage.started_at if running_stage else None,
+                    completed_at=utc_now(),
+                    error=err,
+                )},
                 "errors": [err],
+                "event_run_id": emitter.run_id,
                 "event_seq": emitter.last_seq,
             }
 
     builder.add_node("run_stage", run_stage_fn)
 
     # 4. 汇总节点
-    async def finalize(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
-        st = state.get("stages", {}).get(cfg.id)
+    async def finalize(state: WorkflowGraphState, config: RunnableConfig) -> dict[str, Any]:
+        st = coerce_stage_result(state.get("stages", {}).get(cfg.id), cfg.id)
         errors = state.get("errors", [])
         if st and st.status == "completed":
             final_status: WorkflowStatus = "completed"
@@ -437,16 +523,24 @@ def _build_single_pass_graph(
             final_status = "failed"
             summary = f"{cfg.id} 分析失败"
 
-        emitter = WorkflowEventEmitter.from_config(cfg.id, state.get("event_seq", 0), config)
+        emitter = _event_emitter(cfg.id, state, config)
         if final_status == "completed":
-            await emitter.emit("workflow_completed", workflow_type=cfg.id, result_summary=summary)
+            await emitter.emit("workflow.completed", status="completed")
         else:
             err = errors[-1] if errors else WorkflowError(code="EXECUTION_FAILED", message="工作流执行失败")
-            await emitter.emit("workflow_failed", workflow_type=cfg.id, error=err)
+            await emitter.emit(
+                "workflow.failed",
+                error_code=err.code,
+                message=err.message,
+                retryable=err.retryable,
+            )
 
         return {
             "workflow_status": final_status,
+            "completed_at": utc_now(),
+            "result": st.content if (st and st.status == "completed") else None,
             "result_summary": summary,
+            "event_run_id": emitter.run_id,
             "event_seq": emitter.last_seq,
         }
 

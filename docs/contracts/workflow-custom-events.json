@@ -1,46 +1,45 @@
 [
   {
-    "type": "workflow_started",
+    "type": "workflow.status",
     "workflow_id": "debate",
-    "workflow_type": "debate",
     "run_id": "run-001",
     "seq": 1,
     "emitted_at": "2026-08-25T12:00:00Z",
-    "input": { "code": "600519" },
-    "variant": "standard"
+    "status": "running",
+    "message": "正在收集客观数据"
   },
   {
-    "type": "dossier_progress",
+    "type": "dossier.progress",
     "workflow_id": "debate",
     "run_id": "run-001",
     "seq": 2,
     "emitted_at": "2026-08-25T12:00:01Z",
-    "title": "实时行情",
     "section_id": "quote",
-    "tool": "query_quote",
-    "status": "ok",
-    "loaded": 1,
+    "section_status": "completed",
+    "completed": 1,
     "total": 13
   },
   {
-    "type": "dossier_completed",
+    "type": "dossier.ready",
     "workflow_id": "debate",
     "run_id": "run-001",
     "seq": 3,
     "emitted_at": "2026-08-25T12:00:05Z",
-    "section_count": 13,
-    "missing_count": 0
+    "completed": 13,
+    "missing": [],
+    "has_substantive_data": true
   },
   {
-    "type": "stage_started",
+    "type": "stage.started",
     "workflow_id": "debate",
     "run_id": "run-001",
     "seq": 4,
     "emitted_at": "2026-08-25T12:00:06Z",
-    "stage_id": "bull"
+    "stage_id": "bull",
+    "label": "多方研究员"
   },
   {
-    "type": "stage_delta",
+    "type": "stage.delta",
     "workflow_id": "debate",
     "run_id": "run-001",
     "seq": 5,
@@ -49,7 +48,7 @@
     "delta": "多方论点开始"
   },
   {
-    "type": "stage_completed",
+    "type": "stage.completed",
     "workflow_id": "debate",
     "run_id": "run-001",
     "seq": 6,
@@ -58,38 +57,32 @@
     "truncated": false
   },
   {
-    "type": "stage_failed",
+    "type": "stage.failed",
     "workflow_id": "debate",
     "run_id": "run-001",
     "seq": 7,
     "emitted_at": "2026-08-25T12:00:12Z",
     "stage_id": "bear",
-    "error": {
-      "code": "MODEL_TIMEOUT",
-      "message": "模型响应超时",
-      "stage_id": "bear"
-    }
+    "error_code": "MODEL_TIMEOUT",
+    "message": "模型响应超时",
+    "retryable": true
   },
   {
-    "type": "workflow_completed",
+    "type": "workflow.completed",
     "workflow_id": "debate",
-    "workflow_type": "debate",
     "run_id": "run-001",
     "seq": 8,
     "emitted_at": "2026-08-25T12:00:20Z",
-    "result_summary": "多空辩论完成：3 阶段完成，13 项底稿正常"
+    "status": "partial"
   },
   {
-    "type": "workflow_failed",
+    "type": "workflow.failed",
     "workflow_id": "debate",
-    "workflow_type": "debate",
     "run_id": "run-001",
     "seq": 9,
     "emitted_at": "2026-08-25T12:00:22Z",
-    "error": {
-      "code": "EXECUTION_ABORTED",
-      "message": "阶段失败导致工作流中断",
-      "stage_id": "referee"
-    }
+    "error_code": "EXECUTION_ABORTED",
+    "message": "阶段失败导致工作流中断",
+    "retryable": false
   }
 ]

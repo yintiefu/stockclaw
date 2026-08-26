@@ -1,14 +1,14 @@
 import { useState, useEffect } from "react";
-import { Link } from "react-router-dom";
-import { Sparkles, Loader2, AlertCircle, RefreshCw, Gauge, ArrowDownUp, TrendingUp, TrendingDown, Plus, X, Flame, BarChart3, Globe } from "lucide-react";
+import { Loader2, AlertCircle, RefreshCw, Gauge, ArrowDownUp, TrendingUp, TrendingDown, Plus, X, Flame, BarChart3, Globe, Sparkles } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { AskAiButton } from "@/components/ui/AskAiButton";
 import { Disclaimer } from "@/components/ui/Disclaimer";
-import { api, ApiError, type IndexQuote, type Quote, type MarketOverview, type ShortTermEmotion, type TurnoverTop, type GlobalIndex } from "@/lib/api";
-import { dailyReviewStream } from "@/lib/agents";
+import { WorkflowHistory } from "@/components/workflow/WorkflowHistory";
+import { useWorkflowRun } from "@/hooks/useWorkflowRun";
+import { api, type IndexQuote, type Quote, type MarketOverview, type ShortTermEmotion, type TurnoverTop, type GlobalIndex } from "@/lib/api";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
 import { loadWatch, saveWatch, addCodes } from "@/lib/watchlist";
 import { cn } from "@/lib/utils";
@@ -22,10 +22,6 @@ const yi = (v: number | null) => (v == null ? "—" : `${fmt(v / 1e8)} 亿`); //
 export function DailyReview() {
   const [indices, setIndices] = useState<IndexQuote[]>([]);
   const [idxErr, setIdxErr] = useState(false);
-  const [review, setReview] = useState("");
-  const [reviewLoading, setReviewLoading] = useState(false);
-  const [reviewErr, setReviewErr] = useState<string | null>(null);
-  const [needConfig, setNeedConfig] = useState(false);
   const [overview, setOverview] = useState<MarketOverview | null>(null);
   const [emotion, setEmotion] = useState<ShortTermEmotion | null>(null);
   const [turnover, setTurnover] = useState<TurnoverTop | null>(null);
@@ -35,6 +31,9 @@ export function DailyReview() {
   const [watchQuotes, setWatchQuotes] = useState<Record<string, Quote>>({});
   const [watchInput, setWatchInput] = useState("");
   const [watchLoading, setWatchLoading] = useState(false);
+  // 复盘工作流：把页面已渲染的客观数据快照交给 daily_review 图，不让图再拉数据。
+  const reviewRun = useWorkflowRun({ assistantId: "daily_review" });
+  const [historyKey, setHistoryKey] = useState(0);
 
   // 各数据块请求是否已结束：区分「加载中」与「数据源暂不可用」（非交易时段/被限流时后端返回空）
   const [ovDone, setOvDone] = useState(false);
@@ -81,26 +80,24 @@ export function DailyReview() {
   };
 
   const today = new Date().toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
+  // 当前展示的复盘所属日期：新发起 = 今天；从历史打开 = 记录自己的 subject（存笔记用对日期）。
+  const [reviewDate, setReviewDate] = useState<string | null>(null);
+  const effectiveReviewDate = reviewDate ?? today;
 
   const dataSummary = indices.length
     ? indices.map((i) => `${i.name} ${i.price}（${i.change_pct > 0 ? "+" : ""}${i.change_pct}%）`).join("；")
     : "（指数数据未取到）";
 
-  const runReview = async () => {
-    setReviewErr(null);
-    setNeedConfig(false);
-    setReviewLoading(true);
-    setReview("");
-    try {
-      await dailyReviewStream(dataSummary, today, {
-        onDelta: (t) => setReview((r) => r + t),
-        onError: (err) => setReviewErr(err),
-      });
-    } catch (e) {
-      setReviewErr(e instanceof ApiError ? e.message : "复盘失败");
-    } finally {
-      setReviewLoading(false);
-    }
+  const review = reviewRun.state?.result ?? reviewRun.transient.daily_review ?? "";
+  const reviewLoading = reviewRun.running;
+  const reviewErr = reviewRun.error;
+
+  const runReview = () => {
+    setReviewDate(today);
+    void reviewRun.start({
+      input: { market_snapshot: dataSummary },
+      metadata: { title: `每日复盘 · ${today}`, subject: today },
+    }).finally(() => setHistoryKey((k) => k + 1));
   };
 
   const sentiment = overview?.sentiment;
@@ -230,12 +227,6 @@ export function DailyReview() {
             {review ? "重新复盘" : "让 AI 复盘今天"}
           </button>
         </div>
-        {needConfig && (
-          <div className="mt-3 flex items-center gap-2 rounded-lg border border-warning/30 bg-warning/5 p-3 text-sm text-muted-foreground">
-            <AlertCircle className="h-4 w-4 shrink-0 text-warning" />
-            还没接入 AI。<Link to="/settings" className="text-primary">先去接入你的 AI</Link>，之后一键出复盘。
-          </div>
-        )}
         {reviewErr && (
           <div className="mt-3 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
             <AlertCircle className="h-4 w-4 shrink-0" /> {reviewErr}
@@ -244,11 +235,32 @@ export function DailyReview() {
         {review ? (
           <>
             <div className="prose prose-sm dark:prose-invert mt-4 max-w-none text-foreground"><ReactMarkdown remarkPlugins={[remarkGfm]}>{review}</ReactMarkdown></div>
-            {!reviewLoading && <div className="mt-3"><SaveNoteButton kind="复盘" title={`每日复盘 ${today}`} content={review} /></div>}
+            {!reviewLoading && <div className="mt-3"><SaveNoteButton kind="复盘" title={`每日复盘 ${effectiveReviewDate}`} content={review} /></div>}
           </>
-        ) : !needConfig && !reviewErr && !reviewLoading ? (
+        ) : !reviewErr && !reviewLoading ? (
           <p className="mt-3 text-sm text-muted-foreground">点上方按钮，系统把当天客观数据打包给你的 AI，由它生成复盘。<b className="text-foreground">分析是它给的，我们只负责喂数据。</b></p>
         ) : null}
+
+        {/* 复盘历史只在本页查看；打开从 checkpoint 恢复，重新运行创建新 thread */}
+        <div className="mt-4">
+          <WorkflowHistory
+            workflowType="daily_review"
+            refreshKey={historyKey}
+            onOpen={(thread) => {
+              const historicDate = typeof thread.subject === "string" && thread.subject ? thread.subject : today;
+              setReviewDate(historicDate);
+              void reviewRun.restore(thread.threadId).finally(() => setHistoryKey((k) => k + 1));
+            }}
+            onRerun={(_thread, state) => {
+              const snapshot = typeof state.input?.market_snapshot === "string"
+                ? state.input.market_snapshot : dataSummary;
+              void reviewRun.start({
+                input: { market_snapshot: snapshot },
+                metadata: { title: `每日复盘 · ${today}`, subject: today },
+              }).finally(() => setHistoryKey((k) => k + 1));
+            }}
+          />
+        </div>
       </GlassCard>
 
       {/* 4. 市场情绪 */}

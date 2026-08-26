@@ -92,18 +92,21 @@ def test_append_workflow_errors_appends_immutably() -> None:
 
 
 def test_extra_fields_are_forbidden() -> None:
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as workflow_exc:
         WorkflowError(code="ERR", message="msg", extra_field="forbidden")  # type: ignore
+    assert workflow_exc.value.errors()[0]["type"] == "extra_forbidden"
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as stage_exc:
         StageResult(stage_id="s1", status="completed", extra_field="forbidden")  # type: ignore
+    assert stage_exc.value.errors()[0]["type"] == "extra_forbidden"
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as dossier_exc:
         DossierSection(
             id="quote", tool="query_quote", title="行情",
-            empty_policy="gap_if_empty", status="ok", summary="ok", body="{}",
+            empty_policy="gap_if_empty", status="completed", summary="ok", body="{}",
             extra="forbidden",  # type: ignore
         )
+    assert dossier_exc.value.errors()[0]["type"] == "extra_forbidden"
 
 
 def test_dossier_section_and_result_model() -> None:
@@ -112,11 +115,57 @@ def test_dossier_section_and_result_model() -> None:
         tool="query_quote",
         title="行情",
         empty_policy="gap_if_empty",
-        status="ok",
+        status="completed",
         summary="最新价 100",
         body="{\"price\": 100}",
     )
-    res = DossierResult(sections=[sec], summary="底稿摘要", missing=[])
+    res = DossierResult(sections=[sec], summary="底稿摘要", missing=[], has_substantive_data=True)
     assert len(res.sections) == 1
     assert res.summary == "底稿摘要"
     assert res.missing == []
+
+
+def test_state_models_expose_the_stable_design_contract() -> None:
+    error = WorkflowError(
+        code="MODEL_ERROR",
+        message="模型不可用",
+        retryable=True,
+        stage_id="bull",
+    )
+    result = StageResult(
+        id="bull",
+        status="failed",
+        content=None,
+        truncated=False,
+        context_truncated=True,
+        started_at="2026-08-25T12:00:00Z",
+        completed_at="2026-08-25T12:00:01Z",
+        error=error,
+    )
+
+    assert result.id == "bull"
+    assert result.context_truncated is True
+    assert result.started_at == "2026-08-25T12:00:00Z"
+    assert result.error is not None and result.error.retryable is True
+
+
+@pytest.mark.parametrize("status", ["completed", "no_record", "gap", "failed"])
+def test_dossier_sections_distinguish_all_design_statuses(status: str) -> None:
+    section = DossierSection(
+        id="quote",
+        tool="query_quote",
+        title="行情",
+        empty_policy="gap_if_empty",
+        status=status,
+        summary="摘要",
+        body="{}",
+    )
+    dossier = DossierResult(
+        sections=[section],
+        summary="底稿摘要",
+        missing=[] if status == "completed" else ["行情"],
+        has_substantive_data=status == "completed",
+    )
+
+    assert dossier.sections[0].status == status
+    assert dossier.has_substantive_data is (status == "completed")

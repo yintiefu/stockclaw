@@ -2,8 +2,9 @@
 # Vibe-Research 开发编排脚本（参考 Vibe-Trading/scripts/dev，改用 uv 管理 Python）。
 #
 # 用 uv 在 backend/.venv 建虚拟环境 + 装 requirements.txt，再用 `uv run` 拉起 uvicorn；
-# 前端走 npm；Agent 工作台另跑一个 LangGraph Server（backend/langgraph.json，默认
-# 127.0.0.1:2024，线程持久化在 backend/.langgraph_api/）。三者作为后台常驻进程托管，
+# 前端走 npm；Agent 工作台另跑一个 LangGraph Server（图注册镜像自
+# backend/langgraph.json，默认 127.0.0.1:2024，线程持久化在用户目录
+# ~/.vibe-research/agent/server/.langgraph_api/）。三者作为后台常驻进程托管，
 # PID/日志落在 .vr-dev/ 下。
 set -euo pipefail
 
@@ -167,7 +168,12 @@ stop_service() {
   if kill -0 "$pid" 2>/dev/null; then
     printf "stopping %s (pid %s)...\n" "$service" "$pid"
     kill -TERM "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
-    sleep 0.5
+    # langgraph dev 是 in-memory runtime，SIGTERM 时要把会话数据落盘（详见 AGENTS.md），
+    # 给足 10s 宽限再兜底 KILL；硬等 0.5s 会丢线程历史。
+    for ((i = 0; i < 50; i++)); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.2
+    done
     kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
   fi
   rm -f "$file"
@@ -265,21 +271,77 @@ agent_settings_file() {
   printf '%s' "${VR_AGENT_SETTINGS:-$HOME/.vibe-research/agent/settings.json}"
 }
 
-# 生成用户工作目录里的 langgraph.json：图路径/依赖用绝对路径（不依赖 cwd），CORS 白名单
-# 对准实际前端端口。每次启动重新生成，仓库内 backend/langgraph.json 改动不会漂移失效。
+# in-memory runtime 的 pickle 在 PersistentDict.load() 失败时会以空库启动，随后 10s
+# flush 原子覆盖原文件。启动前把 *.pckl 拷到时间戳目录，保留最近 5 份。
+backup_agent_pickles() {
+  local src="$AGENT_WORK_DIR/.langgraph_api"
+  local bak_root="$AGENT_WORK_DIR/pickle-backups"
+  local keep=5
+  [[ -d "$src" ]] || return 0
+  local stamp dest copied=0 f
+  stamp="$(date +%Y%m%d-%H%M%S)-$$"
+  dest="$bak_root/$stamp"
+  mkdir -p "$dest"
+  for f in "$src"/*.pckl; do
+    [[ -f "$f" ]] || continue
+    cp -a "$f" "$dest/"
+    copied=1
+  done
+  if [[ "$copied" -eq 0 ]]; then
+    rmdir "$dest" 2>/dev/null || true
+    return 0
+  fi
+  printf "agent pickle backup -> %s\n" "$dest"
+  local extra
+  extra="$(ls -1dt "$bak_root"/*/ 2>/dev/null | tail -n +$((keep + 1)) || true)"
+  if [[ -n "$extra" ]]; then
+    while IFS= read -r d; do
+      [[ -n "$d" ]] || continue
+      rm -rf "$d"
+    done <<< "$extra"
+  fi
+}
+
+# 启动日志出现 Failed to load file 即 ops pickle 反序列化失败，线程索引会被清空。
+# 只扫本次启动追加的日志，避免被历史错误行误报。
+warn_if_pickle_load_failed() {
+  local log mark
+  log="$(log_file agent)"
+  [[ -f "$log" ]] || return 0
+  mark="$(cat "$STATE_DIR/agent-log.mark" 2>/dev/null || printf 0)"
+  if tail -c +$((mark + 1)) "$log" | grep -q "Failed to load file"; then
+    printf "warning: agent pickle 反序列化失败（Failed to load file）。线程索引可能已被清空；备份在 %s/pickle-backups/\n" \
+      "$AGENT_WORK_DIR" >&2
+  fi
+}
+
+# 生成用户工作目录里的 langgraph.json：图注册镜像仓库 backend/langgraph.json（相对
+# 路径换成绝对路径，不依赖 cwd），CORS 白名单对准实际前端端口。每次启动重新生成，
+# 仓库里新增/改名图后 restart agent 即生效，不会出现两份注册漂移。
 ensure_agent_workdir() {
   mkdir -p "$AGENT_WORK_DIR"
-  cat > "$AGENT_WORK_DIR/langgraph.json" <<JSON
-{
-  "dependencies": ["$ROOT/backend"],
-  "graphs": {
-    "agent": "$ROOT/backend/agent/graph.py:graph"
-  },
-  "env": {
-    "CORS_ALLOW_ORIGINS": "http://127.0.0.1:$FRONTEND_PORT"
-  }
+  "$BACKEND_VENV/bin/python" - "$ROOT/backend/langgraph.json" \
+    "$AGENT_WORK_DIR/langgraph.json" "http://127.0.0.1:$FRONTEND_PORT" <<'PY'
+import json
+import os
+import sys
+
+repo_config_path, out_path, cors = sys.argv[1], sys.argv[2], sys.argv[3]
+backend = os.path.dirname(os.path.abspath(repo_config_path))
+repo = json.load(open(repo_config_path, encoding="utf-8"))
+graphs = {}
+for name, entry in repo.get("graphs", {}).items():
+    path, _, attr = entry.partition(":")
+    graphs[name] = f"{os.path.normpath(os.path.join(backend, path))}:{attr}"
+config = {
+    "dependencies": [backend],
+    "graphs": graphs,
+    "env": {"CORS_ALLOW_ORIGINS": cors},
 }
-JSON
+with open(out_path, "w", encoding="utf-8") as fh:
+    json.dump(config, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+PY
 }
 
 # 收编历史存储：老版本 scripts/dev 曾用 symlink 重定向，手动裸跑则把数据留在仓库内。
@@ -339,6 +401,12 @@ start_agent() {
   validate_agent_settings || return 1
   ensure_agent_workdir
   migrate_agent_data
+  backup_agent_pickles
+  if [[ -f "$(log_file agent)" ]]; then
+    wc -c < "$(log_file agent)" | tr -d ' ' > "$STATE_DIR/agent-log.mark"
+  else
+    printf '0' > "$STATE_DIR/agent-log.mark"
+  fi
   # --no-reload：改 settings.json / backend/agent 代码后需 restart agent。
   # cwd 是 AGENT_WORK_DIR（用户目录）：runtime 硬编码的 ./.langgraph_api 随 cwd 落在
   # 用户目录；图路径/依赖走生成的绝对路径配置，不受 cwd 影响。
@@ -369,6 +437,8 @@ cmd_up() {
   if is_running agent && ! wait_for_url agent "$(service_url agent)" 60; then
     printf "warning: agent 未就绪，已停止；backend/frontend 不受影响\n" >&2
     stop_service agent
+  elif is_running agent; then
+    warn_if_pickle_load_failed
   fi
   cmd_urls
 }
@@ -409,6 +479,7 @@ cmd_restart() {
       stop_service agent
       start_agent
       wait_for_url agent "$(service_url agent)" 60
+      warn_if_pickle_load_failed
       ;;
     all)
       cmd_stop

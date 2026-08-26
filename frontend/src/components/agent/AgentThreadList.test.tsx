@@ -79,7 +79,7 @@ describe("AgentThreadList", () => {
     render(<Harness />);
 
     const [item] = await createThreads(user, 1);
-    await user.click(within(item).getByRole("button", { name: "重命名会话" }));
+    await user.click(within(item).getByRole("button", { name: "重命名会话" }), { pointerEventsCheck: 0 });
     const input = within(item).getByRole("textbox", { name: "会话标题" });
     await user.clear(input);
     await user.type(input, "客观核验会话");
@@ -95,7 +95,7 @@ describe("AgentThreadList", () => {
     render(<Harness />);
 
     const [item] = await createThreads(user, 1);
-    await user.click(within(item).getByRole("button", { name: "重命名会话" }));
+    await user.click(within(item).getByRole("button", { name: "重命名会话" }), { pointerEventsCheck: 0 });
     const input = within(item).getByRole("textbox", { name: "会话标题" });
     await user.clear(input);
     expect(within(item).getByRole("button", { name: "确认重命名" })).toBeDisabled();
@@ -108,7 +108,7 @@ describe("AgentThreadList", () => {
     render(<Harness />);
 
     const [item] = await createThreads(user, 1);
-    await user.click(within(item).getByRole("button", { name: "删除会话" }));
+    await user.click(within(item).getByRole("button", { name: "删除会话" }), { pointerEventsCheck: 0 });
     await waitFor(() => {
       expect(screen.queryByTestId(/^agent-thread-/)).toBeNull();
     });

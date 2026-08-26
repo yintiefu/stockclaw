@@ -7,8 +7,9 @@ import { PageHeader } from "@/components/ui/PageHeader";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
+import { WorkflowHistory } from "@/components/workflow/WorkflowHistory";
+import { useWorkflowRun } from "@/hooks/useWorkflowRun";
 import { api, ApiError, type RadarData, type Industry, type Announcement, type NewsItem } from "@/lib/api";
-import { newsDigestStream } from "@/lib/agents";
 import { loadWatch } from "@/lib/watchlist";
 import { cn } from "@/lib/utils";
 
@@ -19,7 +20,7 @@ const TABS = [
   { key: "investment-news", label: "Investment News", icon: Rss, integrated: true, desc: "12 赛道全球公开 RSS 资讯（集成自 investment-news 仓库）" },
 ];
 
-interface Digest { loading?: boolean; text?: string; err?: string; needKey?: boolean }
+interface Digest { text?: string; err?: string }
 
 function InvestmentNewsPanel() {
   const [data, setData] = useState<RadarData | null>(null);
@@ -27,7 +28,13 @@ function InvestmentNewsPanel() {
   const [active, setActive] = useState("ai");
   const [refreshing, setRefreshing] = useState(false);
   const [digests, setDigests] = useState<Record<string, Digest>>({});
+  const [historyKeys, setHistoryKeys] = useState<Record<string, number>>({});
+  const [runIndustry, setRunIndustry] = useState<string | null>(null);
   const [bulk, setBulk] = useState<{ running: boolean; done: number; total: number }>({ running: false, done: 0, total: 0 });
+
+  // 资讯提炼工作流：把当前赛道已加载的新闻快照交给 news_digest 图，不让图再抓数据。
+  // thread 按 subject=<industry.key> 隔离，历史只在对应赛道下查看。
+  const digestRun = useWorkflowRun({ assistantId: "news_digest" });
 
   useEffect(() => {
     api.radar().then(setData).catch((e) => setErr(e instanceof ApiError ? e.message : "加载失败"));
@@ -45,17 +52,19 @@ function InvestmentNewsPanel() {
   const hasData = !!data?.generated_at;
 
   const genDigest = async (ind: Industry) => {
-    setDigests((d) => ({ ...d, [ind.key]: { loading: true } }));
+    setRunIndustry(ind.key);
     const ctx = ind.items.slice(0, 25).map((it) => `[${it.time}] ${it.source}｜${it.zh || it.title}`).join("\n");
-    try {
-      let acc = "";
-      await newsDigestStream(ctx, {
-        onDelta: (t) => { acc += t; setDigests((d) => ({ ...d, [ind.key]: { text: acc } })); },
-        onError: (err) => { setDigests((d) => ({ ...d, [ind.key]: { err } })); },
-      });
-    } catch (e) {
-      setDigests((d) => ({ ...d, [ind.key]: { err: e instanceof ApiError ? e.message : "生成失败" } }));
+    const outcome = await digestRun.start({
+      input: { news_snapshot: ctx },
+      metadata: { title: `${ind.name} 今日要点`, subject: ind.key },
+    });
+    if (outcome.error) {
+      setDigests((d) => ({ ...d, [ind.key]: { err: outcome.error ?? "生成失败" } }));
+    } else {
+      setDigests((d) => ({ ...d, [ind.key]: { text: outcome.state?.result ?? "" } }));
     }
+    setRunIndustry(null);
+    setHistoryKeys((k) => ({ ...k, [ind.key]: (k[ind.key] ?? 0) + 1 }));
   };
 
   // 一键提炼全部赛道要点（串行，带进度；单赛道按需的按钮仍保留）
@@ -69,7 +78,12 @@ function InvestmentNewsPanel() {
     setBulk((b) => ({ ...b, running: false }));
   };
 
-  const dg = cur ? digests[cur.key] : undefined;
+  const isRunning = runIndustry != null && runIndustry === cur?.key;
+  const dg = digests[cur?.key ?? ""];
+  const digestText = isRunning
+    ? (digestRun.state?.result ?? digestRun.transient.news_digest ?? "")
+    : dg?.text ?? "";
+  const digestErr = isRunning ? null : dg?.err ?? null;
 
   return (
     <div>
@@ -129,27 +143,53 @@ function InvestmentNewsPanel() {
                   <span className="flex items-center gap-1.5 text-sm font-semibold text-primary">
                     <Lightbulb className="h-4 w-4" /> 今日要点 · {cur.name}
                   </span>
-                  {(dg?.text || dg?.err || dg?.needKey) && (
+                  {(digestText || digestErr) && (
                     <button onClick={() => genDigest(cur)} className="text-xs text-muted-foreground hover:text-primary">重新提炼</button>
                   )}
                 </div>
-                {dg?.loading ? (
+                {isRunning ? (
                   <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-3.5 w-3.5 animate-spin" /> AI 正在读这个赛道的资讯…</p>
-                ) : dg?.text ? (
+                ) : digestText ? (
                   <>
-                    <div className="prose prose-sm dark:prose-invert max-w-none text-foreground"><ReactMarkdown remarkPlugins={[remarkGfm]}>{dg.text}</ReactMarkdown></div>
-                    <div className="mt-2"><SaveNoteButton kind="今日要点" title={`${cur.name} 今日要点`} content={dg.text} /></div>
+                    <div className="prose prose-sm dark:prose-invert max-w-none text-foreground"><ReactMarkdown remarkPlugins={[remarkGfm]}>{digestText}</ReactMarkdown></div>
+                    <div className="mt-2"><SaveNoteButton kind="今日要点" title={`${cur.name} 今日要点`} content={digestText} /></div>
                   </>
-                ) : dg?.needKey ? (
-                  <p className="text-sm text-muted-foreground">还没接入 AI。<Link to="/settings" className="text-primary">先接入你的 AI</Link>，即可一键提炼本赛道今日要点。</p>
-                ) : dg?.err ? (
-                  <p className="text-sm text-destructive">{dg.err}</p>
+                ) : digestErr ? (
+                  <p className="text-sm text-destructive">{digestErr}</p>
                 ) : (
                   <button onClick={() => genDigest(cur)}
                     className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-3 py-1.5 text-sm font-medium text-primary hover:bg-primary/25">
                     <Sparkles className="h-4 w-4" /> 让 AI 提炼今日要点
                   </button>
                 )}
+
+                {/* 本赛道的提炼历史（subject=industry.key 隔离） */}
+                <div className="mt-3">
+                  <WorkflowHistory
+                    workflowType="news_digest"
+                    subject={cur.key}
+                    refreshKey={historyKeys[cur.key] ?? 0}
+                    onOpen={(_thread, state) => {
+                      setDigests((d) => ({ ...d, [cur.key]: { text: state.result ?? "" } }));
+                    }}
+                    onRerun={(_thread, state) => {
+                      const snapshot = typeof state.input?.news_snapshot === "string"
+                        ? state.input.news_snapshot
+                        : cur.items.slice(0, 25).map((it) => `[${it.time}] ${it.source}｜${it.zh || it.title}`).join("\n");
+                      void digestRun.start({
+                        input: { news_snapshot: snapshot },
+                        metadata: { title: `${cur.name} 今日要点`, subject: cur.key },
+                      }).then((outcome) => {
+                        if (outcome.error) {
+                          setDigests((d) => ({ ...d, [cur.key]: { err: outcome.error ?? "生成失败" } }));
+                        } else {
+                          setDigests((d) => ({ ...d, [cur.key]: { text: outcome.state?.result ?? "" } }));
+                        }
+                        setHistoryKeys((k) => ({ ...k, [cur.key]: (k[cur.key] ?? 0) + 1 }));
+                      });
+                    }}
+                  />
+                </div>
               </div>
 
               {/* 资讯列表 */}

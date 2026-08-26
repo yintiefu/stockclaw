@@ -48,29 +48,14 @@ python3 -m venv .venv
 | `GET /api/finance?code=600519` | 季报财务快照（mootdx，前端未用 / 备用） | mootdx |
 | **资金面·筹码·信号（v3.3）** | `/api/margin` · `/block-trade` · `/holders` · `/dividend` · `/fund-flow` · `/dragon-tiger` · `/lockup` · `/blocks` · `/hot-concepts` · `/investor-qa` · `/industry` | requests |
 | `GET /api/market/overview` · `/api/radar` | 市场情绪+板块资金 · 资讯雷达 | akshare / stdlib |
-| `POST /api/chat` | 系统 AI 对话（function calling，AI 自己调数据工具） | requests |
-| `POST /api/debate` | **多空辩论**（多 agent，流式 NDJSON）：事实底稿 → 多方 / 空方 →（可选反驳）→ 中立主持 | requests |
-| `POST /api/reflect` | **反思审计**（流式 NDJSON）：对一段已写好的分析做推理审计 | requests |
+| `GET /api/agent/status` | **Agent 只读状态**（脱敏摘要：模型名 / 主机 / Skill 与 MCP 计数 / 配置路径；受 `VR_API_KEY` 保护，不调用模型） | stdlib |
 
-`/api/debate` 请求体：`{"code": "600519", "rounds": 1, "llm": {...}}`（`rounds=2` 加一轮交叉反驳）。
-事件类型：`status` · `dossier_progress`（底稿逐项进度）· `dossier` · `stage`（角色开始）·
-`delta`（增量文本）· `stage_done`（角色完成，失败时带 `failed: true`）· `done` · `error`。
-
-`/api/reflect` 请求体：`{"source": "待审的分析文本", "title": "可选标题", "llm": {...}}`。
-
-> 两个端点都**不产出买卖结论**：辩论终点是「分歧点 + 验证清单」，反思终点是「怎么继续验证」。
+> 模型调用与 AI 编排已全部迁往本地 LangGraph Server（:2024，六个图：
+> `agent` / `embedded_agent` / `debate` / `reflection` / `daily_review` / `news_digest`），
+> 模型与密钥只来自 `~/.vibe-research/agent/settings.json`。FastAPI 不再持有任何模型配置，
+> 也不再提供 `/api/chat`、`/api/debate`、`/api/reflect` 等流式 AI 端点。
 
 > 上表为主要端点；完整路由清单见 `app.py`。要更全量的 A 股数据（打板 / ETF期权 / 全市场行业排名等），用根目录 [`a-stock-data/`](../a-stock-data/SKILL.md) 工具箱。
-
-`/api/chat` 请求体：
-```json
-{
-  "messages": [{"role": "user", "content": "茅台估值贵不贵？"}],
-  "context": "本页上下文（可空）",
-  "llm": {"baseURL": "https://api.deepseek.com", "apiKey": "sk-…", "model": "deepseek-chat"}
-}
-```
-`llm` 由前端从本地配置随请求带上，后端不持久化 key。
 
 ## 2. MCP Server（给 Claude Code / 高手 agent）
 
@@ -96,5 +81,5 @@ MCP 的 4 个工具是「零配置、开箱即用」的常用项。若 agent 需
 ## 合规
 
 - 数据端点只返回客观行情/研报/财报/新闻，不含任何建议、排名、预测。
-- `/api/chat` 的 system prompt 内置中立红线：不荐股、不预测涨跌、不给买卖时机、不构成投资建议。
+- 所有 LangGraph 图共享代码内固定中立红线：不荐股、不预测涨跌、不给买卖时机、不构成投资建议。
 - 分析结论一律由用户配置的模型 / agent 给出，本产品只提供数据与工具。

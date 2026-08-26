@@ -30,6 +30,7 @@ if not port.isdigit():
 
 root.mkdir(parents=True, exist_ok=True)
 shutil.copy2(E2E / "graph.py", root / "graph.py")
+shutil.copy2(E2E / "unified_graphs.py", root / "unified_graphs.py")
 shutil.copy2(E2E / "langgraph.json", root / "langgraph.json")
 shutil.copytree(E2E / "skills", root / "skills", dirs_exist_ok=True)
 

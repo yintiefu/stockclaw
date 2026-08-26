@@ -74,6 +74,7 @@ test("native Agent workspace persists threads and handles MCP approval", async (
   await expect(page.getByTitle("发送", { exact: true })).toBeVisible();
 
   const activeItem = page.locator('[data-testid^="agent-thread-"][data-active="true"]');
+  await activeItem.hover();
   await activeItem.getByRole("button", { name: "重命名会话" }).click();
   await activeItem.getByRole("textbox", { name: "会话标题" }).fill("E2E 审批会话");
   await activeItem.getByRole("button", { name: "确认重命名" }).click();
@@ -85,6 +86,7 @@ test("native Agent workspace persists threads and handles MCP approval", async (
   await page.getByRole("button", { name: "E2E 审批会话" }).click();
   await expect(page.getByTestId("agent-chat-column").getByText(/MCP 客观结果/)).toBeVisible();
   const originalItem = page.locator('[data-testid^="agent-thread-"]').filter({ has: originalThread });
+  await originalItem.hover();
   await originalItem.getByRole("button", { name: "删除会话" }).click();
   await expect(page.getByRole("button", { name: "给出客观测试回复" })).toHaveCount(0);
 });

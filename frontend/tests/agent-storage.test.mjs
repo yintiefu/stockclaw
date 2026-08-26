@@ -16,12 +16,17 @@ async function sourceTreeContains(needle) {
   };
   return walk(join(process.cwd(), "src")).some(
     (file) => readFileSync(file, "utf8").includes(needle),
-  ) || readFileSync(join(process.cwd(), "package.json"), "utf8").includes(needle);
+  );
 }
 
-test("agent workspace no longer reads or writes the obsolete model storage key", async () => {
-  // Agent 工作台已迁往本地静态设置文件：旧 vr-agent-model 键不再读写，
-  // 而 legacy 聊天（chat/debate/reflect）的 vr-llm 契约保持不变。
+test("frontend no longer reads any legacy AI model storage keys", async () => {
+  // 统一 LangGraph 迁移后，模型只存在服务端 settings.json：
+  // 旧 vr-agent-model / vr-llm 键都不再被生产代码读取（浏览器里的旧值保留但无人使用）。
   assert.equal(await sourceTreeContains("vr-agent-model"), false);
-  assert.equal(await sourceTreeContains("vr-llm"), true);
+  assert.equal(await sourceTreeContains("vr-llm"), false);
+});
+
+test("legacy AI stream modules are fully removed from the source tree", async () => {
+  assert.equal(await sourceTreeContains("lib/llm"), false);
+  assert.equal(await sourceTreeContains("lib/agents"), false);
 });

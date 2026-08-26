@@ -20,29 +20,33 @@ Concretely: data endpoints and AI tools return only objective facts; `chat.py`'s
 ## Layout
 
 ```
-backend/            FastAPI :8900 (Python 3.11+) — data layer + pluggable AI layer
-  app.py              HTTP routes + CORS/auth middleware + startup scheduler
+backend/            FastAPI :8900 (Python 3.11+) — data/business layer; AI runs on LangGraph :2024
+  app.py              HTTP routes + CORS/auth middleware + startup scheduler (data/business APIs
+                      + read-only /api/agent/status; NO AI orchestration routes anymore)
   astock.py           A-share data (ported from a-stock-data/) — eastmoney + tencent
   gstock.py           US/HK/KR data (ported from global-stock-data/) — eastmoney域内
   market.py           market sentiment / sector fund flow / global indices
   newsradar.py        RSS 资讯雷达 (+ news_sources.json, 12 tracks/108 feeds)
-  tools.py            24 function-calling tools — shared by chat / MCP / debate / Agent
-  chat.py             OpenAI-compatible function-calling loop + SSRF guard
-  debate.py           多空辩论 orchestration (dossier → bull/bear → neutral host)
-  reflection.py       反思审计 (reasoning audit of existing analysis)
-  cli_runtime.py      spawn local AI CLIs (claude/qwen/codex/deepseek) — subscription
-  mcp_server.py       MCP server over stdio (zero third-party deps, JSON-RPC)
+  tools.py            24 function-calling tools — the ONLY tool source, shared by all graphs + MCP
+  mcp_server.py       MCP server over stdio (imports tools.py directly, zero third-party deps)
   portfolio.py        holdings + realized P&L (stored in user data dir)
   myreports.py        user-uploaded research reports (local only)
   version.py          single version source (reads frontend/package.json)
-  langgraph.json      Agent workspace graph registration (agent/graph.py)
-  agent/              native LangGraph agent: settings.py (static local config),
-                      tool_registry.py (LangChain adapter + process-wide lock),
-                      graph.py (one-time assembly), ssrf.py (legacy chat guard)
-  tests/              pytest; conftest.py isolates user data dir + agent settings
+  langgraph.json      six graph registrations: agent, embedded_agent, debate, reflection,
+                      daily_review, news_digest
+  agent/              unified AI runtime: settings.py (static local config + status summary),
+                      model_factory.py, policy.py (neutral red-line), skill_backends.py,
+                      tool_executor.py (process-wide serial/parallel guards), tool_registry.py,
+                      graph.py (workspace), embedded_graph.py (page ask-AI),
+                      workflow_{state,loader,events,runtime,builder}.py + workflows/*.yaml
+                      (strict-YAML workflows), workflows_graph.py (one-time exports)
+  tests/              pytest; conftest.py isolates user data dir + agent settings;
+                      agent_e2e/ = deterministic browser-fixture graphs
 frontend/           Vite + React 19 + TS + Tailwind :5899 (glass warm-orange theme)
-  src/lib/            api.ts (client), llm.ts (chat stream), storage.ts, ai-models.ts,
-                      agent/ (thread-adapter, runtime, approval for the Agent page)
+  src/lib/            api.ts (client), storage.ts, clipboard.ts,
+                      agent/ (thread-adapter, workflow-{types,client,stream}, embedded-client)
+  src/hooks/          useWorkflowRun (page workflow controller)
+  src/components/     workflow/WorkflowHistory (per-page history), ui/AskAiButton (drawer)
   src/pages/          one page per top-level nav
 a-stock-data/       vendored A-share data toolbox — see its SKILL.md (copy-paste code)
 global-stock-data/  vendored US/HK data toolbox — see its SKILL.md
@@ -70,8 +74,13 @@ cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # Frontend (:5899)
 cd frontend && npm install && npm run dev    # dev server, proxies /api → 127.0.0.1:8900
-npm run build    # tsc -b && vite build
-npm test         # node --test tests/*.test.mjs
+npm run build      # tsc -b && vite build
+npm test           # node --test tests/*.test.mjs
+npm run test:unit  # vitest component/logic tests
+
+# Deterministic six-graph browser acceptance (isolated FastAPI :8873 / LangGraph :2873 /
+# Vite :5873, scripted models + fake tools; never touches 8900/2024 or ~/.vibe-research)
+npm run test:e2e -- e2e/unified-ai-workflows.spec.ts
 ```
 
 ## Backend conventions
@@ -85,11 +94,11 @@ npm test         # node --test tests/*.test.mjs
 - **Lazy optional deps.** `akshare` / `mootdx` are imported lazily inside functions; if
   missing, the endpoint raises `astock.DependencyMissing` → HTTP **501 + install hint**,
   and the rest of the service keeps working. Never make a heavy dep required.
-- **Streaming endpoints return NDJSON** (one JSON event per line): `/api/chat`,
-  `/api/debate`, `/api/reflect`. Runtime errors become in-stream `{"type":"error"}`
-  events and must **not** break the connection (see `_ndjson` helper). Config errors
-  (missing key, CLI not installed) → HTTP **400 before the stream starts** so the UI can
-  guide the user.
+- **No AI orchestration in FastAPI.** `/api/chat`, `/api/debate`, `/api/reflect` (and the
+  transitional `/api/daily-review`, `/api/news-digest`) were removed with the legacy
+  modules (`chat.py`, `debate.py`, `reflection.py`, `cli_runtime.py`). All model calls go
+  through the local LangGraph Server; FastAPI keeps data/business APIs plus the read-only
+  `/api/agent/status`.
 - **Caching.** Rate-limited eastmoney (`em_*`) endpoints use module-level TTL dicts
   (`_cached(...)`; typically 30 min). Reuse the existing cache helper; don't refetch.
 
@@ -240,13 +249,14 @@ uv run --with futu-api==10.9.6908 python scripts/import-sector-chain.py --key hu
 ## User data & privacy (do not leak)
 
 Holdings, watchlist, uploaded reports, and all API keys are **local only** — never
-persisted server-side, never committed. Legacy chat/debate/reflection keys stay in the
-browser (`localStorage`: `vr-llm`, `vr-access-key`) and are sent per-request; the backend
-doesn't keep them. **Agent workspace keys are different**: they live in plaintext only in
-the local static settings file (default `~/.vibe-research/agent/settings.json`, override
-with `VR_AGENT_SETTINGS`, permission `0600`) and are read once when the LangGraph Server
-starts — do NOT claim all API keys remain in frontend localStorage, and never let settings
-secrets enter thread metadata, graph state, checkpoints, logs, or error messages.
+persisted server-side, never committed. Model keys live in plaintext only in the local
+static settings file (default `~/.vibe-research/agent/settings.json`, override with
+`VR_AGENT_SETTINGS`, permission `0600`), read once when the LangGraph Server starts —
+never let settings secrets enter thread metadata, graph state, checkpoints, logs, or error
+messages. The only key still held in the browser is the FastAPI access key
+(`localStorage`: `vr-access-key`, sent per-request to `/api/*` when `VR_API_KEY` is set).
+Old `vr-llm` / `vr-askai-chat:*` values are pre-migration leftovers: never read, migrated
+or deleted.
 `.gitignore` also guards private internal docs — run `git status` before any
 release to confirm none are staged.
 
@@ -278,7 +288,10 @@ ones — shared across all LangGraph graphs, MCP, and legacy endpoints:
 - `agent/tool_executor.py` classifies tools into `parallel_safe` (7 tools guarded by `BoundedSemaphore(4)`)
   and `eastmoney_serial` (guarded by process-wide `threading.Lock()`).
 - `agent/policy.py` (`fixed_system_policy()`) defines the universal neutrality red-line
-  and tool grounding rules across all graphs and workflows.
+  plus tool grounding rules. Tool-bound graphs (`agent`, `embedded_agent`) use the full
+  policy; workflow stages call the model **without tools bound** and must pass
+  `tools=False` (a tool-advertising prompt makes strong agentic models narrate
+  "I'll call query_market" instead of analyzing — glm-5.2 verified).
 - `agent/skill_backends.py` enforces read-only virtual filesystem access to `/builtin/`
   and `/user/` Skills.
 
@@ -295,6 +308,32 @@ ones — shared across all LangGraph graphs, MCP, and legacy endpoints:
 5. **`daily_review`** (`agent/workflows_graph.py`): Market daily review workflow (`daily_review.yaml`).
 6. **`news_digest`** (`agent/workflows_graph.py`): Multi-track news digest workflow (`news_digest.yaml`).
 
-### Legacy FastAPI Bridge (:8900):
-`/api/debate`, `/api/reflect`, `/api/daily-review`, `/api/news-digest`, and `/api/chat`
-bridge stream execution to the graphs and translate custom events to frontend NDJSON streams.
+### Legacy FastAPI AI routes — removed
+`/api/chat`, `/api/debate`, `/api/reflect`, `/api/daily-review`, `/api/news-digest` and
+their modules (`chat.py`, `debate.py`, `reflection.py`, `cli_runtime.py`, `agent/ssrf.py`)
+are deleted; the cutover happened only after the deterministic six-graph Playwright
+acceptance (`frontend/e2e/unified-ai-workflows.spec.ts`, fixture graphs in
+`backend/tests/agent_e2e/unified_graphs.py`) passed. `mcp_server.py` imports `tools.py`
+directly. Old browser keys (`vr-llm`, `vr-askai-chat:*`) are never read — leave them.
+
+`langgraph dev` is an in-memory runtime. Thread/run/assistant records live in
+`.langgraph_api/.langgraph_ops.pckl`; checkpoints live in
+`.langgraph_checkpoint.{1,2,3}.pckl`. Both flush on a ~10s timer and on SIGTERM.
+A `PersistentDict.load()` failure (incompatible cache / `ModuleNotFoundError`) starts
+an empty ops index, then the next flush atomically overwrites the pickle — thread
+list gone even though checkpoints remain. `scripts/dev` copies `*.pckl` to
+`~/.vibe-research/agent/server/pickle-backups/<timestamp>/` (keeps 5) before each
+agent start, and warns if startup logs contain `Failed to load file`. True
+restart-durability still needs Postgres (`langgraph up`); the E2E restart scenario
+asserts the honest dev-runtime behaviour (histories listed, lost in-flight states
+derive to `interrupted`, new runs work).
+
+### Frontend workflow wiring
+- Pages use `hooks/useWorkflowRun` (thread/run/state/transient controller) +
+  `components/workflow/WorkflowHistory` (one `threads.search(extract)`; `getState` only on
+  open/rerun — never per row). Embedded ask-AI uses `lib/agent/embedded-client.ts`.
+- Retry refuses incompatible `config_version` checkpoints (`WORKFLOW_CONFIG_VERSIONS` in
+  `lib/agent/workflow-types.ts` must mirror `config_version` in the YAML files).
+- Client cancel/interrupt patches write JSON-dict stage values via `updateState`;
+  `merge_stage_results` coerces them back to `StageResult` (backend contract — do not
+  remove the coercion).

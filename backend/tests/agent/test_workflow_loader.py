@@ -17,10 +17,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+import traceback
 import pytest
 import yaml
 
 from agent.skill_backends import BUILTIN_SKILLS_DIR
+from agent.tool_executor import (
+    EASTMONEY_SERIAL_TOOLS,
+    PARALLEL_SAFE_TOOLS,
+    ToolExecutionPolicy,
+    tool_policy,
+)
 from agent.workflow_loader import (
     HARD_LIMITS,
     SinglePassConfig,
@@ -29,6 +36,7 @@ from agent.workflow_loader import (
     load_all_production_workflows,
     load_workflow_config_from_file,
     load_workflow_config_from_string,
+    validate_staged_input,
     validate_workflow_config,
 )
 
@@ -44,6 +52,9 @@ def test_load_valid_staged_workflow_file() -> None:
     assert cfg.kind == "staged_research"
     assert len(cfg.stages) == 3
     assert "standard" in cfg.variants
+    assert cfg.result_stage == "referee"
+    assert cfg.stages[1].label == "空方研究员"
+    assert cfg.stages[1].context == ["dossier", "stage.bull"]
 
 
 def test_load_valid_single_pass_file() -> None:
@@ -113,7 +124,7 @@ def test_reject_filename_id_mismatch(tmp_path: Path) -> None:
         }),
         encoding="utf-8",
     )
-    with pytest.raises(WorkflowConfigError, match="ID 与文件名不匹配"):
+    with pytest.raises(WorkflowConfigError, match="字段 id：与文件名不一致"):
         load_workflow_config_from_file(file, builtin_skills_root=tmp_path)
 
 
@@ -137,7 +148,8 @@ def test_reject_unknown_tool() -> None:
         "config_version": 1,
         "id": "test_wf",
         "kind": "staged_research",
-        "input": {"code": {"type": "string"}},
+        "result_stage": "s1",
+        "input": {"code": {"type": "string", "pattern": "^[0-9]{6}$"}},
         "dossier": {
             "section_chars": 1800,
             "dossier_summary_chars": 6000,
@@ -153,8 +165,10 @@ def test_reject_unknown_tool() -> None:
         "stages": [
             {
                 "id": "s1",
-                "skill": "builtin/test",
-                "instruction": "test.md",
+                "label": "研究员",
+                "skill": "builtin/debate",
+                "instruction": "references/bull.md",
+                "context": [],
                 "on_error": "continue",
                 "output_chars": 1000,
                 "context_chars": 5000,
@@ -162,7 +176,7 @@ def test_reject_unknown_tool() -> None:
         ],
         "variants": {"standard": ["s1"]},
     }
-    with pytest.raises(WorkflowConfigError, match="non_existent_tool_name"):
+    with pytest.raises(WorkflowConfigError, match="dossier.sections.0.tool"):
         validate_workflow_config(doc, workflow_id="test_wf")
 
 
@@ -172,11 +186,12 @@ def test_reject_duplicate_or_missing_stage() -> None:
         "config_version": 1,
         "id": "test_wf",
         "kind": "staged_research",
-        "input": {"code": {"type": "string"}},
+        "result_stage": "dup",
+        "input": {"code": {"type": "string", "pattern": "^[0-9]{6}$"}},
         "dossier": {"section_chars": 1800, "dossier_summary_chars": 6000, "sections": []},
         "stages": [
-            {"id": "dup", "skill": "b/t", "instruction": "t.md", "on_error": "continue", "output_chars": 1000, "context_chars": 5000},
-            {"id": "dup", "skill": "b/t", "instruction": "t.md", "on_error": "continue", "output_chars": 1000, "context_chars": 5000},
+            {"id": "dup", "label": "阶段", "skill": "builtin/debate", "instruction": "references/bull.md", "context": [], "on_error": "continue", "output_chars": 1000, "context_chars": 5000},
+            {"id": "dup", "label": "阶段", "skill": "builtin/debate", "instruction": "references/bull.md", "context": [], "on_error": "continue", "output_chars": 1000, "context_chars": 5000},
         ],
         "variants": {"v1": ["dup"]},
     }
@@ -188,14 +203,15 @@ def test_reject_duplicate_or_missing_stage() -> None:
         "config_version": 1,
         "id": "test_wf",
         "kind": "staged_research",
-        "input": {"code": {"type": "string"}},
+        "result_stage": "s1",
+        "input": {"code": {"type": "string", "pattern": "^[0-9]{6}$"}},
         "dossier": {"section_chars": 1800, "dossier_summary_chars": 6000, "sections": []},
         "stages": [
-            {"id": "s1", "skill": "b/t", "instruction": "t.md", "on_error": "continue", "output_chars": 1000, "context_chars": 5000},
+            {"id": "s1", "label": "阶段", "skill": "builtin/debate", "instruction": "references/bull.md", "context": [], "on_error": "continue", "output_chars": 1000, "context_chars": 5000},
         ],
         "variants": {"v1": ["s1", "non_existent_stage"]},
     }
-    with pytest.raises(WorkflowConfigError, match="未定义的阶段"):
+    with pytest.raises(WorkflowConfigError, match="未声明阶段"):
         validate_workflow_config(doc_missing_variant_stage, workflow_id="test_wf")
 
 
@@ -205,7 +221,8 @@ def test_reject_invalid_input_reference() -> None:
         "config_version": 1,
         "id": "test_wf",
         "kind": "staged_research",
-        "input": {"code": {"type": "string"}},
+        "result_stage": "s1",
+        "input": {"code": {"type": "string", "pattern": "^[0-9]{6}$"}},
         "dossier": {
             "section_chars": 1800,
             "dossier_summary_chars": 6000,
@@ -219,11 +236,11 @@ def test_reject_invalid_input_reference() -> None:
             ],
         },
         "stages": [
-            {"id": "s1", "skill": "b/t", "instruction": "t.md", "on_error": "continue", "output_chars": 1000, "context_chars": 5000},
+            {"id": "s1", "label": "阶段", "skill": "builtin/debate", "instruction": "references/bull.md", "context": [], "on_error": "continue", "output_chars": 1000, "context_chars": 5000},
         ],
         "variants": {"v1": ["s1"]},
     }
-    with pytest.raises(WorkflowConfigError, match="input.non_existent_field"):
+    with pytest.raises(WorkflowConfigError, match="dossier.sections.0.args.codes.0"):
         validate_workflow_config(doc, workflow_id="test_wf")
 
 
@@ -237,7 +254,7 @@ def test_reject_path_escape(tmp_path: Path) -> None:
         "instruction": "../../../etc/passwd",
         "input": {"text_field": "source", "max_chars": 1000},
     }
-    with pytest.raises(WorkflowConfigError, match="Path traversal|路径逃逸"):
+    with pytest.raises(WorkflowConfigError, match="不得逃逸"):
         validate_workflow_config(doc, workflow_id="test_wf", builtin_skills_root=tmp_path)
 
 
@@ -247,7 +264,8 @@ def test_reject_invalid_empty_policy_and_on_error() -> None:
         "config_version": 1,
         "id": "test_wf",
         "kind": "staged_research",
-        "input": {"code": {"type": "string"}},
+        "result_stage": "s1",
+        "input": {"code": {"type": "string", "pattern": "^[0-9]{6}$"}},
         "dossier": {
             "section_chars": 1800,
             "dossier_summary_chars": 6000,
@@ -256,7 +274,7 @@ def test_reject_invalid_empty_policy_and_on_error() -> None:
             ],
         },
         "stages": [
-            {"id": "s1", "skill": "b/t", "instruction": "t.md", "on_error": "continue", "output_chars": 1000, "context_chars": 5000}
+            {"id": "s1", "label": "阶段", "skill": "builtin/debate", "instruction": "references/bull.md", "context": [], "on_error": "continue", "output_chars": 1000, "context_chars": 5000}
         ],
         "variants": {"v1": ["s1"]},
     }
@@ -270,14 +288,15 @@ def test_reject_soft_limit_above_hard_limit() -> None:
         "config_version": 1,
         "id": "test_wf",
         "kind": "staged_research",
-        "input": {"code": {"type": "string"}},
+        "result_stage": "s1",
+        "input": {"code": {"type": "string", "pattern": "^[0-9]{6}$"}},
         "dossier": {
             "section_chars": HARD_LIMITS["section_chars"] + 1000,
             "dossier_summary_chars": 6000,
             "sections": [],
         },
         "stages": [
-            {"id": "s1", "skill": "b/t", "instruction": "t.md", "on_error": "continue", "output_chars": 1000, "context_chars": 5000}
+            {"id": "s1", "label": "阶段", "skill": "builtin/debate", "instruction": "references/bull.md", "context": [], "on_error": "continue", "output_chars": 1000, "context_chars": 5000}
         ],
         "variants": {"v1": ["s1"]},
     }
@@ -315,6 +334,16 @@ def test_load_all_production_workflows_returns_four_configs() -> None:
         "standard": ["bull", "bear", "referee"],
         "cross_exam": ["bull", "bear", "bull_rebut", "bear_rebut", "referee"],
     }
+    assert debate.result_stage == "referee"
+
+    expected_stage_contract = {
+        "bull": ("多方研究员", ["dossier"]),
+        "bear": ("空方研究员", ["dossier", "stage.bull"]),
+        "bull_rebut": ("多方反驳", ["dossier", "stage.bull", "stage.bear"]),
+        "bear_rebut": ("空方反驳", ["dossier", "stage.bull", "stage.bear", "stage.bull_rebut"]),
+        "referee": ("中立主持", ["dossier.summary", "dossier.missing", "stages"]),
+    }
+    assert {stage.id: (stage.label, stage.context) for stage in debate.stages} == expected_stage_contract
 
     # 13 items mapping
     expected_sections = [
@@ -386,15 +415,16 @@ def test_reject_variant_with_duplicate_stages() -> None:
         "config_version": 1,
         "id": "dup_variant",
         "kind": "staged_research",
-        "input": {"code": {"type": "string"}},
+        "result_stage": "referee",
+        "input": {"code": {"type": "string", "pattern": "^[0-9]{6}$"}},
         "dossier": {
             "section_chars": 1000,
             "dossier_summary_chars": 2000,
             "sections": [{"id": "quote", "tool": "query_quote", "empty_policy": "gap_if_empty"}],
         },
         "stages": [
-            {"id": "bull", "skill": "builtin/debate", "instruction": "references/bull.md", "output_chars": 1000, "context_chars": 2000},
-            {"id": "referee", "skill": "builtin/debate", "instruction": "references/referee.md", "output_chars": 1000, "context_chars": 2000},
+            {"id": "bull", "label": "多方", "skill": "builtin/debate", "instruction": "references/bull.md", "context": ["dossier"], "output_chars": 1000, "context_chars": 2000},
+            {"id": "referee", "label": "主持", "skill": "builtin/debate", "instruction": "references/referee.md", "context": ["stages"], "output_chars": 1000, "context_chars": 2000},
         ],
         "variants": {
             "standard": ["bull", "bull", "referee"],
@@ -416,3 +446,222 @@ def test_reject_nonexistent_skill_file(tmp_path: Path) -> None:
     }
     with pytest.raises(WorkflowConfigError, match="引用的内置技能指令文件不存在"):
         validate_workflow_config(doc, workflow_id="missing_skill_wf")
+
+
+def test_reject_partial_input_reference() -> None:
+    doc = yaml.safe_load((PRODUCTION_WORKFLOWS_DIR / "debate.yaml").read_text(encoding="utf-8"))
+    doc["id"] = "partial_ref"
+    doc["dossier"]["sections"][0]["args"]["codes"] = ["prefix-${input.code}"]
+
+    with pytest.raises(WorkflowConfigError, match="input.*引用|完整引用"):
+        validate_workflow_config(doc, workflow_id="partial_ref")
+
+
+def test_reject_invalid_context_reference() -> None:
+    doc = yaml.safe_load((PRODUCTION_WORKFLOWS_DIR / "debate.yaml").read_text(encoding="utf-8"))
+    doc["id"] = "invalid_context"
+    doc["stages"][0]["context"] = ["stage.future"]
+
+    with pytest.raises(WorkflowConfigError, match="stages.0.context"):
+        validate_workflow_config(doc, workflow_id="invalid_context")
+
+
+def test_reject_empty_variant() -> None:
+    doc = yaml.safe_load((PRODUCTION_WORKFLOWS_DIR / "debate.yaml").read_text(encoding="utf-8"))
+    doc["id"] = "empty_variant"
+    doc["variants"]["standard"] = []
+
+    with pytest.raises(WorkflowConfigError, match="variants.standard"):
+        validate_workflow_config(doc, workflow_id="empty_variant")
+
+
+def test_validate_staged_input_accepts_matching_value() -> None:
+    cfg = load_workflow_config_from_file(
+        PRODUCTION_WORKFLOWS_DIR / "debate.yaml",
+        builtin_skills_root=BUILTIN_SKILLS_DIR,
+    )
+    assert isinstance(cfg, StagedResearchConfig)
+
+    validate_staged_input(cfg, {"code": "600519"})
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ([], "必须是对象"),
+        ({}, "input.code.*缺失"),
+        ({"code": 600519}, "input.code.*类型错误"),
+        ({"code": "abc"}, "input.code.*格式不符合"),
+    ],
+)
+def test_validate_staged_input_rejects_invalid_values(
+    values: object,
+    message: str,
+) -> None:
+    cfg = load_workflow_config_from_file(
+        PRODUCTION_WORKFLOWS_DIR / "debate.yaml",
+        builtin_skills_root=BUILTIN_SKILLS_DIR,
+    )
+    assert isinstance(cfg, StagedResearchConfig)
+
+    with pytest.raises(ValueError, match=message):
+        validate_staged_input(cfg, values)  # type: ignore[arg-type]
+
+
+def test_configuration_errors_do_not_echo_sensitive_input_values() -> None:
+    secret = "Basic dXNlcjpwYXNz secret-input-value"
+    doc = {
+        "schema_version": 1,
+        "config_version": 1,
+        "id": "safe_error",
+        "kind": "single_pass",
+        "skill": "builtin/reflection-audit",
+        "instruction": "SKILL.md",
+        "input": {"text_field": "source", "max_chars": 1000, "secret": secret},
+    }
+
+    with pytest.raises(WorkflowConfigError) as exc_info:
+        validate_workflow_config(doc, workflow_id="safe_error")
+
+    message = str(exc_info.value)
+    assert "input.secret" in message
+    assert secret not in message
+    assert "Basic" not in message
+    assert "input_value" not in message
+    assert "validation error" not in message.lower()
+
+
+def test_configuration_error_traceback_does_not_chain_sensitive_validation_error() -> None:
+    secret = "Basic dHJhY2U6c2VjcmV0 traceback-secret"
+    doc = {
+        "schema_version": 1,
+        "config_version": 1,
+        "id": "safe_traceback",
+        "kind": "single_pass",
+        "skill": "builtin/reflection-audit",
+        "instruction": "SKILL.md",
+        "input": {"text_field": "source", "max_chars": 1000, "secret": secret},
+    }
+
+    try:
+        validate_workflow_config(doc, workflow_id="safe_traceback")
+    except WorkflowConfigError:
+        formatted = traceback.format_exc()
+    else:
+        pytest.fail("应拒绝未知配置字段")
+
+    assert secret not in formatted
+    assert "Basic" not in formatted
+    assert "input_value" not in formatted
+
+
+@pytest.mark.parametrize(
+    "skill_content",
+    [
+        "---\nname: wrong-name\ndescription: 错误的 Skill 名称\n---\n\n# 内容\n",
+        "---\nname: reflection-audit\n---\n\n# 缺少 description\n",
+    ],
+)
+def test_malformed_builtin_skill_frontmatter_blocks_workflow_loading(
+    tmp_path: Path,
+    skill_content: str,
+) -> None:
+    skill_dir = tmp_path / "reflection-audit"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(skill_content, encoding="utf-8")
+    doc = {
+        "schema_version": 1,
+        "config_version": 1,
+        "id": "bad_skill",
+        "kind": "single_pass",
+        "skill": "builtin/reflection-audit",
+        "instruction": "SKILL.md",
+        "input": {"text_field": "source", "max_chars": 1000},
+    }
+
+    with pytest.raises(WorkflowConfigError, match="Skill.*frontmatter|Skill.*元数据"):
+        validate_workflow_config(doc, workflow_id="bad_skill", builtin_skills_root=tmp_path)
+
+
+def test_debate_tool_contract_matches_executor_policies_and_yaml_arguments() -> None:
+    debate = load_all_production_workflows(PRODUCTION_WORKFLOWS_DIR, BUILTIN_SKILLS_DIR)["debate"]
+    assert isinstance(debate, StagedResearchConfig)
+    expected = [
+        ("quote", "query_quote", {"codes": ["${input.code}"]}, "gap_if_empty", "parallel_safe"),
+        ("valuation", "query_valuation", {"code": "${input.code}"}, "gap_if_empty", "eastmoney_serial"),
+        ("valuation_percentile", "query_valuation_percentile", {"code": "${input.code}"}, "gap_if_empty", "parallel_safe"),
+        ("financials", "query_financials", {"code": "${input.code}"}, "gap_if_empty", "parallel_safe"),
+        ("kline", "query_kline", {"code": "${input.code}", "count": 60}, "gap_if_empty", "parallel_safe"),
+        ("fund_flow", "query_fund_flow", {"code": "${input.code}", "days": 5}, "gap_if_empty", "eastmoney_serial"),
+        ("margin", "query_margin", {"code": "${input.code}"}, "allow_no_record", "eastmoney_serial"),
+        ("holders", "query_holders", {"code": "${input.code}"}, "allow_no_record", "eastmoney_serial"),
+        ("announcements", "query_announcements", {"code": "${input.code}"}, "allow_no_record", "parallel_safe"),
+        ("lockup", "query_lockup", {"code": "${input.code}"}, "allow_no_record", "eastmoney_serial"),
+        ("concepts", "query_concepts", {"code": "${input.code}"}, "gap_if_empty", "eastmoney_serial"),
+        ("reports", "query_reports", {"code": "${input.code}"}, "allow_no_record", "parallel_safe"),
+        ("news", "query_news", {"code": "${input.code}"}, "allow_no_record", "parallel_safe"),
+    ]
+    actual = [
+        (section.id, section.tool, section.args, section.empty_policy, tool_policy(section.tool).value)
+        for section in debate.dossier.sections
+    ]
+    assert actual == expected
+    expected_parallel = {tool for _, tool, _, _, policy in expected if policy == "parallel_safe"}
+    expected_serial = {tool for _, tool, _, _, policy in expected if policy == "eastmoney_serial"}
+    assert expected_parallel == set(PARALLEL_SAFE_TOOLS)
+    assert expected_serial == set(EASTMONEY_SERIAL_TOOLS)
+    assert all(tool_policy(tool) is ToolExecutionPolicy.PARALLEL_SAFE for tool in expected_parallel)
+    assert all(tool_policy(tool) is ToolExecutionPolicy.EASTMONEY_SERIAL for tool in expected_serial)
+
+
+@pytest.mark.parametrize(
+    ("section_index", "field", "value"),
+    [
+        (4, "args", {"code": "${input.code}", "count": 61}),
+        (6, "empty_policy", "gap_if_empty"),
+    ],
+)
+def test_debate_loader_rejects_dossier_contract_drift(
+    section_index: int,
+    field: str,
+    value: object,
+) -> None:
+    doc = yaml.safe_load((PRODUCTION_WORKFLOWS_DIR / "debate.yaml").read_text(encoding="utf-8"))
+    doc["dossier"]["sections"][section_index][field] = value
+
+    with pytest.raises(WorkflowConfigError, match="dossier.sections"):
+        validate_workflow_config(doc, workflow_id="debate")
+
+
+@pytest.mark.parametrize("invalid_value", [True, "1000"])
+def test_single_pass_numeric_fields_are_strict(invalid_value: object) -> None:
+    doc = {
+        "schema_version": 1,
+        "config_version": 1,
+        "id": "strict_number",
+        "kind": "single_pass",
+        "skill": "builtin/reflection-audit",
+        "instruction": "SKILL.md",
+        "input": {"text_field": "source", "max_chars": invalid_value},
+    }
+    with pytest.raises(WorkflowConfigError, match="input.max_chars"):
+        validate_workflow_config(doc, workflow_id="strict_number")
+
+
+@pytest.mark.parametrize("invalid_value", [True, "1200"])
+def test_staged_numeric_fields_are_strict(invalid_value: object) -> None:
+    doc = yaml.safe_load((PRODUCTION_WORKFLOWS_DIR / "debate.yaml").read_text(encoding="utf-8"))
+    doc["id"] = "strict_stage_number"
+    doc["stages"][0]["output_chars"] = invalid_value
+
+    with pytest.raises(WorkflowConfigError, match="stages.0.output_chars"):
+        validate_workflow_config(doc, workflow_id="strict_stage_number")
+
+
+def test_staged_input_pattern_is_compiled_at_load_time() -> None:
+    doc = yaml.safe_load((PRODUCTION_WORKFLOWS_DIR / "debate.yaml").read_text(encoding="utf-8"))
+    doc["id"] = "bad_pattern"
+    doc["input"]["code"]["pattern"] = "["
+
+    with pytest.raises(WorkflowConfigError, match="input.code.pattern"):
+        validate_workflow_config(doc, workflow_id="bad_pattern")
