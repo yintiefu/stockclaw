@@ -44,7 +44,7 @@ export function AgentWorkspace({ desktop, threads, chat, approval }: {
               >
                 <MessagesSquare className="h-4 w-4" aria-hidden />
               </button>
-              <h1 className="min-w-0 flex-1 truncate text-sm font-semibold">Agent 工作台</h1>
+              <h1 className="min-w-0 flex-1 truncate text-sm font-semibold">α-mind</h1>
             </header>
           ) : null}
           {approval ? <div className="max-h-[45%] shrink-0 overflow-y-auto px-3 pt-3">{approval}</div> : null}

@@ -76,7 +76,7 @@ async function request<T>(path: string, method: "GET" | "POST" | "DELETE" = "GET
   }
   if (!resp.ok) {
     if (resp.status === 401) {
-      throw new ApiError("后端开启了访问鉴权（VR_API_KEY）：请在「接入 AI」页底部填写后端访问密钥", 401);
+      throw new ApiError("后端开启了访问鉴权（VR_API_KEY）：请在「设置」页底部填写后端访问密钥", 401);
     }
     throw new ApiError(payload?.detail || `HTTP ${resp.status}`, resp.status);
   }

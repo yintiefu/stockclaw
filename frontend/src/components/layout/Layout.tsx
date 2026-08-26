@@ -19,6 +19,7 @@ const X_URL = "https://x.com/linsizhen";
 const MAIL_URL = "mailto:simonlin0423@gmail.com";
 
 const NAV = [
+  { to: "/agent", icon: Bot, label: "α-mind" },
   { to: "/daily-review", icon: Activity, label: "每日复盘" },
   { to: "/intel", icon: Radar, label: "资讯雷达" },
   { to: "/sectors", icon: LayoutGrid, label: "板块中心" },
@@ -28,8 +29,7 @@ const NAV = [
   { to: "/portfolio", icon: Wallet, label: "我的持仓" },
   { to: "/my-reports", icon: FileText, label: "我的研报" },
   { to: "/notes", icon: NotebookPen, label: "研究记录" },
-  { to: "/settings", icon: Settings, label: "接入 AI" },
-  { to: "/agent", icon: Bot, label: "Agent 工作台" },
+  { to: "/settings", icon: Settings, label: "设置" },
 ];
 
 // 常看的板块，作为「板块中心」下的快捷入口（缩进显示）。
