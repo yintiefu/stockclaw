@@ -1,0 +1,9 @@
+schema_version: 1
+config_version: 1
+id: daily_review
+kind: single_pass
+skill: builtin/market-review
+instruction: SKILL.md
+input:
+  text_field: market_snapshot
+  max_chars: 24000

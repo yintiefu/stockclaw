@@ -1,0 +1,145 @@
+schema_version: 1
+config_version: 1
+id: debate
+kind: staged_research
+result_stage: referee
+input:
+  code:
+    type: string
+    pattern: "^[0-9]{6}$"
+dossier:
+  section_chars: 1800
+  dossier_summary_chars: 6000
+  sections:
+    - id: quote
+      tool: query_quote
+      title: 实时行情
+      args:
+        codes: ["${input.code}"]
+      empty_policy: gap_if_empty
+    - id: valuation
+      tool: query_valuation
+      title: 估值与一致预期
+      args:
+        code: "${input.code}"
+      empty_policy: gap_if_empty
+    - id: valuation_percentile
+      tool: query_valuation_percentile
+      title: 估值历史分位
+      args:
+        code: "${input.code}"
+      empty_policy: gap_if_empty
+    - id: financials
+      tool: query_financials
+      title: 最新财报关键指标
+      args:
+        code: "${input.code}"
+      empty_policy: gap_if_empty
+    - id: kline
+      tool: query_kline
+      title: 近 60 日价格走势
+      args:
+        code: "${input.code}"
+        count: 60
+      empty_policy: gap_if_empty
+    - id: fund_flow
+      tool: query_fund_flow
+      title: 资金流向
+      args:
+        code: "${input.code}"
+        days: 5
+      empty_policy: gap_if_empty
+    - id: margin
+      tool: query_margin
+      title: 融资融券
+      args:
+        code: "${input.code}"
+      empty_policy: allow_no_record
+    - id: holders
+      tool: query_holders
+      title: 股东户数
+      args:
+        code: "${input.code}"
+      empty_policy: allow_no_record
+    - id: announcements
+      tool: query_announcements
+      title: 近期公告
+      args:
+        code: "${input.code}"
+      empty_policy: allow_no_record
+    - id: lockup
+      tool: query_lockup
+      title: 限售解禁
+      args:
+        code: "${input.code}"
+      empty_policy: allow_no_record
+    - id: concepts
+      tool: query_concepts
+      title: 板块与概念归属
+      args:
+        code: "${input.code}"
+      empty_policy: gap_if_empty
+    - id: reports
+      tool: query_reports
+      title: 近期研报
+      args:
+        code: "${input.code}"
+      empty_policy: allow_no_record
+    - id: news
+      tool: query_news
+      title: 近期新闻
+      args:
+        code: "${input.code}"
+      empty_policy: allow_no_record
+stages:
+  - id: bull
+    label: 多方研究员
+    skill: builtin/debate
+    instruction: references/bull.md
+    context: [dossier]
+    on_error: continue
+    output_chars: 1200
+    context_chars: 24000
+  - id: bear
+    label: 空方研究员
+    skill: builtin/debate
+    instruction: references/bear.md
+    context: [dossier, stage.bull]
+    on_error: continue
+    output_chars: 1200
+    context_chars: 24000
+  - id: bull_rebut
+    label: 多方反驳
+    skill: builtin/debate
+    instruction: references/bull-rebut.md
+    context: [dossier, stage.bull, stage.bear]
+    on_error: continue
+    output_chars: 1200
+    context_chars: 24000
+  - id: bear_rebut
+    label: 空方反驳
+    skill: builtin/debate
+    instruction: references/bear-rebut.md
+    context: [dossier, stage.bull, stage.bear, stage.bull_rebut]
+    on_error: continue
+    output_chars: 1200
+    context_chars: 24000
+  - id: referee
+    label: 中立主持
+    skill: builtin/debate
+    instruction: references/referee.md
+    context: [dossier.summary, dossier.missing, stages]
+    on_error: fail
+    output_chars: 1200
+    context_chars: 24000
+variants:
+  standard:
+    - bull
+    - bear
+    - referee
+  cross_exam:
+    - bull
+    - bear
+    - bull_rebut
+    - bear_rebut
+    - referee

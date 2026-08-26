@@ -3,6 +3,43 @@
 本项目的版本号唯一来源是 `frontend/package.json`；后端 HTTP API、`/api/health`、
 前端界面与 MCP `serverInfo` 全部从它读取（见 `backend/version.py`）。
 
+## 未发布 — 2026-08-24：Agent 思考过程展示（thinking 开关）
+
+- `settings.json` 的 `model.thinking`（默认 `false`）：开启后请求带上游思考参数，模型
+  `reasoning_content` 增量转成 thinking content block，前端以「思考过程」折叠区实时展示。
+- 新增 `ReasoningChatOpenAI`：`ChatOpenAI` 会丢弃第三方非标准字段 `reasoning_content`，
+  子类在流式 chunk 转换处保留并转块；历史回传上游前 thinking 块自动剥离（智谱等对
+  未知内容块返回 400）。
+- 思考计入 output tokens；仅对支持 `reasoning_content` 的第三方 OpenAI 兼容上游生效。
+
+## 未发布 — 2026-08-24：Agent 会话调用链路追踪（JSONL）
+
+- 新增 `SessionTraceMiddleware`：每个 run 的模型调用（耗时 / token / tool_calls）、工具调用、
+  HITL 拒绝实时追加写入按线程组织的 `~/.vibe-research/agent/traces/<thread_id>.jsonl`，
+  可 `tail -f` / `jq`；`settings.json` 的 `trace.enabled` / `trace.dir` 可关可改。
+- 终端查看：`scripts/dev trace`（列线程）与 `scripts/dev trace show <thread_id>`
+  （时间线 / `--raw`）。
+- 追踪写入失败不影响 agent 运行（首错熔断，仅一行 stderr 告警）；只记录启用后的新 run。
+
+## 未发布 — 2026-08-24：Agent 工作台迁移到本地 LangGraph Server
+
+Agent 工作台的自定义 FastAPI/AG-UI 运行时整体替换为 **assistant-ui + 本地 LangGraph Server**
+（与 FastAPI 分离启动，`127.0.0.1:2024`，仅回环地址）：
+
+- **原生线程 / 检查点 / 审批**：会话、运行、检查点与 MCP 人工审批（HITL）由 LangGraph Server
+  原生持久化，进程重启后普通会话与待审批断点均可恢复；前端经 `useStreamRuntime` + LangGraph SDK
+  线程适配器直连。
+- **静态本地配置**：模型 / MCP / Skills 全部来自一份本地设置文件（默认
+  `~/.vibe-research/agent/settings.json`，`VR_AGENT_SETTINGS` 可覆盖；含明文密钥，建议 `chmod 600`），
+  Agent Server 启动时读取一次，修改后重启生效。请求级模型配置与请求头密钥转发已移除。
+- **三个本地服务**：`uvicorn app:app`（:8900）+ `langgraph dev`（:2024）+ `npm run dev`（:5899）；
+  Python 3.11+，`langgraph dev` 不会自动安装依赖。
+- **旧会话不迁移**：旧版自定义 Agent JSON 会话不读取也不删除，升级后工作台从空列表开始。
+- **移除的能力**：Inspector、Artifact / 来源标签、预算治理（Policy/会话配额）、MCP/Skills 管理
+  界面与「本次/本会话」审批粒度——MCP 审批收敛为逐次「批准 / 拒绝」。
+- **不变的部分**：传统 chat / debate / reflect 仍走 FastAPI 且保持请求级模型配置与 SSRF 行为；
+  `tools.py` 的 25 个数据工具为全出口共用，Eastmoney 节流仍保持串行（进程级锁）。
+
 ## v0.4.0 — 2026-08-20
 
 ### 新增：「产业信号」页 · 第一个小栏目「GPU 租金」

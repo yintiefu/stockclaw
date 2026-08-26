@@ -13,6 +13,54 @@ def test_health():
     assert r.json()["ok"] is True
 
 
+def test_agent_status_requires_auth_when_api_key_set(monkeypatch):
+    """VR_API_KEY 公网模式下 /api/agent/status 必须带 Bearer（和其他 /api/* 一致）。"""
+    monkeypatch.setattr(app_module, "_API_KEY", "test-key-123")
+    no_auth = client.get("/api/agent/status")
+    assert no_auth.status_code == 401
+    with_auth = client.get("/api/agent/status", headers={"Authorization": "Bearer test-key-123"})
+    assert with_auth.status_code == 200
+
+
+def test_agent_status_returns_redacted_summary(monkeypatch):
+    """端点只回脱敏摘要：模型名/主机/计数/模板，绝不出现密钥。"""
+    import json as _json
+
+    from agent.settings import agent_status_summary, load_agent_settings
+
+    monkeypatch.setattr(app_module, "_API_KEY", "")
+    monkeypatch.setattr(
+        app_module, "_agent_status_payload", lambda: agent_status_summary(load_agent_settings()),
+    )
+    r = client.get("/api/agent/status")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["configured"] is True
+    assert payload["model_name"] == "test-model"
+    assert payload["base_url_host"] == "example.invalid"
+    assert payload["builtin_skill_count"] == 5
+    assert payload["mcp_server_count"] == 0
+    serialized = _json.dumps(payload, ensure_ascii=False)
+    assert "test-secret-never-send" not in serialized
+    assert "YOUR_API_KEY" in serialized
+
+
+def test_agent_status_safe_when_settings_missing(monkeypatch):
+    from agent.settings import agent_status_summary
+
+    monkeypatch.setattr(app_module, "_API_KEY", "")
+    monkeypatch.setattr(
+        app_module, "_agent_status_payload", lambda: agent_status_summary(None),
+    )
+    r = client.get("/api/agent/status")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["configured"] is False
+    assert payload["model_name"] is None
+    assert payload["base_url_host"] is None
+    assert payload["builtin_skill_count"] == 0
+
+
 @pytest.mark.parametrize("path", [
     "/api/quote?codes=abc",
     "/api/valuation?code=12",
@@ -29,30 +77,6 @@ def test_industry_top_range():
     assert client.get("/api/industry?top=999").status_code == 422  # le=50
 
 
-def test_chat_empty_messages_400():
-    r = client.post("/api/chat", json={"messages": [], "llm": {"model": "x", "baseURL": "http://x", "apiKey": "k"}})
-    assert r.status_code == 400
-
-
-def test_chat_api_missing_key_400():
-    # API 接入缺 baseURL/apiKey → 400（在开流前拦下）
-    r = client.post("/api/chat", json={
-        "messages": [{"role": "user", "content": "hi"}],
-        "llm": {"provider": "deepseek", "model": "deepseek-chat", "baseURL": "", "apiKey": ""},
-    })
-    assert r.status_code == 400
-
-
-def test_chat_cli_not_installed_400():
-    # 订阅接入选一个本机没装的 CLI → 400 明确提示（不静默失败）
-    r = client.post("/api/chat", json={
-        "messages": [{"role": "user", "content": "hi"}],
-        "llm": {"provider": "cli-qwen", "model": "qwen-code", "baseURL": "", "apiKey": ""},
-    })
-    # qwen 一般未装 → 400；若恰好装了 qwen 则会进流式（放宽断言）
-    assert r.status_code in (400, 200)
-
-
 def test_global_stock_404(monkeypatch):
     """无法解析的美股/港股代码 → 404（不 500、不崩）。"""
     import gstock
@@ -66,3 +90,26 @@ def test_gstock_quote_full_null_shape():
     q = gstock._quote_from({})
     assert set(q) == {"code", "name", "price", "open", "high", "low", "prev_close", "amount", "mcap", "change_pct"}
     assert all(v is None for v in q.values())
+
+
+def test_cors_preflight_allows_patch():
+    """前端自定义方法（如持仓改用的 PATCH 语义）预检需放行。"""
+    r = client.options(
+        "/api/holdings",
+        headers={
+            "Origin": "http://127.0.0.1:5899",
+            "Access-Control-Request-Method": "PATCH",
+        },
+    )
+    assert r.status_code == 200
+    assert "PATCH" in r.headers.get("access-control-allow-methods", "")
+
+
+def test_fastapi_has_no_legacy_ai_or_agent_control_plane():
+    """迁移完成后 FastAPI 只保留数据/业务路由 + 只读 Agent 状态，AI 编排路由全部移除。"""
+    assert client.get("/api/health").status_code == 200
+    for path in ("/api/chat", "/api/debate", "/api/reflect", "/api/daily-review", "/api/news-digest"):
+        assert client.post(path, json={}).status_code == 404, path
+    assert client.get("/api/agent/threads").status_code == 404
+    # 数据 API 合同不受影响（代表性抽查）
+    assert client.get("/api/health").json()["ok"] is True

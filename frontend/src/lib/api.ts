@@ -2,8 +2,11 @@
 // 后端未启动或数据源异常时抛 ApiError，页面据此优雅降级。
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number) {
+  readonly status: number;
+  constructor(message: string, status: number) {
     super(message);
+    this.status = status;
+    this.name = "ApiError";
   }
 }
 
@@ -73,7 +76,7 @@ async function request<T>(path: string, method: "GET" | "POST" | "DELETE" = "GET
   }
   if (!resp.ok) {
     if (resp.status === 401) {
-      throw new ApiError("后端开启了访问鉴权（VR_API_KEY）：请在「接入 AI」页底部填写后端访问密钥", 401);
+      throw new ApiError("后端开启了访问鉴权（VR_API_KEY）：请在「设置」页底部填写后端访问密钥", 401);
     }
     throw new ApiError(payload?.detail || `HTTP ${resp.status}`, resp.status);
   }
@@ -281,8 +284,21 @@ export interface HkCashflow {
   currency: string | null; item_order: string[]; periods: HkCashflowPeriod[];
 }
 
+export interface AgentStatusSummary {
+  configured: boolean;
+  settings_path: string;
+  model_name: string | null;
+  base_url_host: string | null;
+  builtin_skill_count: number;
+  mcp_server_count: number;
+  restart_required: boolean;
+  config_template: string;
+  reason?: string;
+}
+
 export const api = {
   health: () => get<{ ok: boolean }>("/health"),
+  agentStatus: () => get<AgentStatusSummary>("/agent/status"),
   indices: () => get<IndexQuote[]>("/indices"),
   marketOverview: () => get<MarketOverview>("/market/overview"),
   emotion: () => get<ShortTermEmotion>("/market/emotion"),

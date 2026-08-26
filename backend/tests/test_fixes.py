@@ -7,8 +7,6 @@ from fastapi.testclient import TestClient
 
 import app as app_module
 import astock
-import chat
-import cli_runtime
 import market
 import portfolio as pf
 
@@ -196,49 +194,3 @@ def test_market_degrades_without_akshare(monkeypatch):
 
 
 # ── 流式工具调用：非标网关不带 index 时按 id 归位、不串参数 ──────────
-
-def test_stream_tool_calls_without_index(monkeypatch):
-    deltas_rounds = [
-        [  # 第一轮：增量全部不带 index —— 续块无 id、新调用带新 id
-            {"tool_calls": [{"id": "call_a", "function": {"name": "query_quote", "arguments": '{"codes":'}}]},
-            {"tool_calls": [{"function": {"arguments": '["600519"]}'}}]},
-            {"tool_calls": [{"id": "call_b", "function": {"name": "query_news", "arguments": '{"code":"600519"}'}}]},
-        ],
-        [{"content": "答案"}],  # 第二轮：纯文本收尾
-    ]
-    state = {"round": 0}
-    monkeypatch.setattr(chat, "_call_llm_stream", lambda cfg, messages, use_tools: None)
-
-    def fake_iter(_resp):
-        i = state["round"]
-        state["round"] += 1
-        yield from deltas_rounds[i]
-
-    monkeypatch.setattr(chat, "_iter_sse_deltas", fake_iter)
-    executed = []
-    monkeypatch.setattr(chat, "_exec_tool", lambda name, args: (executed.append((name, args)), {"ok": 1})[1])
-
-    events = list(chat.run_chat_stream(
-        {"baseURL": "http://x", "apiKey": "k", "model": "m"},
-        [{"role": "user", "content": "q"}],
-    ))
-    assert ("query_quote", {"codes": ["600519"]}) in executed  # 参数没被串坏
-    assert ("query_news", {"code": "600519"}) in executed      # 两个调用各归各槽
-    assert events[-1]["type"] == "done"
-
-
-# ── CLI 流式：子进程挂起时超时真正生效（不再无限期阻塞） ────────────
-
-def test_run_cli_stream_timeout(monkeypatch):
-    monkeypatch.setattr(cli_runtime, "_CLI_TIMEOUT_S", 1)
-    monkeypatch.setitem(cli_runtime._CLI_DEFS, "fake", {
-        "bins": ["python3"],
-        "delivery": "stdin",
-        "build_args": lambda _: ["-c", "import time\nprint('x', flush=True)\ntime.sleep(30)"],
-        "env": {},
-    })
-    chunks = []
-    with pytest.raises(RuntimeError, match="超时"):
-        for line in cli_runtime.run_cli_stream("fake", "s", "u"):
-            chunks.append(line)
-    assert chunks and chunks[0].strip() == "x"  # 挂起前的输出已正常流出

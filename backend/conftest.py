@@ -1,7 +1,9 @@
 """pytest 配置：把 backend 目录加进 sys.path，注册 live 标记，隔离用户数据目录。"""
+import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -11,6 +13,27 @@ sys.path.insert(0, os.path.dirname(__file__))
 _TEST_DATA_DIR = tempfile.mkdtemp(prefix="vr-test-data-")
 os.environ["VR_DATA_DIR"] = _TEST_DATA_DIR
 os.environ["VR_REPORTS_DIR"] = os.path.join(_TEST_DATA_DIR, "myreports")
+
+# Agent 静态设置隔离：agent.settings 在 import/加载时按 VR_AGENT_SETTINGS 固化默认路径，
+# 同样必须在任何测试模块 import agent 之前指向临时文件，绝不读取真实 ~/.vibe-research/。
+_TEST_AGENT_DIR = Path(_TEST_DATA_DIR) / "agent-fixtures"
+_TEST_SKILLS_DIR = _TEST_AGENT_DIR / "skills"
+_TEST_SKILLS_DIR.mkdir(parents=True)
+_TEST_SETTINGS = _TEST_AGENT_DIR / "settings.json"
+_TEST_SETTINGS.write_text(json.dumps({
+    "model": {
+        "provider": "openai",
+        "name": "test-model",
+        "apiKey": "test-secret-never-send",
+        "baseURL": "https://example.invalid/v1",
+        "temperature": 0.2,
+    },
+    "skills": {"path": str(_TEST_SKILLS_DIR)},
+    "mcpServers": {},
+    "trace": {"enabled": False},
+}), encoding="utf-8")
+os.chmod(_TEST_SETTINGS, 0o600)
+os.environ["VR_AGENT_SETTINGS"] = str(_TEST_SETTINGS)
 
 
 def pytest_configure(config):

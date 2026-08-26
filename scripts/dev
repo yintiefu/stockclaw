@@ -1,0 +1,574 @@
+#!/usr/bin/env bash
+# Vibe-Research 开发编排脚本（参考 Vibe-Trading/scripts/dev，改用 uv 管理 Python）。
+#
+# 用 uv 在 backend/.venv 建虚拟环境 + 装 requirements.txt，再用 `uv run` 拉起 uvicorn；
+# 前端走 npm；Agent 工作台另跑一个 LangGraph Server（图注册镜像自
+# backend/langgraph.json，默认 127.0.0.1:2024，线程持久化在用户目录
+# ~/.vibe-research/agent/server/.langgraph_api/）。三者作为后台常驻进程托管，
+# PID/日志落在 .vr-dev/ 下。
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATE_DIR="${VR_DEV_STATE_DIR:-$ROOT/.vr-dev}"
+LOG_DIR="$STATE_DIR/logs"
+PID_DIR="$STATE_DIR/pids"
+
+# 默认值贴合本项目：后端 127.0.0.1:8900（与 README / 安全默认一致），前端 0.0.0.0:5899（便于局域网调试）。
+# 前端 vite 代理始终打到 http://127.0.0.1:<后端端口>（见 vite.config 的 IPv6 说明，issue #8）。
+BACKEND_HOST="${VR_BACKEND_HOST:-127.0.0.1}"
+BACKEND_PORT="${VR_BACKEND_PORT:-8900}"
+FRONTEND_HOST="${VR_FRONTEND_HOST:-0.0.0.0}"
+FRONTEND_PORT="${VR_FRONTEND_PORT:-5899}"
+
+# Agent(LangGraph) Server：settings 只在图导入时读一次，改 settings.json / agent 代码
+# 后用 `scripts/dev restart agent` 重载。只绑 loopback（README：绝不要绑局域网/公网）。
+AGENT_HOST="${VR_AGENT_HOST:-127.0.0.1}"
+AGENT_PORT="${VR_AGENT_PORT:-2024}"
+
+# langgraph-runtime-inmem 把持久化路径硬编码为 cwd 下的 ./.langgraph_api/（无官方
+# env 覆盖项）。这里让服务进程以用户数据目录为 cwd 运行，配合一份自动生成的绝对路径
+# langgraph.json（--config 传入，图路径与依赖不依赖 cwd），会话数据便全部落在用户目录，
+# 仓库里不产生任何运行时文件。
+AGENT_WORK_DIR="${VR_AGENT_WORK_DIR:-$HOME/.vibe-research/agent/server}"
+
+# uv 二进制，默认取 PATH 上的 uv；可用 VR_UV 覆盖（如自定义安装路径）。
+VR_UV="${VR_UV:-uv}"
+
+# backend 虚拟环境（与 README 约定一致：backend/.venv）。
+BACKEND_VENV="$ROOT/backend/.venv"
+BACKEND_REQ="$ROOT/backend/requirements.txt"
+
+mkdir -p "$LOG_DIR" "$PID_DIR"
+
+usage() {
+  cat <<USAGE
+Usage: scripts/dev <command>
+
+Commands:
+  up                 启动后端 + 前端 + Agent(LangGraph) 开发服务器
+                      （未配置 agent settings 时跳过 Agent，其余照常）
+  stop [service]     停止 backend / frontend / agent / all（默认 all）
+  restart [service]  重启 backend / frontend / agent / all（默认 all）
+                      （改了 settings.json 或 backend/agent 代码后用 restart agent 重载）
+  status             查看进程状态与 URL
+  trace [args]       查看 Agent 调用链路追踪（无参数=列线程；show <thread_id> 看时间线；
+                      透传 --traces-dir / show --raw，用法见 python -m agent.session_trace -h）
+  logs [service]     跟踪 backend / frontend / agent / all 的日志
+  open               用默认浏览器打开前端
+  urls               打印本地开发 URL
+
+Environment:
+  VR_BACKEND_HOST     后端监听地址（默认 127.0.0.1）
+  VR_BACKEND_PORT     后端端口（默认 8900）
+  VR_FRONTEND_HOST    前端监听地址（默认 0.0.0.0）
+  VR_FRONTEND_PORT    前端端口（默认 5899）
+  VR_AGENT_HOST       Agent(LangGraph) 监听地址（默认 127.0.0.1，勿绑非本机地址）
+  VR_AGENT_PORT       Agent(LangGraph) 端口（默认 2024）
+  VR_AGENT_SETTINGS   Agent 设置文件（默认 ~/.vibe-research/agent/settings.json）
+  VR_AGENT_WORK_DIR   Agent 运行工作目录（默认 ~/.vibe-research/agent/server；
+                      生成的 langgraph.json 与 .langgraph_api/ 会话数据都在这里）
+  VR_UV               uv 可执行文件路径（默认 uv）
+  VR_DEV_STATE_DIR    PID/日志目录（默认 <repo>/.vr-dev）
+USAGE
+}
+
+# —— uv 前置检查 ——
+require_uv() {
+  if ! command -v "$VR_UV" >/dev/null 2>&1; then
+    printf "未找到 uv（%s）。请先安装：https://docs.astral.sh/uv/getting-started/installation/\n" "$VR_UV" >&2
+    exit 1
+  fi
+}
+
+# —— 确保 backend/.venv 存在且依赖已安装（uv 建环境 + uv pip 装依赖）——
+# 用 stamp 文件记录上次安装时间，仅在 venv 缺失或 requirements.txt 变更时重装，其余 up/restart 秒过。
+ensure_backend_env() {
+  if [[ ! -d "$BACKEND_VENV" ]]; then
+    printf "creating uv venv at %s\n" "$BACKEND_VENV"
+    "$VR_UV" venv "$BACKEND_VENV"
+  fi
+  local stamp="$BACKEND_VENV/.vr-deps-stamped"
+  if [[ ! -f "$stamp" ]] || [[ "$BACKEND_REQ" -nt "$stamp" ]]; then
+    printf "syncing backend deps via uv...\n"
+    # requirements.txt 里有相对路径依赖（./vendor/mootdx_compat）；uv 按“当前工作目录”解析
+    # 相对路径（不同于 pip 按文件所在目录），必须切到 backend/ 执行，否则会去仓库根找 vendor/。
+    (cd "$ROOT/backend" && VIRTUAL_ENV="$BACKEND_VENV" "$VR_UV" pip install -r requirements.txt)
+    touch "$stamp"
+  fi
+}
+
+pid_file() {
+  printf "%s/%s.pid" "$PID_DIR" "$1"
+}
+
+log_file() {
+  printf "%s/%s.log" "$LOG_DIR" "$1"
+}
+
+# url 健康探测回退用的 python（优先 backend/.venv 的，否则系统 python3）。
+_url_python() {
+  if [[ -x "$BACKEND_VENV/bin/python" ]]; then
+    printf '%s' "$BACKEND_VENV/bin/python"
+  else
+    printf '%s' python3
+  fi
+}
+
+is_running() {
+  local service="$1"
+  local file
+  file="$(pid_file "$service")"
+  [[ -f "$file" ]] && kill -0 "$(cat "$file")" 2>/dev/null
+}
+
+# 把一条命令作为新会话（独立进程组）的后台常驻进程拉起，便于后续按 PID/进程组管理。
+start_service() {
+  local service="$1"
+  shift
+  if is_running "$service"; then
+    printf "%s already running (pid %s)\n" "$service" "$(cat "$(pid_file "$service")")"
+    return
+  fi
+
+  printf "starting %s...\n" "$service"
+  "$("_url_python")" - "$(log_file "$service")" "$(pid_file "$service")" "$@" <<'PY'
+import subprocess
+import sys
+
+log_path = sys.argv[1]
+pid_path = sys.argv[2]
+cmd = sys.argv[3:]
+
+log = open(log_path, "ab", buffering=0)
+proc = subprocess.Popen(
+    cmd,
+    stdin=subprocess.DEVNULL,
+    stdout=log,
+    stderr=subprocess.STDOUT,
+    start_new_session=True,
+    close_fds=True,
+)
+with open(pid_path, "w", encoding="utf-8") as fh:
+    fh.write(str(proc.pid))
+PY
+  printf "%s pid %s, log %s\n" "$service" "$(cat "$(pid_file "$service")")" "$(log_file "$service")"
+}
+
+stop_service() {
+  local service="$1"
+  local file
+  file="$(pid_file "$service")"
+  if ! [[ -f "$file" ]]; then
+    printf "%s not started by scripts/dev\n" "$service"
+    return
+  fi
+
+  local pid
+  pid="$(cat "$file")"
+  if kill -0 "$pid" 2>/dev/null; then
+    printf "stopping %s (pid %s)...\n" "$service" "$pid"
+    kill -TERM "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+    # langgraph dev 是 in-memory runtime，SIGTERM 时要把会话数据落盘（详见 AGENTS.md），
+    # 给足 10s 宽限再兜底 KILL；硬等 0.5s 会丢线程历史。
+    for ((i = 0; i < 50; i++)); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.2
+    done
+    kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  fi
+  rm -f "$file"
+}
+
+url_ok() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 2 "$url" >/dev/null 2>&1
+  else
+    "$("_url_python")" - "$url" >/dev/null 2>&1 <<'PY'
+import sys
+import urllib.request
+
+urllib.request.urlopen(sys.argv[1], timeout=2).read(1)
+PY
+  fi
+}
+
+# 就绪失败时把日志尾部一并打到 stderr，省去手动找日志文件的一步。
+report_log_tail() {
+  local service="$1"
+  printf -- "---- %s 最近日志（tail 15，完整日志 %s）----\n" "$service" "$(log_file "$service")" >&2
+  tail -n 15 "$(log_file "$service")" >&2 2>/dev/null || true
+}
+
+wait_for_url() {
+  local service="$1"
+  local url="$2"
+  local attempts="${3:-30}"
+
+  printf "waiting for %s at %s" "$service" "$url"
+  for ((i = 1; i <= attempts; i++)); do
+    if url_ok "$url"; then
+      printf " ready\n"
+      return 0
+    fi
+    if ! is_running "$service"; then
+      printf "\n%s exited early\n" "$service" >&2
+      report_log_tail "$service"
+      return 1
+    fi
+    printf "."
+    sleep 1
+  done
+  printf "\n%s not ready after %ss\n" "$service" "$attempts" >&2
+  report_log_tail "$service"
+  return 1
+}
+
+service_url() {
+  case "$1" in
+    backend) printf "http://127.0.0.1:%s/api/health" "$BACKEND_PORT" ;;
+    frontend) printf "http://127.0.0.1:%s" "$FRONTEND_PORT" ;;
+    agent) printf "http://127.0.0.1:%s/ok" "$AGENT_PORT" ;;
+    *) return 2 ;;
+  esac
+}
+
+start_backend() {
+  if ! is_running backend && url_ok "$(service_url backend)"; then
+    rm -f "$(pid_file backend)"
+    printf "backend already reachable at %s (external)\n" "$(service_url backend)"
+    return
+  fi
+  ensure_backend_env
+  # uv run 会用 backend/.venv 里的解释器；cd 进 backend 是因为 app.py 用兄弟模块导入（import astock）。
+  start_service backend bash -lc '
+    set -euo pipefail
+    cd "$1/backend"
+    exec "$2" run python -m uvicorn app:app --host "$3" --port "$4"
+  ' bash "$ROOT" "$VR_UV" "$BACKEND_HOST" "$BACKEND_PORT"
+}
+
+start_frontend() {
+  if ! is_running frontend && url_ok "$(service_url frontend)"; then
+    rm -f "$(pid_file frontend)"
+    printf "frontend already reachable at %s (external)\n" "$(service_url frontend)"
+    return
+  fi
+  # 后端始终以 127.0.0.1 对前端可达（vite 代理避免 localhost 的 IPv6 误解析，issue #8）。
+  start_service frontend bash -lc '
+    set -euo pipefail
+    cd "$1"
+    if ! [[ -d node_modules ]]; then
+      npm install
+    fi
+    export VITE_API_URL="${VITE_API_URL:-http://127.0.0.1:$4}"
+    exec npm run dev -- --host "$2" --port "$3"
+  ' bash "$ROOT/frontend" "$FRONTEND_HOST" "$FRONTEND_PORT" "$BACKEND_PORT"
+}
+
+# agent 设置文件路径（与 backend/agent/settings.py::agent_settings_path 的默认一致）。
+agent_settings_file() {
+  printf '%s' "${VR_AGENT_SETTINGS:-$HOME/.vibe-research/agent/settings.json}"
+}
+
+# in-memory runtime 的 pickle 在 PersistentDict.load() 失败时会以空库启动，随后 10s
+# flush 原子覆盖原文件。启动前把 *.pckl 拷到时间戳目录，保留最近 5 份。
+backup_agent_pickles() {
+  local src="$AGENT_WORK_DIR/.langgraph_api"
+  local bak_root="$AGENT_WORK_DIR/pickle-backups"
+  local keep=5
+  [[ -d "$src" ]] || return 0
+  local stamp dest copied=0 f
+  stamp="$(date +%Y%m%d-%H%M%S)-$$"
+  dest="$bak_root/$stamp"
+  mkdir -p "$dest"
+  for f in "$src"/*.pckl; do
+    [[ -f "$f" ]] || continue
+    cp -a "$f" "$dest/"
+    copied=1
+  done
+  if [[ "$copied" -eq 0 ]]; then
+    rmdir "$dest" 2>/dev/null || true
+    return 0
+  fi
+  printf "agent pickle backup -> %s\n" "$dest"
+  local extra
+  extra="$(ls -1dt "$bak_root"/*/ 2>/dev/null | tail -n +$((keep + 1)) || true)"
+  if [[ -n "$extra" ]]; then
+    while IFS= read -r d; do
+      [[ -n "$d" ]] || continue
+      rm -rf "$d"
+    done <<< "$extra"
+  fi
+}
+
+# 启动日志出现 Failed to load file 即 ops pickle 反序列化失败，线程索引会被清空。
+# 只扫本次启动追加的日志，避免被历史错误行误报。
+warn_if_pickle_load_failed() {
+  local log mark
+  log="$(log_file agent)"
+  [[ -f "$log" ]] || return 0
+  mark="$(cat "$STATE_DIR/agent-log.mark" 2>/dev/null || printf 0)"
+  if tail -c +$((mark + 1)) "$log" | grep -q "Failed to load file"; then
+    printf "warning: agent pickle 反序列化失败（Failed to load file）。线程索引可能已被清空；备份在 %s/pickle-backups/\n" \
+      "$AGENT_WORK_DIR" >&2
+  fi
+}
+
+# 生成用户工作目录里的 langgraph.json：图注册镜像仓库 backend/langgraph.json（相对
+# 路径换成绝对路径，不依赖 cwd），CORS 白名单对准实际前端端口。每次启动重新生成，
+# 仓库里新增/改名图后 restart agent 即生效，不会出现两份注册漂移。
+ensure_agent_workdir() {
+  mkdir -p "$AGENT_WORK_DIR"
+  "$BACKEND_VENV/bin/python" - "$ROOT/backend/langgraph.json" \
+    "$AGENT_WORK_DIR/langgraph.json" "http://127.0.0.1:$FRONTEND_PORT" <<'PY'
+import json
+import os
+import sys
+
+repo_config_path, out_path, cors = sys.argv[1], sys.argv[2], sys.argv[3]
+backend = os.path.dirname(os.path.abspath(repo_config_path))
+repo = json.load(open(repo_config_path, encoding="utf-8"))
+graphs = {}
+for name, entry in repo.get("graphs", {}).items():
+    path, _, attr = entry.partition(":")
+    graphs[name] = f"{os.path.normpath(os.path.join(backend, path))}:{attr}"
+config = {
+    "dependencies": [backend],
+    "graphs": graphs,
+    "env": {"CORS_ALLOW_ORIGINS": cors},
+}
+with open(out_path, "w", encoding="utf-8") as fh:
+    json.dump(config, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+PY
+}
+
+# 收编历史存储：老版本 scripts/dev 曾用 symlink 重定向，手动裸跑则把数据留在仓库内。
+# 两种情况都把数据搬进工作目录；工作目录已有数据时不覆盖（旧的留在 *.bak）。
+migrate_agent_data() {
+  local link="$ROOT/backend/.langgraph_api"
+  local target="$AGENT_WORK_DIR/.langgraph_api"
+  local src=""
+  if [[ -L "$link" ]]; then
+    src="$(readlink -f "$link")"
+  elif [[ -d "$link" ]]; then
+    src="$link"
+  fi
+  [[ -n "$src" ]] || return 0
+  if [[ -d "$target" ]] && [[ -n "$(ls -A "$target" 2>/dev/null)" ]]; then
+    mv "$link" "$link.bak"
+    printf "note: %s 已有会话数据，仓库内旧数据保留在 %s.bak\n" "$target" "$link" >&2
+    return 0
+  fi
+  printf "migrating agent data %s -> %s\n" "$src" "$target"
+  mkdir -p "$target"
+  (shopt -s dotglob nullglob && mv "$src"/* "$target"/)
+  rm -f "$link"
+  [[ "$src" != "$target" ]] && rmdir "$src" 2>/dev/null || true
+}
+
+# 启动前用生产加载器校验 settings（中文报错、不回显密钥），把配置错误拦在起进程之前。
+validate_agent_settings() {
+  local py="$BACKEND_VENV/bin/python"
+  [[ -x "$py" ]] || return 0
+  if ! (cd "$ROOT/backend" && "$py" - <<'PY'
+from agent.settings import AgentSettingsError, load_agent_settings
+
+try:
+    load_agent_settings()
+except AgentSettingsError as exc:
+    raise SystemExit(f"Agent 配置无效：{exc}")
+PY
+  ); then
+    return 1
+  fi
+}
+
+start_agent() {
+  if ! is_running agent && url_ok "$(service_url agent)"; then
+    rm -f "$(pid_file agent)"
+    printf "agent already reachable at %s (external)\n" "$(service_url agent)"
+    return
+  fi
+  local settings
+  settings="$(agent_settings_file)"
+  if [[ ! -f "$settings" ]]; then
+    printf "agent settings not found: %s（配置方法见 README「Agent 工作台」）\n" "$settings" >&2
+    return 1
+  fi
+  ensure_backend_env
+  validate_agent_settings || return 1
+  ensure_agent_workdir
+  migrate_agent_data
+  backup_agent_pickles
+  if [[ -f "$(log_file agent)" ]]; then
+    wc -c < "$(log_file agent)" | tr -d ' ' > "$STATE_DIR/agent-log.mark"
+  else
+    printf '0' > "$STATE_DIR/agent-log.mark"
+  fi
+  # --no-reload：改 settings.json / backend/agent 代码后需 restart agent。
+  # cwd 是 AGENT_WORK_DIR（用户目录）：runtime 硬编码的 ./.langgraph_api 随 cwd 落在
+  # 用户目录；图路径/依赖走生成的绝对路径配置，不受 cwd 影响。
+  start_service agent bash -lc '
+    set -euo pipefail
+    cd "$1"
+    exec "$2/bin/langgraph" dev --config "$3" --no-browser --no-reload --host "$4" --port "$5"
+  ' bash "$AGENT_WORK_DIR" "$BACKEND_VENV" "$AGENT_WORK_DIR/langgraph.json" "$AGENT_HOST" "$AGENT_PORT"
+}
+
+cmd_up() {
+  require_uv
+  start_backend
+  start_frontend
+  if [[ -f "$(agent_settings_file)" ]]; then
+    # agent 配置错误不应拖垮 backend/frontend：启动失败只告警。
+    start_agent || printf "warning: agent 未能启动（见上方错误），backend/frontend 不受影响\n" >&2
+  else
+    printf "agent settings not found（%s），跳过 Agent Server；配置后可随时 scripts/dev restart agent\n" \
+      "$(agent_settings_file)"
+  fi
+  if ! wait_for_url backend "$(service_url backend)" 30 || \
+     ! wait_for_url frontend "$(service_url frontend)" 30; then
+    cmd_stop
+    exit 1
+  fi
+  # agent 就绪等待放最后且失败不回滚其余服务（图装配含模型/MCP 初始化，给足 60s）。
+  if is_running agent && ! wait_for_url agent "$(service_url agent)" 60; then
+    printf "warning: agent 未就绪，已停止；backend/frontend 不受影响\n" >&2
+    stop_service agent
+  elif is_running agent; then
+    warn_if_pickle_load_failed
+  fi
+  cmd_urls
+}
+
+cmd_stop() {
+  local service="${1:-all}"
+  case "$service" in
+    backend|frontend|agent)
+      stop_service "$service"
+      ;;
+    all)
+      stop_service frontend
+      stop_service agent
+      stop_service backend
+      ;;
+    *)
+      printf "unknown service: %s\n" "$service" >&2
+      exit 2
+      ;;
+  esac
+}
+
+cmd_restart() {
+  local service="${1:-all}"
+  require_uv
+  case "$service" in
+    backend)
+      stop_service backend
+      start_backend
+      wait_for_url backend "$(service_url backend)" 30
+      ;;
+    frontend)
+      stop_service frontend
+      start_frontend
+      wait_for_url frontend "$(service_url frontend)" 30
+      ;;
+    agent)
+      stop_service agent
+      start_agent
+      wait_for_url agent "$(service_url agent)" 60
+      warn_if_pickle_load_failed
+      ;;
+    all)
+      cmd_stop
+      cmd_up
+      ;;
+    *)
+      printf "unknown service: %s\n" "$service" >&2
+      exit 2
+      ;;
+  esac
+}
+
+cmd_status() {
+  local service
+  for service in backend frontend agent; do
+    if is_running "$service"; then
+      printf "%-8s running pid=%s log=%s\n" "$service" "$(cat "$(pid_file "$service")")" "$(log_file "$service")"
+    elif url_ok "$(service_url "$service")"; then
+      printf "%-8s reachable external url=%s\n" "$service" "$(service_url "$service")"
+    elif [[ "$service" == agent && ! -f "$(agent_settings_file)" ]]; then
+      printf "%-8s not configured (%s)\n" "$service" "$(agent_settings_file)"
+    else
+      printf "%-8s stopped\n" "$service"
+    fi
+  done
+  cmd_urls
+}
+
+cmd_logs() {
+  local service="${1:-all}"
+  case "$service" in
+    backend|frontend|agent)
+      touch "$(log_file "$service")"
+      tail -f "$(log_file "$service")"
+      ;;
+    all)
+      touch "$(log_file backend)" "$(log_file frontend)" "$(log_file agent)"
+      tail -f "$(log_file backend)" "$(log_file frontend)" "$(log_file agent)"
+      ;;
+    *)
+      printf "unknown service: %s\n" "$service" >&2
+      exit 2
+      ;;
+  esac
+}
+
+cmd_open() {
+  local url="http://127.0.0.1:$FRONTEND_PORT"
+  if command -v open >/dev/null 2>&1; then
+    open "$url"
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$url"
+  else
+    printf "%s\n" "$url"
+  fi
+}
+
+cmd_trace() {
+  if [[ ! -x "$BACKEND_VENV/bin/python" ]]; then
+    printf "backend venv 不存在（%s），先 scripts/dev up\n" "$BACKEND_VENV" >&2
+    exit 1
+  fi
+  (cd "$ROOT/backend" && "$BACKEND_VENV/bin/python" -m agent.session_trace "$@")
+}
+
+cmd_urls() {
+  cat <<URLS
+Frontend: http://127.0.0.1:$FRONTEND_PORT
+Backend:  http://127.0.0.1:$BACKEND_PORT/api/health
+API docs: http://127.0.0.1:$BACKEND_PORT/docs
+Agent:    http://127.0.0.1:$AGENT_PORT （LangGraph Server，健康检查 /ok）
+Agent UI: http://127.0.0.1:$FRONTEND_PORT/agent
+URLS
+}
+
+case "${1:-}" in
+  up) cmd_up ;;
+  stop) shift; cmd_stop "${1:-all}" ;;
+  restart) shift; cmd_restart "${1:-all}" ;;
+  status) require_uv; cmd_status ;;
+  trace) shift; cmd_trace "$@" ;;
+  logs) shift; cmd_logs "${1:-all}" ;;
+  open) cmd_open ;;
+  urls) cmd_urls ;;
+  -h|--help|help|"") usage ;;
+  *)
+    printf "unknown command: %s\n\n" "$1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+

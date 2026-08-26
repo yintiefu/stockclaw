@@ -3,112 +3,80 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const SRC = new URL("../src/components/ui/AskAiButton.tsx", import.meta.url);
+const CLIENT = new URL("../src/lib/agent/embedded-client.ts", import.meta.url);
 const source = await readFile(SRC, "utf8");
+const clientSource = await readFile(CLIENT, "utf8");
 
-// 这些断言锁的是 #19 的修复：对话此前只存在组件 useState 里，
-// 切页面/刷新就全丢。用户反馈「关闭 AI 就找不回之前的对话」，
-// 而每轮对话都花了他自己的 API 额度。
+// 统一 LangGraph 迁移后，问 AI 的持久化契约变了：
+// - 对话历史存在 Server 的 embedded thread checkpoint 里，不再写 localStorage；
+// - 打开抽屉只按 (route, scope_key) 精确 metadata 搜索恢复，绝不创建空 thread；
+// - 首次发送才创建 thread；「清空本页对话」删除该 scope 的 thread；
+// - 旧键 vr-askai-chat:* / vr-llm 属于迁移前数据：不读取、不迁移、不删除。
 
-test("Ask AI persists the conversation through the safe storage helper", () => {
-  assert.match(source, /from "@\/lib\/storage"/);
-  assert.match(source, /storageGet/);
-  assert.match(source, /storageSet/);
-  // 必须走 storage.ts 的封装：localStorage 在隐私模式/配额写满时会直接抛异常，
-  // 裸调会让整个面板崩掉。
-  assert.doesNotMatch(source, /(?<!\/\/.*)\blocalStorage\.(get|set|remove)Item\b/);
+test("history is checkpoint-backed: the component no longer persists chat to localStorage", () => {
+  assert.doesNotMatch(source, /vr-askai-chat/);
+  assert.doesNotMatch(source, /storageGet|storageSet|storageRemove/);
+  assert.doesNotMatch(clientSource, /vr-askai-chat|vr-askai-thread|storageGet|storageSet|storageRemove/);
+  // 恢复与发送必须走 LangGraph embedded client
+  assert.match(source, /findEmbeddedThread/);
+  assert.match(source, /loadEmbeddedMessages/);
+  assert.match(source, /sendEmbeddedMessage/);
+  assert.match(source, /deleteEmbeddedThread/);
 });
 
-test("conversations are keyed per route, not shared across pages", () => {
-  assert.match(source, /useLocation/);
-  assert.match(source, /CHAT_KEY_PREFIX\s*\+\s*pathname/);
+test("legacy browser chat and model keys are neither read nor deleted", async () => {
+  const pages = [
+    "../src/components/ui/AskAiButton.tsx",
+    "../src/lib/agent/embedded-client.ts",
+    "../src/pages/DailyReview.tsx",
+    "../src/pages/StockData.tsx",
+  ];
+  for (const rel of pages) {
+    const text = await readFile(new URL(rel, import.meta.url), "utf8");
+    assert.doesNotMatch(text, /vr-askai-chat/, `${rel} 不得读写旧对话键`);
+    assert.doesNotMatch(text, /"vr-llm"|'vr-llm'/, `${rel} 不得读取旧模型配置键`);
+  }
 });
 
-test("persisted history is capped so localStorage cannot be blown out", () => {
-  assert.match(source, /MAX_PERSISTED_MSGS\s*=\s*\d+/);
-  assert.match(source, /slice\(-MAX_PERSISTED_MSGS\)/);
+test("the embedded client searches with exact scope metadata and never creates on lookup", () => {
+  assert.match(clientSource, /channel: "embedded"/);
+  assert.match(clientSource, /scope_key: scope/);
+  assert.match(clientSource, /sortBy: "updated_at"/);
+  // 搜索恢复路径绝不创建 thread（创建只发生在 send 发现缺失时）
+  const findImpl = clientSource.match(/async function findThread[\s\S]*?\n  \}/);
+  assert.ok(findImpl, "未找到 findThread 实现");
+  assert.doesNotMatch(findImpl[0], /threads\.create/);
 });
 
-test("malformed stored data is ignored instead of crashing the panel", () => {
-  // 存量数据可能来自旧版本或被手工改坏；JSON.parse 必须包 try/catch，
-  // 且要校验形状，否则脏数据会让页面白屏。
-  assert.match(source, /try\s*\{[\s\S]*JSON\.parse[\s\S]*\}\s*catch/);
-  assert.match(source, /Array\.isArray\(parsed\)/);
+test("first send validates the page snapshot and stamps it into the run input", () => {
+  assert.match(clientSource, /page_context: \{ route, scope_key: scope, source_as_of: sourceAsOf, content \}/);
+  assert.match(clientSource, /页面快照内容为空/);
+  assert.match(clientSource, /页面快照缺少数据时间/);
 });
 
-test("there is a way to clear a stored conversation", () => {
-  assert.match(source, /storageRemove/);
-  assert.match(source, /clearChat/);
+test("clear deletes exactly the matching embedded thread", () => {
+  const clearImpl = clientSource.match(/async function deleteThread[\s\S]*?\n  \}/);
+  assert.ok(clearImpl, "未找到 deleteThread 实现");
+  assert.match(clearImpl[0], /threads\.delete/);
+  assert.match(clearImpl[0], /matchesScope/);
 });
 
-test("emptying the conversation removes the key rather than storing an empty shell", () => {
-  assert.match(source, /if \(!msgs\.length\)\s*\{\s*\n?\s*storageRemove\(key\)/);
+test("local abort never cancels the server run", () => {
+  // 断开=continue：抽屉关闭/换 scope 只中止本地消费，Server run 继续落 checkpoint。
+  assert.match(clientSource, /onDisconnect: "continue"/);
+  assert.doesNotMatch(clientSource, /runs\.cancel/);
+  assert.match(source, /只断开本地消费，不取消 Server run/);
 });
 
-test("key and messages are stored in one atomic state, not a ref", () => {
-  // 分成 msgs + 归属 ref 是不够的：key 变化那一帧 ref 已指向新 key 而 msgs 仍是旧的
-  // （setState 下一帧才生效），守卫会误放行、覆盖目标 key 已存的对话。
-  assert.match(source, /useState<\{ key: string; msgs: StoredMsg\[\] \}>/);
-  assert.match(source, /if \(chat\.key !== chatKey\) return;/);
-  assert.doesNotMatch(source, /loadedKeyRef/);
-});
-
-test("switching keys aborts an in-flight stream", () => {
-  // 否则迟到的 chunk 会被追加到目标页的对话上，且存的是用来源页上下文生成的回答。
-  const effect = source.match(/useEffect\(\(\) => \{[\s\S]*?setChat\(\{ key: chatKey[\s\S]*?\}, \[chatKey\]\);/);
-  assert.ok(effect, "未找到 chatKey 切换的 effect");
-  assert.match(effect[0], /abortRef\.current\?\.abort\(\)/);
-});
-
-test("callers can scope a conversation below the route level", () => {
-  // 个股页不换路由就能换标的：只按 pathname 分 key 会让 A 股票的历史
-  // 作为 history 发给正在问 B 股票的模型。
+test("conversations stay scoped per route and symbol", () => {
   assert.match(source, /scopeKey\?: string/);
-  assert.match(source, /CHAT_KEY_PREFIX \+ pathname \+ \(scopeKey \? `#\$\{scopeKey\}` : ""\)/);
+  assert.match(clientSource, /function normalizeScope/);
+  // scope_key 非空：无细分 scope 的页面归一化为路由本身
+  assert.match(clientSource, /return scope \|\| route\.trim\(\)/);
 });
 
-test("the stock page actually passes a per-symbol scope", async () => {
-  const page = await readFile(
-    new URL("../src/pages/StockData.tsx", import.meta.url), "utf8",
-  );
-  assert.match(page, /<AskAiButton[\s\S]*?scopeKey=/);
-  // 必须用已解析结果的代码，不能用一边打字一边变的输入框 state
-  assert.match(page, /scopeKey=\{gstock \? `g:\$\{gstock\.code\}` : val\?\.code\}/);
-});
-
-test("aborted-request cleanup is gated by request identity", () => {
-  // 换页会中止旧请求，其 catch 可能在用户已于新页面发起提问后才落地。
-  // 不校验就会删掉新请求的空气泡，后续 chunk 无处可写、对话残缺。
-  const block = source.match(/\} catch \(e\) \{[\s\S]*?\} finally \{/);
-  assert.ok(block, "未找到 catch 块");
-  // 不能简单用 abortRef.current === ac：close() 会把它置 null，
-  // 那种情况下空气泡**仍要清理**，否则会被持久化成一条空回复。
-  assert.match(block[0], /const superseded = abortRef\.current !== null && abortRef\.current !== ac;/);
-  assert.match(block[0], /if \(!superseded && chatKeyRef\.current === startedKey\)/);
-});
-
-test("streaming replies are partial from creation and only cleared on success", () => {
-  // 每个 delta 都会触发落盘，所以「中止时再补标记」来不及：
-  // 流到一半换页/换标的，存下来的就是一条被当作完整回答的残句，
-  // 回到该对话时还会以完整发言的身份进入下一轮 history。
-  assert.match(source, /partial\?: boolean/);
-  assert.match(source, /role: "assistant", content: "", tools: \[\], partial: true/); // 创建即标
-  assert.match(source, /const \{ partial: _drop, \.\.\.rest \} = msg;/);            // 成功才摘
-  assert.match(source, /const keep = completeTurns\(msgs\)/);                        // 不落盘
-  assert.match(source, /completeTurns\(msgs\)\.map/);                                // 不进 history
-});
-
-test("an interrupted turn drops the question too, not just the half answer", () => {
-  // 只丢 assistant 会留下孤立的提问，模型在 history 里看到连续两条 user 发言，
-  // 会把那个被放弃的问题当成还在等回答，去答错的题。
-  assert.match(source, /function completeTurns/);
-  assert.match(source, /if \(out\.length && out\[out\.length - 1\]\.role === "user"\) out\.pop\(\);/);
-});
-
-test("a request that fails before any content removes its question too", () => {
-  // 对称情况：一个字都没收到时删空气泡，若不连提问一起删，
-  // 界面和存储里都会留下孤立的 user turn，下一轮就是连续两条 user。
-  const block = source.match(/\} catch \(e\) \{[\s\S]*?\} finally \{/);
-  assert.ok(block, "未找到 catch 块");
-  assert.match(block[0], /const dropUser = m\[m\.length - 2\]\?\.role === "user";/);
-  assert.match(block[0], /m\.slice\(0, dropUser \? -2 : -1\)/);
+test("transient streamed answers are replaced by the authoritative checkpoint", () => {
+  assert.match(clientSource, /流结束后的 checkpoint 才是权威回答/);
+  assert.match(source, /权威 checkpoint 消息整体替换临时流式文本/);
+  assert.match(source, /partial\?: boolean|partial: true/);
 });

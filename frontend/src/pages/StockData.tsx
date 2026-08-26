@@ -68,7 +68,7 @@ function ValBand({ label, m }: { label: string; m: ValMetric }) {
           <div className="bg-muted" style={{ width: `${p80 - p20}%` }} />
           <div className="flex-1 bg-danger/35" />
         </div>
-        <div className="absolute top-1/2 h-4 w-[3px] -translate-x-1/2 -translate-y-1/2 rounded bg-foreground shadow" style={{ left: `${cur}%` }} />
+        <div className="absolute top-1/2 h-4 w-[3px] -translate-x-1/2 -translate-y-1/2 rounded bg-foreground shadow-sm" style={{ left: `${cur}%` }} />
       </div>
       <div className="mt-1 flex justify-between font-mono text-[10px] text-muted-foreground/60">
         <span>低 {m.min}</span><span>20% {m.p20}</span><span>中 {m.p50}</span><span>80% {m.p80}</span><span>高 {m.max}</span>
@@ -222,7 +222,7 @@ export function StockData() {
           onChange={(e) => setCode(e.target.value.replace(/[^a-zA-Z0-9.]/g, "").toUpperCase().slice(0, 12))}
           onKeyDown={(e) => e.key === "Enter" && run()}
           placeholder="A 股 6 位代码，或美股/港股/韩股（AAPL / 00700 / 005930.KS）"
-          className="w-80 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50"
+          className="w-80 rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-hidden focus:border-primary/50"
         />
         <button
           onClick={run}

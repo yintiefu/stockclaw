@@ -3,7 +3,7 @@ import { Link, Outlet, useLocation } from "react-router-dom";
 import {
   Activity, Radar, LayoutGrid, Wallet, Settings, Search, NotebookPen,
   Moon, Sun, ChevronsLeft, ChevronsRight, ChevronDown, LineChart, Github, UserRound,
-  Cog, Cpu, Database, Cable, Rocket, FlaskConical, Star, FileText, Swords, Thermometer, Gauge,
+  Cog, Cpu, Database, Cable, Rocket, FlaskConical, Star, FileText, Swords, Bot, Thermometer, Gauge,
   Rss, Newspaper, TrendingUp,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -21,6 +21,7 @@ const X_URL = "https://x.com/linsizhen";
 const MAIL_URL = "mailto:simonlin0423@gmail.com";
 
 const NAV = [
+  { to: "/agent", icon: Bot, label: "α-mind" },
   { to: "/daily-review", icon: Activity, label: "每日复盘" },
   { to: "/intel", icon: Radar, label: "资讯雷达" },
   { to: "/signals", icon: Thermometer, label: "产业信号" },
@@ -31,7 +32,7 @@ const NAV = [
   { to: "/portfolio", icon: Wallet, label: "我的持仓" },
   { to: "/my-reports", icon: FileText, label: "我的研报" },
   { to: "/notes", icon: NotebookPen, label: "研究记录" },
-  { to: "/settings", icon: Settings, label: "接入 AI" },
+  { to: "/settings", icon: Settings, label: "设置" },
 ];
 
 // 资讯雷达的小栏目（缩进子项，顺序即页内 Tab 顺序）。
@@ -84,28 +85,43 @@ export function Layout() {
     storageSet("vr-sidebar", collapsed ? "collapsed" : "expanded");
   }, [collapsed]);
 
+  const [constrainedAgentWidth, setConstrainedAgentWidth] = useState(() =>
+    typeof window !== "undefined"
+      && window.matchMedia("(max-width: 1399px)").matches);
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 1399px)");
+    const update = (event: MediaQueryListEvent) => setConstrainedAgentWidth(event.matches);
+    setConstrainedAgentWidth(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  const agentRoute = pathname === "/agent" || pathname.startsWith("/agent/");
+  const effectiveCollapsed = collapsed || (agentRoute && constrainedAgentWidth);
+
   return (
     <div className="flex h-screen">
       {/* Sidebar */}
       <aside className={cn(
         "glass z-10 m-2 flex shrink-0 flex-col rounded-2xl transition-all duration-200",
-        collapsed ? "w-14" : "w-60",
+        effectiveCollapsed ? "w-14" : "w-60",
       )}>
         {/* Brand */}
-        <div className={cn("border-b border-border/50", collapsed ? "flex justify-center p-3" : "p-4")}>
-          <Link to="/daily-review" className={cn("flex items-center", collapsed ? "justify-center" : "gap-2")}>
+        <div className={cn("border-b border-border/50", effectiveCollapsed ? "flex justify-center p-3" : "p-4")}>
+          <Link to="/daily-review" className={cn("flex items-center", effectiveCollapsed ? "justify-center" : "gap-2")}>
             <LineChart className="h-6 w-6 shrink-0 text-primary text-glow" />
-            {!collapsed && (
+            {!effectiveCollapsed && (
               <span className="text-lg font-extrabold tracking-tight">
                 Vibe-<span className="text-primary">Research</span>
               </span>
             )}
           </Link>
-          {!collapsed && <p className="mt-1 text-[11px] text-muted-foreground">个人 AI 投研系统 · A股/美股/港股</p>}
+          {!effectiveCollapsed && <p className="mt-1 text-[11px] text-muted-foreground">个人 AI 投研系统 · A股/美股/港股</p>}
         </div>
 
         {/* Nav */}
-        <nav className={cn("flex-1 space-y-1 overflow-auto", collapsed ? "p-1.5" : "p-2.5")}>
+        <nav className={cn("flex-1 space-y-1 overflow-auto", effectiveCollapsed ? "p-1.5" : "p-2.5")}>
           {NAV.map(({ to, icon: Icon, label }) => {
             const active = pathname === to;
             const group = NAV_GROUPS[to];
@@ -114,19 +130,19 @@ export function Layout() {
               <div key={to}>
                 <Link
                   to={to}
-                  title={collapsed ? label : undefined}
+                  title={effectiveCollapsed ? label : undefined}
                   className={cn(
                     "flex items-center rounded-lg text-sm transition-colors",
-                    collapsed ? "justify-center p-2.5" : "gap-2.5 px-3 py-2.5",
-                    active
+                    effectiveCollapsed ? "justify-center p-2.5" : "gap-2.5 px-3 py-2.5",
+                    active || groupOpen
                       ? "bg-primary/15 font-medium text-primary shadow-glow"
                       : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
                   )}
                 >
                   <Icon className="h-4 w-4 shrink-0" />
-                  {!collapsed && (group ? <span className="flex-1">{label}</span> : label)}
+                  {!effectiveCollapsed && (group ? <span className="flex-1">{label}</span> : label)}
                   {/* 导航组：小三角展开/收起子栏目（点三角不跳转，点文字仍进总览页） */}
-                  {group && !collapsed && (
+                  {group && !effectiveCollapsed && (
                     <span
                       role="button"
                       aria-label={groupOpen ? "收起子栏目" : "展开子栏目"}
@@ -139,25 +155,25 @@ export function Layout() {
                 </Link>
 
                 {/* 子栏目（缩进）；收起侧栏时恒显示图标入口 */}
-                {group && (groupOpen || collapsed) && (
-                  <div className={cn("mt-1 space-y-0.5", !collapsed && "ml-4 border-l border-border/40 pl-1.5")}>
+                {group && (groupOpen || effectiveCollapsed) && (
+                  <div className={cn("mt-1 space-y-0.5", !effectiveCollapsed && "ml-4 border-l border-border/40 pl-1.5")}>
                     {group.links.map(({ to: st, icon: SIcon, label: slabel }) => {
                       const sactive = pathname === st;
                       return (
                         <Link
                           key={st}
                           to={st}
-                          title={collapsed ? slabel : undefined}
+                          title={effectiveCollapsed ? slabel : undefined}
                           className={cn(
                             "flex items-center rounded-lg transition-colors",
-                            collapsed ? "justify-center p-2" : "gap-2 px-2.5 py-1.5 text-[13px]",
+                            effectiveCollapsed ? "justify-center p-2" : "gap-2 px-2.5 py-1.5 text-[13px]",
                             sactive
                               ? "bg-primary/10 font-medium text-primary"
                               : "text-muted-foreground/80 hover:bg-muted/40 hover:text-foreground",
                           )}
                         >
                           <SIcon className="h-3.5 w-3.5 shrink-0" />
-                          {!collapsed && slabel}
+                          {!effectiveCollapsed && slabel}
                         </Link>
                       );
                     })}
@@ -169,8 +185,8 @@ export function Layout() {
         </nav>
 
         {/* Footer */}
-        <div className={cn("border-t border-border/50", collapsed ? "flex flex-col items-center gap-2 p-2" : "space-y-2 p-3")}>
-          {collapsed ? (
+        <div className={cn("border-t border-border/50", effectiveCollapsed ? "flex flex-col items-center gap-2 p-2" : "space-y-2 p-3")}>
+          {effectiveCollapsed ? (
             <>
               <button onClick={toggle} className="rounded p-1.5 text-muted-foreground transition-colors hover:text-foreground" title={dark ? "亮色" : "暗色"}>
                 {dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
@@ -216,10 +232,12 @@ export function Layout() {
       </aside>
 
       {/* Main */}
-      <main className="flex-1 overflow-auto">
-        <div className="mx-auto max-w-6xl px-6 py-6">
-          <Outlet />
-        </div>
+      <main className={cn("min-w-0 flex-1", agentRoute ? "overflow-hidden" : "overflow-auto")}>
+        {agentRoute ? <Outlet /> : (
+          <div className="mx-auto max-w-6xl px-6 py-6">
+            <Outlet />
+          </div>
+        )}
       </main>
     </div>
   );

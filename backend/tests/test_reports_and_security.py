@@ -2,7 +2,6 @@
 
 覆盖 2026-07-07 粉丝反馈批量修复中新增/加固的后端面：
 - myreports：文件名分行业、存取删、类型白名单、data:URI 守卫、原子写。
-- chat._check_base_url：防 SSRF（本地放行本机、始终挡云元数据、公网姿态挡内网）。
 - 成本允许负数、清仓日期格式校验。
 """
 import base64
@@ -11,7 +10,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app as app_module
-import chat
 import myreports as mr
 
 client = TestClient(app_module.app)
@@ -53,32 +51,6 @@ def test_report_data_uri_without_comma_400():
 
 def test_report_missing_file_404():
     assert client.get("/api/myreports/file/does-not-exist").status_code == 404
-
-
-# ---- SSRF 守卫 ----
-
-def _allowed(url: str) -> bool:
-    try:
-        chat._check_base_url(url)
-        return True
-    except RuntimeError:
-        return False
-
-
-def test_ssrf_local_mode():
-    assert chat._PUBLIC_MODE is False  # 测试进程未设 VR_API_KEY
-    assert _allowed("https://api.deepseek.com") is True
-    assert _allowed("http://127.0.0.1:11434") is True   # 本机 Ollama 等，本地放行
-    assert _allowed("http://169.254.169.254/latest") is False  # 云元数据，始终挡
-    assert _allowed("ftp://evil/x") is False
-
-
-def test_ssrf_public_mode_blocks_internal(monkeypatch):
-    monkeypatch.setattr(chat, "_PUBLIC_MODE", True)
-    assert _allowed("http://192.168.1.1") is False
-    assert _allowed("http://10.0.0.5") is False
-    assert _allowed("http://127.0.0.1:11434") is False
-    # 注：公网域名在 public 姿态会走真实 DNS 解析核对，为保持离线不在此断言
 
 
 # ---- 成本负数 / 日期 ----

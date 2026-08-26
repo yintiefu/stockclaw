@@ -116,3 +116,54 @@ def test_hk_cashflow_shape():
         assert "经营活动现金流净额" in cf["item_order"]
         assert {"report_date", "items", "currency"} <= set(cf["periods"][0])
     assert gstock.hk_cashflow("AAPL") == {}  # 美股不走此接口
+
+
+# ---------------------------------------------------------------------------
+# mootdx 真源冒烟（Task 1C-1）：串行、只验形状。F10 直接走 Quotes，不加 HTTP 路由。
+# ---------------------------------------------------------------------------
+
+@pytest.mark.live
+def test_mootdx_kline_route_live():
+    """真实 /api/kline 路由冒烟：需要 mootdx 且上游 TDX 服务器可达。"""
+    from fastapi.testclient import TestClient
+
+    import app
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/kline", params={"code": CODE, "offset": 5})
+        if resp.status_code == 501:  # mootdx 未安装，跳过（非本测试关注点）
+            pytest.skip("mootdx 未安装")
+        assert resp.status_code == 200
+        rows = resp.json()["data"]
+        assert isinstance(rows, list)
+        if rows:
+            assert {"open", "close", "high", "low"} <= set(rows[0])
+
+
+@pytest.mark.live
+def test_mootdx_finance_route_live():
+    """真实 /api/finance 路由冒烟。"""
+    from fastapi.testclient import TestClient
+
+    import app
+
+    with TestClient(app.app) as client:
+        resp = client.get("/api/finance", params={"code": CODE})
+        if resp.status_code == 501:
+            pytest.skip("mootdx 未安装")
+        assert resp.status_code == 200
+        payload = resp.json()["data"]
+        assert isinstance(payload, dict)
+
+
+@pytest.mark.live
+def test_mootdx_f10_live():
+    """直接调用 Quotes.factory(market='std').F10，验证返回映射形状。"""
+    from mootdx.quotes import Quotes
+
+    quotes = Quotes.factory(market="std")
+    result = quotes.F10(CODE)
+    if not result:  # 上游风控可能间歇为空，不算失败
+        return
+    assert isinstance(result, dict)
+    assert any(isinstance(v, str) for v in result.values())
