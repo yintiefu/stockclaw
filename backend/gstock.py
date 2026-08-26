@@ -4,11 +4,11 @@
 用途＝A 股「看隔夜外围脸色」+ 个股页支持美港股代码。
 
 工程要点：
-- 东财调用全部复用 `astock.em_get`（直连优先、避开用户 Clash 代理挂国内站）+
+- 东财调用全部复用 `astock.em_get`（直连优先、失败自动降级系统网络设置）+
   `astock.eastmoney_datacenter`（datacenter 三表/指标已封装）。
 - push2 stock/get 直连偶发掉连 → **push2 优先、失败降级 push2delay**（延时行情，研究场景足够），
   latch 到可用主机整进程复用（同成交额榜的做法）。
-- Yahoo / SEC 等国外源不并入（需科学上网、且非必要）。
+- Yahoo / SEC 等境外源不并入（连通性因网络环境而异、且非必要）。
 
 合规：只做客观数据整理，不预置标的、不推荐、不预测。
 """
@@ -156,7 +156,7 @@ def _search(q: str) -> dict | None:
         raise SearchUnavailable(
             f"证券搜索接口暂时不可用（已尝试 {len(_SEARCH_ENDPOINTS)} 个端点）。"
             f"最后一个错误：{last_error}。"
-            f"这与「查无此代码」是两回事——请检查网络 / 代理，或稍后重试。"
+            f"这与「查无此代码」是两回事——请检查网络环境，或稍后重试。"
         )
     matches = []
     for s in rows:

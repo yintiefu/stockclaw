@@ -23,7 +23,7 @@
 
 > **Vibe-Research: Your Personal Trading Research Agent** · A股 / 美股 / 港股 的个人投研 Agent。
 >
-> 每日复盘、资讯雷达、个股数据、自选股、板块中心、我的持仓、我的研报、研究记录。把数据和功能配齐，由**你自己的 AI** 驱动投资研究。
+> 每日复盘、资讯雷达、产业信号、个股数据、自选股、板块中心、我的持仓、我的研报、研究记录。把数据和功能配齐，由**你自己的 AI** 驱动投资研究。
 
 Vibe-Research 是一个开源的「个人 AI 投研看板」，**主推 A 股、兼看美股 / 港股**（A 股常要看隔夜外围脸色，数据配上更全）。它不替你做决定——把行情、研报、估值、财务、公告、资金面、资讯都配齐，放进一个干净的看板，再留一个能接入**你自己的 AI** 的接口。方向和结论，交给你自己配置的模型 / agent。
 
@@ -46,9 +46,25 @@ Vibe-Research 是一个开源的「个人 AI 投研看板」，**主推 A 股、
 </td>
 <td width="50%">
 
-**资讯雷达** — 12 赛道 108 个公开源，一键提炼今日要点
+**资讯雷达** — 12 赛道 106 个公开源，一键提炼今日要点
 
 ![资讯雷达](docs/screenshots/intel.png)
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+**产业信号 · GPU 租金** — 近一年走势 + 现货 + 远期预期，零鉴权公开数据
+
+![产业信号 GPU租金](docs/screenshots/signals-gpu-rent.png)
+
+</td>
+<td width="50%">
+
+**接入 AI** — 订阅 CLI 免 key，或任意 OpenAI 兼容端点，key 只存本地
+
+![接入 AI](docs/screenshots/settings.png)
 
 </td>
 </tr>
@@ -63,7 +79,8 @@ Vibe-Research 是一个开源的「个人 AI 投研看板」，**主推 A 股、
 | 页面 | 包含的模块 / 能力 |
 |---|---|
 | 📊&nbsp;**每&#8288;日&#8288;复&#8288;盘** | 大盘指数 · **全球市场**（隔夜美股道指 / 标普 / 纳指 + 港股恒指 / 恒生科技）· 关注股票（自选实时行情）· **短线情绪**（连板股 / 最高连板 / 连板梯队 / 封板率 / 炸板率 / 晋级率）· **全市场成交额 TOP20** · 市场情绪（大盘宽度 / 题材投机 / 涨跌停）· 板块资金趋势榜 · 资金轮动 · AI 当日复盘 |
-| 📡&nbsp;**资&#8288;讯&#8288;雷&#8288;达** | 12 赛道 108 个公开 RSS 源 · AI 一键提炼「今日要点」· A 股公告 / 公开新闻（挂钩你的关注列表）|
+| 📡&nbsp;**资&#8288;讯&#8288;雷&#8288;达** | 12 赛道 106 个公开 RSS 源 · AI 一键提炼「今日要点」· A 股公告 / 公开新闻（挂钩你的关注列表）|
+| 🌡️&nbsp;**产&#8288;业&#8288;信&#8288;号** | 一句话产业信号，零鉴权公开数据直连、逐期添加小栏目。**GPU 租金**：B200 / H100 / A100 **近一年逐日租金走势**（500.farm 按机型分组统计聚合的中位）· 现货卡=曲线最新点（同源同算法，数字严格一致；附可租/总卡数与在租率）· 远期资金预期（Kalshi 公开事件合约，按 Ornn 跨平台指数整月平均结算，**覆盖全部在市结算月**：预期曲线一眼看远期涨跌 + 每月**概率分布、隐含预期中位价、最可能区间**；已结算月实际落点互证）· 口径边界直接写在页面上防误读（现货「此刻价」与远期「整月均价」是两种口径，不能直接对减）· **仓库自带发布日的数据快照，clone 打开就有完整历史**，点刷新即更新到当天 · 只呈现价格事实，不产出「过剩 / 短缺」判断 |
 | 🔍&nbsp;**个&#8288;股&#8288;数&#8288;据** | **A 股**：行情 · 估值矩阵（前向 PE / PEG）· **财报速览** · 估值历史分位 · 财务关键指标 · 研报 · 公告 · 新闻 · **资金面**（融资融券 / 股东户数 / 主力资金流 / 分红 / 大宗交易）· 龙虎榜 · 限售解禁 · 板块归属 · 热门概念 · 互动易问答。**美股 / 港股 / 韩股**（输 `AAPL` / `00700` / `005930.KS`）：行情 · 总市值 · 关键财务指标（营收 / 净利 / EPS / ROE / 毛利率 / 负债率；韩股仅行情）|
 | ⚔️&nbsp;**多&#8288;空&#8288;辩&#8288;论** | **多 agent**：后端先拉一份客观事实底稿（13 项数据），再让**多方研究员 / 空方研究员**基于同一份数据各自立论（可选交叉反驳），最后由**中立主持**归纳「双方共识 / 真正的分歧点 / 验证清单 / 数据缺口」。**刻意不产出买卖结论**。<br>⏱ 比问答重：一轮约 100 秒 / 3 次模型调用，**跑之前先看下方「一次辩论的开销」** |
 | ⭐&nbsp;**自&#8288;选&#8288;股** | **批量粘贴一串代码即加**（逗号 / 空格 / 换行都行）· 一屏表格总览（现价 / 涨跌 / PE / PB / 换手）· **实时行情开关**（右上角，默认关；开了在交易时段每 3 秒自动刷新，非交易时段与页面切走时自动暂停）· 一键交给 AI 读。只存本地 |
@@ -83,22 +100,22 @@ Vibe-Research 把三套公开数据源**直接集成进仓库**——`git clone`
 
 ### A 股全栈数据 · AStockData
 
-- **就在本仓库的 [`a-stock-data/`](a-stock-data/) 文件夹里**（v3.6.0）。十层数据架构、47 个端点、15 个数据源，`a-stock-data/SKILL.md` **内嵌全部调用代码**，自包含、零第三方数据封装依赖，东财接口已内置限流防封，主源被封还能降级到备用源。
+- **就在本仓库的 [`a-stock-data/`](a-stock-data/) 文件夹里**（v3.7.1）。十一层数据架构、54 个端点、19 个数据源，`a-stock-data/SKILL.md` **内嵌全部调用代码**，自包含、零第三方数据封装依赖，东财接口已内置限流防封，主源被封还能降级到备用源。
 - **覆盖**：行情 / K线 / 研报 / 一致预期 / 估值 / 历史分位 / 财务三表 / 公告 / 龙虎榜 / 融资融券 / 大宗交易 / 股东户数 / 分红 / 资金流 / 解禁 / 概念板块 / 打板情绪 / ETF 期权 / 互动易 / 全市场行业排名 …
 - **给 agent 用**：用 Claude Code 等 agent 跑本仓库时，要调 A 股数据就看 [`a-stock-data/SKILL.md`](a-stock-data/SKILL.md)——每个接口都有 copy-paste 即用的代码。Vibe-Research 后端的数据层（`backend/astock.py`）也是从它移植的。
-- **运行依赖**：`pip install mootdx requests pandas stockstats`（自包含，v3.0 起已移除 akshare 依赖）。
+- **运行依赖**：`pip install mootdx requests pandas stockstats numpy baostock xlrd openpyxl`（自包含，v3.0 起已移除 akshare；v3.7 新增 numpy/baostock/xlrd/openpyxl，用于筹码分布与估值历史等新端点）。
 - **更新 / 上游**：<https://github.com/simonlin1212/a-stock-data> —— 想跟进最新端点、扩数据源，去这里看；**但即便你不更新，仓库自带的这份也是固定可用的快照，可以一直用。**
 
 ### 美股 / 港股数据 · global-stock-data
 
 - **就在本仓库的 [`global-stock-data/`](global-stock-data/) 文件夹里**（v2.0.3）。13 层数据架构、30+ 个端点、11 个数据源、零鉴权，覆盖美港股行情 / K线 / 技术指标 / 三表财报 / 资金流 / 期权（CBOE 官方期权链含完整希腊字母与 0DTE 流）/ FINRA 空头成交量 / SEC EDGAR 申报流与全市场筛选。每个数据源都标注了合规级别。
-- 后端 `backend/gstock.py` 移植了**东财域内的合规子集**：全球指数（每日复盘「全球市场」栏）+ 美港股个股行情 & 关键财务指标（个股页输 `AAPL` / `00700` 即用）。东财调用复用 `astock.em_get`（直连优先，避开科学上网代理挂国内站）。
+- 后端 `backend/gstock.py` 移植了**东财域内的合规子集**：全球指数（每日复盘「全球市场」栏）+ 美港股个股行情 & 关键财务指标（个股页输 `AAPL` / `00700` 即用）。东财调用复用 `astock.em_get`（直连优先，失败自动降级系统网络设置）。
 - **韩股**：东财已覆盖，个股页输 6 位代码**加 `.KS` 后缀**即可（如三星 `005930.KS`、SK 海力士 `000660.KS`）。⚠️ 韩股代码与 A 股同为 6 位数字，**必须带 `.KS` 后缀**才能被识别为韩股（否则按 A 股处理）；东财对韩股仅给行情、无财务。台股走美股 ADR（如台积电 `TSM`）。
 - **上游**：<https://github.com/simonlin1212/global-stock-data> —— 想要 K线 / 技术指标 / 期权 / SEC 等全量端点，去这里看。
 
 ### 全球资讯 · investment-news
 
-- 12 赛道 108 个公开 RSS 源，已并入 `backend/newsradar.py` + `backend/news_sources.json`：纯标准库、零 key、已按合规词表过滤（剔除赌 / 预测市场 / 加密等）。
+- 12 赛道 106 个公开 RSS 源，已并入 `backend/newsradar.py` + `backend/news_sources.json`：纯标准库、零 key、已按合规词表过滤（剔除赌 / 预测市场 / 加密等）。
 - **上游**：<https://github.com/simonlin1212/investment-news>
 
 > 数据均来自公开源。Vibe-Research 只做客观信息整理与公开榜单呈现（连板股 / 成交额榜等，与东财 / 同花顺同款客观数据），**只呈现事实、不推荐个股、不预测涨跌、不给买卖时机、不做主观评分**；用这些数据做什么分析、看什么方向，由你和你自己的 AI 决定。
@@ -109,15 +126,16 @@ Vibe-Research 把三套公开数据源**直接集成进仓库**——`git clone`
 
 ```
 Vibe-Research/
-├── a-stock-data/      A 股全栈数据工具箱（数据源，v3.6.0，自带即用）
+├── a-stock-data/      A 股全栈数据工具箱（数据源，v3.7.1，自带即用）
 ├── global-stock-data/ 美股 / 港股数据工具箱（数据源，v2.0.3，自带即用）
 ├── backend/           FastAPI :8900（数据/业务 API）+ 本地 LangGraph Server :2024（全部 AI）
 │   ├── astock.py        A 股数据（移植自 a-stock-data）
 │   ├── gstock.py        美股 / 港股数据（移植自 global-stock-data）
 │   ├── newsradar.py     资讯雷达（移植自 investment-news）
+│   ├── signals.py       产业信号（GPU 租金：Vast 现货 + 500.farm 历史 + Kalshi 远期）
 │   ├── market.py        市场情绪 + 板块资金流 + 全球指数
 │   ├── portfolio.py     持仓 + 已清仓（存本地用户目录）
-│   ├── tools.py         AI 工具层（24 个数据工具，全部 Graph 与 MCP 共用）
+│   ├── tools.py         AI 工具层（25 个数据工具，全部 Graph 与 MCP 共用）
 │   ├── mcp_server.py    MCP server（给 Claude Code 等 agent）
 │   ├── langgraph.json   六个 LangGraph 图注册（agent / embedded_agent / debate /
 │   │                    reflection / daily_review / news_digest）
@@ -346,7 +364,7 @@ Vibe-Research 用到的数据 / 工具，来自同一套自研开源体系（都
 | [**a-stock-data**](https://github.com/simonlin1212/a-stock-data) | A 股全栈数据工具包（10 层 · 44 端点 · 15 数据源）—— 本项目的 A 股数据引擎 |
 | [**global-stock-data**](https://github.com/simonlin1212/global-stock-data) | 美股 / 港股全栈数据工具包（13 层 · 30+ 端点 · 11 数据源） |
 | [**investment-news**](https://github.com/simonlin1212/investment-news) | 全球产业链资讯看板（12 赛道一一对应 A 股板块）—— 本项目的资讯源 |
-| [**Agent-Staff**](https://github.com/simonlin1212/Agent-Staff) | 把公司 Agent 化：每部门一个 AI agent + CEO 参谋长，常驻飞书 |
+| [**TradingAgents-astock**](https://github.com/simonlin1212/TradingAgents-astock) | A 股多 Agent 投研框架（7 位分析师 · 多空辩论 · 基于 TradingAgents 深度改造适配大 A） |
 
 ## 联系作者
 

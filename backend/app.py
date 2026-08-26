@@ -22,6 +22,7 @@ import newsradar
 import portfolio as pf
 import market
 import myreports as mr
+import signals
 
 
 from version import read_version
@@ -219,6 +220,24 @@ def radar_refresh():
         return {"data": newsradar.fetch_radar()}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"资讯雷达刷新失败：{e}") from e
+
+
+@app.get("/api/signals/gpu-rent")
+def signals_gpu_rent():
+    """GPU 租金信号（算力温度计）：读缓存，无缓存返回结构骨架。"""
+    try:
+        return {"data": signals.get_gpu_rent(force=False)}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"GPU 租金信号异常：{e}") from e
+
+
+@app.post("/api/signals/gpu-rent/refresh")
+def signals_gpu_rent_refresh():
+    """强制重抓 Vast 现货 + Kalshi 远期（约 10-20s：远期逐档串行限流），更新缓存。"""
+    try:
+        return {"data": signals.fetch_gpu_rent()}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"GPU 租金信号刷新失败：{e}") from e
 
 
 @app.get("/api/market/overview")

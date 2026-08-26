@@ -178,6 +178,44 @@ export interface RadarData {
   stats: { industries: number; total_sources: number; failed_sources?: number };
 }
 
+// 产业信号 · GPU 租金
+export interface GpuSpot {
+  gpu: string; median?: number; asof_ts?: number;
+  available_gpus?: number | null; total_gpus?: number | null;
+  unavailable?: boolean; note?: string; err?: string;
+  stale?: boolean; fetch_error?: string; observed_at?: string | null;
+}
+export interface GpuHistSeries {
+  gpu: string; n_points?: number; points?: [number, number][]; latest?: number;
+  unavailable?: boolean; note?: string; err?: string;
+  stale?: boolean; fetch_error?: string; observed_at?: string | null;
+}
+export interface ForwardRung { strike: number; p_above: number; open_interest: number | null }
+export interface DistBin { label: string; lo: number | null; hi: number | null; p: number }
+export interface ImpliedMedian { value: number; bound: "exact" | "above" | "below" }
+export interface ForwardMonth {
+  month: string; close_date: string; rungs: ForwardRung[];
+  lowest_strike: number; p_below_lowest: number;
+  implied_median: ImpliedMedian | null;
+  distribution: DistBin[]; most_likely: DistBin;
+}
+export interface SettledMonth { month: string; lo: number | null; hi: number | null }
+export interface GpuForward {
+  months?: ForwardMonth[]; n_contracts?: number; n_months?: number;
+  settled?: SettledMonth[]; settled_error?: string | null;
+  unavailable?: boolean; note?: string; err?: string;
+  stale?: boolean; fetch_error?: string; observed_at?: string | null;
+}
+export interface GpuRentData {
+  generated_at: string | null;
+  how_to_read: string[];
+  spot_source: string; history_source: string; forward_source: string;
+  spot: { gpus: GpuSpot[] };
+  history: { gpus: GpuHistSeries[]; days: number };
+  forward: GpuForward | null;
+  errors: string[] | null;
+}
+
 export interface Holding {
   code: string; name: string; price: number; shares: number; cost: number;
   market_value: number; pnl: number; pnl_pct: number;
@@ -270,6 +308,8 @@ export const api = {
   hkCashflow: (symbol: string) => get<HkCashflow>(`/global/hk/cashflow?symbol=${encodeURIComponent(symbol)}`),
   radar: () => get<RadarData>("/radar"),
   radarRefresh: () => request<RadarData>("/radar/refresh", "POST"),
+  gpuRent: () => get<GpuRentData>("/signals/gpu-rent"),
+  gpuRentRefresh: () => request<GpuRentData>("/signals/gpu-rent/refresh", "POST"),
   portfolio: () => get<PortfolioData>("/portfolio"),
   addHolding: (code: string, shares: number, cost: number) => request<PortfolioData>("/portfolio/holding", "POST", { code, shares, cost }),
   removeHolding: (code: string) => request<PortfolioData>(`/portfolio/holding?code=${code}`, "DELETE"),

@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
-import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { Link, Outlet, useLocation } from "react-router-dom";
 import {
   Activity, Radar, LayoutGrid, Wallet, Settings, Search, NotebookPen,
   Moon, Sun, ChevronsLeft, ChevronsRight, ChevronDown, LineChart, Github, UserRound,
-  Cog, Cpu, Database, Cable, Rocket, FlaskConical, Star, FileText, Swords, Bot } from "lucide-react";
+  Cog, Cpu, Database, Cable, Rocket, FlaskConical, Star, FileText, Swords, Bot, Thermometer, Gauge,
+  Rss, Newspaper, TrendingUp,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useDarkMode } from "@/hooks/useDarkMode";
 import { storageGet, storageSet } from "@/lib/storage";
@@ -22,6 +24,7 @@ const NAV = [
   { to: "/agent", icon: Bot, label: "α-mind" },
   { to: "/daily-review", icon: Activity, label: "每日复盘" },
   { to: "/intel", icon: Radar, label: "资讯雷达" },
+  { to: "/signals", icon: Thermometer, label: "产业信号" },
   { to: "/sectors", icon: LayoutGrid, label: "板块中心" },
   { to: "/stock-data", icon: Search, label: "个股数据" },
   { to: "/debate", icon: Swords, label: "多空辩论" },
@@ -30,6 +33,19 @@ const NAV = [
   { to: "/my-reports", icon: FileText, label: "我的研报" },
   { to: "/notes", icon: NotebookPen, label: "研究记录" },
   { to: "/settings", icon: Settings, label: "设置" },
+];
+
+// 资讯雷达的小栏目（缩进子项，顺序即页内 Tab 顺序）。
+const INTEL_LINKS = [
+  { to: "/intel/investment-news", icon: Rss, label: "Investment News" },
+  { to: "/intel/news", icon: Newspaper, label: "公开新闻" },
+  { to: "/intel/filings", icon: FileText, label: "A股公告" },
+  { to: "/intel/events", icon: TrendingUp, label: "事件概率" },
+];
+
+// 产业信号的小栏目（缩进子项，逐期在此添加；带小三角可展开收起）。
+const SIGNAL_LINKS = [
+  { to: "/signals/gpu-rent", icon: Gauge, label: "GPU租金" },
 ];
 
 // 常看的板块，作为「板块中心」下的快捷入口（缩进显示）。
@@ -42,29 +58,36 @@ const SECTOR_LINKS = [
   { to: "/sectors/ai-pharma", icon: FlaskConical, label: "生物医药" },
 ];
 
+// 带子栏目的导航组：父项右侧小三角展开/收起，展开状态按组记忆。
+const NAV_GROUPS: Record<string, { storageKey: string; links: typeof SIGNAL_LINKS }> = {
+  "/intel": { storageKey: "vr-intel-open", links: INTEL_LINKS },
+  "/signals": { storageKey: "vr-signals-open", links: SIGNAL_LINKS },
+  "/sectors": { storageKey: "vr-sectors-open", links: SECTOR_LINKS },
+};
+
 export function Layout() {
   const { pathname } = useLocation();
-  const navigate = useNavigate();
   const { dark, toggle } = useDarkMode();
-  const [collapsed, setCollapsedState] = useState(() => storageGet("vr-sidebar") === "collapsed");
-  const setCollapsed = (next: boolean) => {
-    setCollapsedState(next);
-    storageSet("vr-sidebar", next ? "collapsed" : "expanded");
+  const [collapsed, setCollapsed] = useState(() => storageGet("vr-sidebar") === "collapsed");
+  // 各导航组子栏目的展开状态（默认展开；按组记住用户的选择）
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>(() =>
+    Object.fromEntries(Object.entries(NAV_GROUPS).map(([path, g]) => [path, storageGet(g.storageKey) !== "closed"])));
+
+  const toggleGroup = (path: string) => {
+    setOpenGroups((prev) => {
+      const next = { ...prev, [path]: !prev[path] };
+      storageSet(NAV_GROUPS[path].storageKey, next[path] ? "open" : "closed");
+      return next;
+    });
   };
+
+  useEffect(() => {
+    storageSet("vr-sidebar", collapsed ? "collapsed" : "expanded");
+  }, [collapsed]);
+
   const [constrainedAgentWidth, setConstrainedAgentWidth] = useState(() =>
     typeof window !== "undefined"
       && window.matchMedia("(max-width: 1399px)").matches);
-  // 板块中心的子菜单：未持久化过时默认按当前是否在板块页展开
-  const [sectorsOpen, setSectorsOpen] = useState(() => {
-    const stored = storageGet("vr-sidebar-sectors");
-    if (stored === "open") return true;
-    if (stored === "closed") return false;
-    return pathname.startsWith("/sectors");
-  });
-
-  useEffect(() => {
-    storageSet("vr-sidebar-sectors", sectorsOpen ? "open" : "closed");
-  }, [sectorsOpen]);
 
   useEffect(() => {
     const media = window.matchMedia("(max-width: 1399px)");
@@ -101,44 +124,40 @@ export function Layout() {
         <nav className={cn("flex-1 space-y-1 overflow-auto", effectiveCollapsed ? "p-1.5" : "p-2.5")}>
           {NAV.map(({ to, icon: Icon, label }) => {
             const active = pathname === to;
-            // 板块中心：整行可点击展开/收起子菜单（同时保留跳转到板块总览）
-            const isSectors = to === "/sectors";
-            const subOpen = isSectors && sectorsOpen;
+            const group = NAV_GROUPS[to];
+            const groupOpen = group ? openGroups[to] : false;
             return (
               <div key={to}>
                 <Link
                   to={to}
                   title={effectiveCollapsed ? label : undefined}
-                  onClick={isSectors ? (e) => {
-                    e.preventDefault();
-                    setSectorsOpen((open) => !open);
-                    if (pathname !== to) {
-                      // 首次点击仍进入板块总览，之后点击只做展开/收起
-                      navigate(to);
-                    }
-                  } : undefined}
                   className={cn(
                     "flex items-center rounded-lg text-sm transition-colors",
                     effectiveCollapsed ? "justify-center p-2.5" : "gap-2.5 px-3 py-2.5",
-                    active || subOpen
+                    active || groupOpen
                       ? "bg-primary/15 font-medium text-primary shadow-glow"
                       : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
                   )}
                 >
                   <Icon className="h-4 w-4 shrink-0" />
-                  {!effectiveCollapsed && label}
-                  {!effectiveCollapsed && isSectors && (
-                    <ChevronDown
-                      className={cn("ml-auto h-3.5 w-3.5 shrink-0 transition-transform duration-200", subOpen && "rotate-180")}
-                      aria-label={subOpen ? "收起板块列表" : "展开板块列表"}
-                    />
+                  {!effectiveCollapsed && (group ? <span className="flex-1">{label}</span> : label)}
+                  {/* 导航组：小三角展开/收起子栏目（点三角不跳转，点文字仍进总览页） */}
+                  {group && !effectiveCollapsed && (
+                    <span
+                      role="button"
+                      aria-label={groupOpen ? "收起子栏目" : "展开子栏目"}
+                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); toggleGroup(to); }}
+                      className="-mr-1 rounded p-0.5 hover:bg-muted/60"
+                    >
+                      <ChevronDown className={cn("h-3.5 w-3.5 transition-transform", !groupOpen && "-rotate-90")} />
+                    </span>
                   )}
                 </Link>
 
-                {/* 板块中心下方：常看板块的快捷入口（缩进，可展开/收起） */}
-                {isSectors && subOpen && (
+                {/* 子栏目（缩进）；收起侧栏时恒显示图标入口 */}
+                {group && (groupOpen || effectiveCollapsed) && (
                   <div className={cn("mt-1 space-y-0.5", !effectiveCollapsed && "ml-4 border-l border-border/40 pl-1.5")}>
-                    {SECTOR_LINKS.map(({ to: st, icon: SIcon, label: slabel }) => {
+                    {group.links.map(({ to: st, icon: SIcon, label: slabel }) => {
                       const sactive = pathname === st;
                       return (
                         <Link
