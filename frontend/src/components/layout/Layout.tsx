@@ -53,7 +53,7 @@ const SECTOR_LINKS = [
   { to: "/sectors/humanoid", icon: Cog, label: "人形机器人" },
   { to: "/sectors/ai-computing", icon: Cpu, label: "AI 算力" },
   { to: "/sectors/hbm", icon: Database, label: "HBM" },
-  { to: "/sectors/cpo", icon: Cable, label: "光互联" },
+  { to: "/sectors/cpo", icon: Cable, label: "光通信" },
   { to: "/sectors/business-space", icon: Rocket, label: "商业航天" },
   { to: "/sectors/ai-pharma", icon: FlaskConical, label: "生物医药" },
 ];
