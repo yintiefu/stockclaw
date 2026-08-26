@@ -16,6 +16,13 @@
 - text 增量同步转成 `text` block：`merge_content` 对「list + 字符串」会把裸
   字符串追加进列表，前端转换层不认字符串元素（会丢正文），必须全程 block。
 - 块带固定 `index`，`merge_lists` 据此把连续增量合并进同一块（字符串拼接）。
+  **索引必须用 `lc_` 前缀字符串，不能用整数**：LangGraph 事件流桥
+  （`langchain_core` `chunks_to_events`）以块的 `index` 字段作为源标识合并
+  增量，而上游 tool_calls 增量带的是从 0 开始的整数索引——reasoning 块若
+  占用整数 0，工具调用轮的第一条 tool_call 增量（index 0）会与其同键，
+  累积时把 reasoning 块整体覆盖，思考文本就此从 checkpoint 消失（表现为
+  历史会话只剩最后一轮无工具调用的思考）。`lc_` 前缀字符串是官方认可的
+  源标识形态（`merge_lists` 只认整数或 `lc_` 前缀字符串作合并键）。
 
 **请求侧**（`_get_request_payload`）：历史 AI 消息里的 `reasoning` /
 `thinking` 块（含被 v1 规范化包进 `non_standard` 的）在上游请求前剥离——
@@ -27,6 +34,11 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langchain_openai import ChatOpenAI
+
+# reasoning / text 合成块的稳定块索引：lc_ 前缀字符串命名空间，与上游
+# tool_calls 增量的整数索引（0,1,2,…）永不相交（见模块 docstring）。
+_REASONING_BLOCK_INDEX = "lc_rs_0"
+_TEXT_BLOCK_INDEX = "lc_txt_0"
 
 
 def _is_thinking_block(block: Any) -> bool:
@@ -70,9 +82,13 @@ class ReasoningChatOpenAI(ChatOpenAI):
         message = generation.message
         reasoning = self._extract_reasoning_delta(chunk)
         if reasoning:
-            message.content = [{"type": "reasoning", "reasoning": reasoning, "index": 0}]
+            message.content = [
+                {"type": "reasoning", "reasoning": reasoning, "index": _REASONING_BLOCK_INDEX}
+            ]
         elif isinstance(message.content, str) and message.content:
-            message.content = [{"type": "text", "text": message.content, "index": 1}]
+            message.content = [
+                {"type": "text", "text": message.content, "index": _TEXT_BLOCK_INDEX}
+            ]
         return generation
 
     def _get_request_payload(
