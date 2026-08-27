@@ -594,3 +594,14 @@ async def test_model_failure_terminal_state_does_not_leak_secret():
     assert failed_stage.started_at and failed_stage.completed_at
     assert secret not in repr(final_state)
     assert final_state["errors"][-1].retryable is True
+
+
+@pytest.mark.asyncio
+async def test_resume_rejected_on_empty_checkpoint():
+    """run 在首个 checkpoint 落盘前被取消（空线程）：resume 必须被拒且文案可理解。"""
+    cfg = _debate_cfg()
+    graph = build_workflow_graph(cfg, model=StageAwareModel(replies=[]),
+                                 checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
+    # 只建线程不运行：state 为空（config_version 与 input 均缺失）
+    with pytest.raises(ValueError, match="没有可恢复的状态"):
+        await graph.ainvoke({"resume": True}, config=_thread("t-empty"))

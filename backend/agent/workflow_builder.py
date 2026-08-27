@@ -76,8 +76,13 @@ def _build_staged_graph(
     # 0. 统一入口与 resume 路由（v2 run.start 无 goto，重试 = 新 run + 控制位）
     async def entry(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
         """resume 先过版本门控；普通运行直通校验。"""
-        if _is_resume(state) and state.get("config_version") != cfg.config_version:
-            raise ValueError("配置版本不兼容：请查看已有状态或重新发起工作流")
+        if _is_resume(state):
+            stored = state.get("config_version")
+            if stored is None and "input" not in state:
+                # run 在首个 checkpoint 落盘前被取消：没有任何可恢复状态
+                raise ValueError("该工作流没有可恢复的状态：请重新发起工作流")
+            if stored != cfg.config_version:
+                raise ValueError("配置版本不兼容：请查看已有状态或重新发起工作流")
         return {}
 
     def _resume_target(state: WorkflowState) -> str:

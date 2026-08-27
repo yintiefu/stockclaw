@@ -225,8 +225,9 @@ test("辩论可中止并经 resume 从失败阶段继续，已完成阶段不重
   await page.goto("/debate");
   await page.getByPlaceholder("6 位代码，如 600519").fill("600519");
   await page.getByRole("button", { name: "开始辩论" }).click();
-  await expect(page.getByText("多方脚本观点").first()).toBeVisible({ timeout: 60_000 });
-
+  // 阶段模型带 1.5s 延迟；等首阶段开始（生成中标记 = validate_input 已落 checkpoint，
+  // 过早取消会留下无可恢复状态的空线程）再中止
+  await expect(page.getByText("生成中…").first()).toBeVisible({ timeout: 30_000 });
   await page.getByRole("button", { name: "中止" }).click();
   // stop() 内部会轮询到线程脱离 busy 才返回（≤10s），页面 finally 里的 historyKey
   // 自增发生在其后——badge「已中断」与重试按钮的出现是确定性的，不存在竞态。
@@ -240,7 +241,8 @@ test("辩论可中止并经 resume 从失败阶段继续，已完成阶段不重
   const state = await threadState(threads[0].thread_id);
   const contents = (state.values.messages ?? []).map((m: { content: unknown }) =>
     typeof m.content === "string" ? m.content : JSON.stringify(m.content));
-  expect(contents.filter((c: string) => c.includes("多方脚本观点"))).toHaveLength(1);  // bull 未重放
+  // 无论中止落在 bull 之前还是之后：resume 只补非终态阶段，bull 正文始终恰好一条
+  expect(contents.filter((c: string) => c.includes("多方脚本观点"))).toHaveLength(1);
   expect(state.values.stages.referee.status).toBe("completed");
   expect(state.values.input).toEqual({ code: "600519" });  // resume 不覆写 input
   expect(state.values.stages.bull.message_id).toBeTruthy();
