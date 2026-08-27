@@ -11,6 +11,15 @@
   的运行时校验外移为 pytest 契约测试：加载器只做通用 schema 校验，防回归不变量由
   `tests/agent/test_workflow_loader.py` 的契约比对在 CI 兜底；同时解除 loader 对
   `tool_executor` 的反向依赖。
+- 页面级「问 AI」抽屉的传输层从手写 SSE 消费切换为 `@langchain/react` 的
+  `useStream`（v2 流协议，已对本地 langgraph-api 0.12.6 冒烟验证：token 级流式、
+  `page_context` 注入、断开后 Server run 继续跑完均通过）：
+  - `embedded-client.ts` 只保留域逻辑（scope 线程搜索/创建/删除、submit 输入构造、
+    流式消息 → 抽屉消息映射），删除「流结束后再拉一次 getState」的双读与
+    AbortController 手工管理；
+  - `AskAiButton.tsx` 直接消费 hook 合并后的消息（乐观上屏 + 权威 checkpoint 自动
+    归并），关抽屉/换 scope/卸载只断开本地订阅，语义与之前一致（从不取消 Server run）；
+  - 六图 Playwright 验收（含嵌入式问答 scope 持久化/快照版本/恢复/隔离/删除）全过。
 
 ## 未发布 — 2026-08-24：Agent 思考过程展示（thinking 开关）
 
