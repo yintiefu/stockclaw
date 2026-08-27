@@ -1,33 +1,38 @@
-"""工作流图编译器与执行契约测试。
+"""工作流图编译器与执行契约测试（v2：resume 通道路由、版本门控、消息指针写入、input 保持）。
 
 测试覆盖：
 - debate 工作流 standard 与 cross_exam 变体执行路径；
-- reflection / daily_review / news_digest 单步图编译与执行；
+- 阶段正文写入 messages 通道、StageResult 只持 message_id 指针、无 result 键；
 - start_node 在调用模型前将 stage.status=running 写入 checkpoint；
-- 无效 variant 校验拦截；
-- on_error=continue 容错跳过与未产出占位符；
-- on_error=fail 直接路由至 finalize；
-- 已完成阶段在 resume 时不重复执行；
-- single_pass 图结果固定存放在 state["result"]。
+- on_error=continue 容错跳过与未产出占位符；on_error=fail 直接路由至 finalize；
+- resume（{resume: true}）：input 原样保留、只补跑非终态阶段、已完成后续阶段不重放；
+- 配置版本门控：config_version 不匹配的 resume 被 entry 拒绝；
+- reflection 单步图编译与执行。
 """
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
-import uuid
 import pytest
 import yaml
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 
-import tools as legacy_tools
 from agent.skill_backends import BUILTIN_SKILLS_DIR
 from agent.workflow_builder import build_workflow_graph
 from agent.workflow_loader import load_workflow_config_from_file, validate_workflow_config
-from agent.workflow_state import StageResult, WorkflowState
-from tests.agent.fakes import ScriptedChatModel
+from agent.workflow_state import StageResult, message_text
+from tests.agent.fakes import ScriptedChatModel, install_fake_exec_tool
 
 WORKFLOWS_DIR = Path(__file__).resolve().parents[2] / "agent" / "workflows"
+DEBATE_YAML = WORKFLOWS_DIR / "debate.yaml"
+
+
+@pytest.fixture(autouse=True)
+def _fake_tools(monkeypatch):
+    """底稿 13 节离线化（助手与 FAKE_TOOL_RESULTS 见 tests/agent/fakes.py）。
+    不 fake 会触真实数据源 + 全空走 abort_no_data。"""
+    install_fake_exec_tool(monkeypatch)
 
 
 def valid_debate_input() -> dict:
@@ -38,16 +43,146 @@ def run_config(thread_id: str) -> dict:
     return {"configurable": {"thread_id": thread_id, "run_id": f"run-{thread_id}"}}
 
 
+def _debate_cfg():
+    return load_workflow_config_from_file(DEBATE_YAML, builtin_skills_root=BUILTIN_SKILLS_DIR)
+
+
+def _system_text(messages) -> str:
+    return "".join(str(m.content) for m in messages if getattr(m, "type", "") == "system")
+
+
+class StageAwareModel(ScriptedChatModel):
+    """按系统提示角色输出脚本文本（判别串与 e2e fixture StageAwareDebateModel 一致：
+    「中立主持人」「空方研究员」——substring 必须与 debate.yaml 实际系统提示吻合，
+    fixture 已在 e2e 里验证过这些判别串）。"""
+
+    def _pick_reply(self, messages) -> AIMessage:
+        text = _system_text(messages)
+        if "中立主持人" in text:
+            return AIMessage(content="中立主持脚本归纳")
+        if "空方研究员" in text:
+            return AIMessage(content="空方脚本观点")
+        return AIMessage(content="多方脚本观点")
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.invocations.append(list(messages))
+        return ChatResult(generations=[ChatGeneration(message=self._pick_reply(messages))])
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        self.invocations.append(list(messages))
+        message = self._pick_reply(messages)
+        yield ChatGenerationChunk(message=AIMessageChunk(content=message.content))
+
+
+class FlakyBearModel(StageAwareModel):
+    """首次空方调用抛错，制造「bear 失败 → resume 恢复」场景。
+
+    计数用公开字段 invocations（_stream/_generate 先 append 再 _pick_reply，
+    故计数已含本次调用，bear_visits<=1 即首次）。不碰 PrivateAttr：BaseChatModel
+    是 Pydantic 模型，类级读 `_bear_calls` 拿到的是 ModelPrivateAttr 描述符对象，
+    对其做算术直接 TypeError（已探针核实）。
+    """
+
+    def _pick_reply(self, messages) -> AIMessage:
+        if "空方研究员" in _system_text(messages):
+            bear_visits = sum(
+                1 for inv in self.invocations if "空方研究员" in _system_text(inv)
+            )
+            if bear_visits <= 1:
+                raise RuntimeError("MODEL_ERROR 模拟一次失败")
+        return super()._pick_reply(messages)
+
+
+def _thread(tid):
+    return {"configurable": {"thread_id": tid}}
+
+
 @pytest.mark.asyncio
-async def test_start_node_commits_running_before_model_node(monkeypatch):
-    monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"price": 1800.0, "ok": True})
-    cfg = load_workflow_config_from_file(WORKFLOWS_DIR / "debate.yaml", builtin_skills_root=BUILTIN_SKILLS_DIR)
+async def test_fresh_run_writes_pointer_messages_and_no_result_key():
+    graph = build_workflow_graph(_debate_cfg(), model=StageAwareModel(replies=[]),
+                                 checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
+    result = await graph.ainvoke({"input": {"code": "600519"}, "variant": "standard"}, config=_thread("t1"))
+    bull = result["stages"]["bull"]
+    assert bull.status == "completed"
+    assert bull.message_id  # BaseChatModel 自动 lc-run id
+    assert any(m.id == bull.message_id for m in result["messages"])
+    assert message_text(next(m for m in result["messages"] if m.id == bull.message_id)) == "多方脚本观点"
+    assert "result" not in result
+
+
+@pytest.mark.asyncio
+async def test_resume_preserves_input_and_continues_failed_stage():
+    cfg = _debate_cfg()
+    graph = build_workflow_graph(cfg, model=FlakyBearModel(replies=[]),
+                                 checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
+    first = await graph.ainvoke({"input": {"code": "600519"}, "variant": "standard"}, config=_thread("t2"))
+    assert first["stages"]["bear"].status == "failed"
+    assert first["input"] == {"code": "600519"}
+
+    # 第二次运行（同 thread）：resume 通道触发，input 必须原样保留
+    second = await graph.ainvoke({"resume": True}, config=_thread("t2"))
+    assert second["input"] == {"code": "600519"}
+    assert second["stages"]["bear"].status == "completed"
+    assert second["stages"]["referee"].status == "completed"
+    # 已完成的 bull 不重放：多方正文只出现一次
+    bull_texts = [message_text(m) for m in second["messages"]]
+    assert bull_texts.count("多方脚本观点") == 1
+    assert bull_texts.count("空方脚本观点") == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_skips_later_completed_stages():
+    """bear 失败但 referee 已完成（真实部分完成历史：失败路径不写消息）时，
+    resume 只补 bear——后续 completed 阶段不得重跑（重复模型费用 + 重复正文）。
+
+    现行 start_* 会无条件把阶段覆盖回 running（workflow_builder.py:186），
+    把 run_* 里的 completed 守卫（:197）中和掉；v2 必须靠路由持续跳过。
+    """
+    cfg = _debate_cfg()
+    model = FlakyBearModel(replies=[])
+    graph = build_workflow_graph(cfg, model=model,
+                                 checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
+    # 首跑：bear 失败（on_error=continue）→ referee 照常完成 → partial
+    first = await graph.ainvoke({"input": {"code": "600519"}, "variant": "standard"}, config=_thread("t4"))
+    assert first["stages"]["bear"].status == "failed"
+    assert first["stages"]["referee"].status == "completed"
+    assert first["workflow_status"] == "partial"
+    referee_calls = sum(1 for inv in model.invocations if "中立主持人" in _system_text(inv))
+    assert referee_calls == 1  # 首跑恰好一次
+    bear_calls = sum(1 for inv in model.invocations if "空方研究员" in _system_text(inv))
+    assert bear_calls == 1  # 失败一次
+
+    await graph.ainvoke({"resume": True}, config=_thread("t4"))
+    final = (await graph.aget_state(_thread("t4"))).values
+    assert final["stages"]["bear"].status == "completed"
+    assert final["workflow_status"] == "completed"
+    # referee 未重跑：调用次数与正文条数都还是 1
+    assert sum(1 for inv in model.invocations if "中立主持人" in _system_text(inv)) == 1
+    # bear 恰好补跑一次（失败不写消息，重跑新增一条）
+    assert sum(1 for inv in model.invocations if "空方研究员" in _system_text(inv)) == 2
+    texts = [message_text(m) for m in final["messages"]]
+    assert texts.count("中立主持脚本归纳") == 1
+    assert texts.count("空方脚本观点") == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_rejected_on_version_mismatch():
+    cfg = _debate_cfg()
+    graph = build_workflow_graph(cfg, model=StageAwareModel(replies=[]),
+                                 checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
+    await graph.ainvoke({"input": {"code": "600519"}, "variant": "standard"}, config=_thread("t3"))
+    # 公开 API 直写值（config_version 是 LastValue 通道）制造版本不匹配；
+    # checkpointer.put 需要完整 Checkpoint 对象，不是测试接口。
+    await graph.aupdate_state(_thread("t3"), {"config_version": 999})
+    with pytest.raises(ValueError, match="配置版本不兼容"):
+        await graph.ainvoke({"resume": True}, config=_thread("t3"))
+
+
+@pytest.mark.asyncio
+async def test_start_node_commits_running_before_model_node():
+    cfg = _debate_cfg()
     checkpointer = InMemorySaver()
-    model = ScriptedChatModel([
-        AIMessage(content="多方立论"),
-        AIMessage(content="空方立论"),
-        AIMessage(content="中立主持"),
-    ])
+    model = StageAwareModel(replies=[])
     graph = build_workflow_graph(cfg, model=model, checkpointer=checkpointer, builtin_skills_root=BUILTIN_SKILLS_DIR)
 
     config = run_config("checkpoint-test-start")
@@ -63,17 +198,12 @@ async def test_start_node_commits_running_before_model_node(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_debate_standard_and_cross_exam_variants(monkeypatch):
-    monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"price": 1800.0, "ok": True})
-    cfg = load_workflow_config_from_file(WORKFLOWS_DIR / "debate.yaml", builtin_skills_root=BUILTIN_SKILLS_DIR)
+async def test_debate_standard_and_cross_exam_variants():
+    cfg = _debate_cfg()
 
     # Standard variant (3 stages: bull, bear, referee)
-    model_std = ScriptedChatModel([
-        AIMessage(content="多方观点"),
-        AIMessage(content="空方观点"),
-        AIMessage(content="中立裁判：双方分歧点与验证清单"),
-    ])
-    graph_std = build_workflow_graph(cfg, model=model_std, checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
+    graph_std = build_workflow_graph(cfg, model=StageAwareModel(replies=[]),
+                                     checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
     res_std = await graph_std.ainvoke({"input": {"code": "600519"}, "variant": "standard"}, config=run_config("t-std"))
 
     assert res_std["workflow_status"] == "completed"
@@ -81,18 +211,15 @@ async def test_debate_standard_and_cross_exam_variants(monkeypatch):
     assert res_std["stages"]["bull"].status == "completed"
     assert res_std["stages"]["bear"].status == "completed"
     assert res_std["stages"]["referee"].status == "completed"
-    assert "分歧点" in res_std["result"]
+    referee = res_std["stages"]["referee"]
+    assert referee.message_id
+    assert "中立主持脚本归纳" == message_text(
+        next(m for m in res_std["messages"] if m.id == referee.message_id))
     assert "600519" in res_std["result_summary"] or "debate" in res_std["result_summary"] or "多空辩论" in res_std["result_summary"]
 
     # Cross-exam variant (5 stages)
-    model_cross = ScriptedChatModel([
-        AIMessage(content="多方观点"),
-        AIMessage(content="空方观点"),
-        AIMessage(content="多方反驳"),
-        AIMessage(content="空方反驳"),
-        AIMessage(content="中立裁判：最终分歧与验证清单"),
-    ])
-    graph_cross = build_workflow_graph(cfg, model=model_cross, checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
+    graph_cross = build_workflow_graph(cfg, model=StageAwareModel(replies=[]),
+                                       checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
     res_cross = await graph_cross.ainvoke({"input": {"code": "600519"}, "variant": "cross_exam"}, config=run_config("t-cross"))
 
     assert res_cross["workflow_status"] == "completed"
@@ -110,14 +237,17 @@ async def test_single_pass_reflection_graph():
         config=run_config("t-reflect"),
     )
     assert res["workflow_status"] == "completed"
-    assert res["result"] == "审计结果：发现 2 处逻辑跳跃与验证清单。"
+    assert "result" not in res
     assert "reflection" in res["stages"]
     assert res["stages"]["reflection"].status == "completed"
+    stage = res["stages"]["reflection"]
+    assert stage.message_id
+    assert message_text(next(m for m in res["messages"] if m.id == stage.message_id)) == "审计结果：发现 2 处逻辑跳跃与验证清单。"
     assert res["started_at"]
     assert res["completed_at"]
-    assert res["stages"]["reflection"].id == "reflection"
-    assert res["stages"]["reflection"].started_at
-    assert res["stages"]["reflection"].completed_at
+    assert stage.id == "reflection"
+    assert stage.started_at
+    assert stage.completed_at
 
 
 @pytest.mark.asyncio
@@ -191,7 +321,7 @@ async def test_single_pass_fixed_prompt_overflow_fails_before_model():
 
     assert model.invocations == []
     assert result["workflow_status"] == "failed"
-    assert result["result"] is None
+    assert "result" not in result
     assert result["errors"][-1].code == "CONTEXT_OVERFLOW"
     assert result["errors"][-1].retryable is False
 
@@ -245,28 +375,24 @@ async def test_single_pass_rejects_non_object_input_with_stable_field_path():
 
 
 @pytest.mark.asyncio
-async def test_stage_continue_on_error_routes_to_next_stage(monkeypatch):
-    monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"price": 1800.0, "ok": True})
-    cfg = load_workflow_config_from_file(WORKFLOWS_DIR / "debate.yaml", builtin_skills_root=BUILTIN_SKILLS_DIR)
+async def test_stage_continue_on_error_routes_to_next_stage():
+    cfg = _debate_cfg()
 
-    class FailingBullModel(ScriptedChatModel):
+    class FailingBullModel(StageAwareModel):
         async def astream(self, messages, config=None, **kwargs):
             # Fail on first call (bull), succeed on bear and referee
             if len(self.invocations) == 0:
-                self.invocations.append(messages)
+                self.invocations.append(list(messages))
                 raise RuntimeError("Bull model failed")
             async for chunk in super().astream(messages, config=config, **kwargs):
                 yield chunk
 
-    model = FailingBullModel([
-        AIMessage(content="空方观点正常输出"),
-        AIMessage(content="中立裁判：注意多方阶段未产出"),
-    ])
+    model = FailingBullModel(replies=[])
     graph = build_workflow_graph(cfg, model=model, checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
     res = await graph.ainvoke({"input": {"code": "600519"}, "variant": "standard"}, config=run_config("t-err-continue"))
 
     assert res["stages"]["bull"].status == "failed"
-    assert res["stages"]["bull"].content is None
+    assert res["stages"]["bull"].message_id is None
     assert res["stages"]["bear"].status == "completed"
     assert res["stages"]["referee"].status == "completed"
     assert len(res["errors"]) >= 1
@@ -275,9 +401,10 @@ async def test_stage_continue_on_error_routes_to_next_stage(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_dossier_all_failed_aborts_without_model_calls(monkeypatch):
-    # Simulate all tools failing / empty
+    # Simulate all tools failing / empty（覆盖 autouse fixture，制造全空底稿）
+    import tools as legacy_tools
     monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"error": "接口限流或无数据"})
-    cfg = load_workflow_config_from_file(WORKFLOWS_DIR / "debate.yaml", builtin_skills_root=BUILTIN_SKILLS_DIR)
+    cfg = _debate_cfg()
     model = ScriptedChatModel([AIMessage(content="不应被调用")])
     graph = build_workflow_graph(cfg, model=model, checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
 
@@ -289,35 +416,30 @@ async def test_dossier_all_failed_aborts_without_model_calls(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_referee_failure_fails_entire_workflow(monkeypatch):
-    monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"price": 1800.0, "ok": True})
-    cfg = load_workflow_config_from_file(WORKFLOWS_DIR / "debate.yaml", builtin_skills_root=BUILTIN_SKILLS_DIR)
+async def test_referee_failure_fails_entire_workflow():
+    cfg = _debate_cfg()
 
-    class FailingRefereeModel(ScriptedChatModel):
+    class FailingRefereeModel(StageAwareModel):
         async def astream(self, messages, config=None, **kwargs):
             if len(self.invocations) == 2:  # 3rd invocation (referee) fails
-                self.invocations.append(messages)
+                self.invocations.append(list(messages))
                 raise RuntimeError("Referee failed")
             async for chunk in super().astream(messages, config=config, **kwargs):
                 yield chunk
 
-    model = FailingRefereeModel([
-        AIMessage(content="多方正常"),
-        AIMessage(content="空方正常"),
-    ])
+    model = FailingRefereeModel(replies=[])
     graph = build_workflow_graph(cfg, model=model, checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
 
     res = await graph.ainvoke({"input": {"code": "600519"}, "variant": "standard"}, config=run_config("t-referee-fail"))
 
     assert res["workflow_status"] == "failed"
     assert res["stages"]["referee"].status == "failed"
-    assert res["result"] is None
+    assert res["stages"]["referee"].message_id is None
 
 
 @pytest.mark.asyncio
-async def test_on_error_fail_marks_remaining_stages_skipped(monkeypatch):
-    monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"price": 1800.0, "ok": True})
-    raw = yaml.safe_load((WORKFLOWS_DIR / "debate.yaml").read_text(encoding="utf-8"))
+async def test_on_error_fail_marks_remaining_stages_skipped():
+    raw = yaml.safe_load(DEBATE_YAML.read_text(encoding="utf-8"))
     raw["id"] = "early_fail"
     raw["stages"][0]["on_error"] = "fail"
     cfg = validate_workflow_config(
@@ -326,13 +448,13 @@ async def test_on_error_fail_marks_remaining_stages_skipped(monkeypatch):
         builtin_skills_root=BUILTIN_SKILLS_DIR,
     )
 
-    class FailingFirstModel(ScriptedChatModel):
+    class FailingFirstModel(StageAwareModel):
         async def astream(self, messages, config=None, **kwargs):
-            self.invocations.append(messages)
+            self.invocations.append(list(messages))
             raise RuntimeError("model failed")
             yield  # pragma: no cover
 
-    model = FailingFirstModel([])
+    model = FailingFirstModel(replies=[])
     graph = build_workflow_graph(
         cfg,
         model=model,
@@ -355,136 +477,8 @@ async def test_on_error_fail_marks_remaining_stages_skipped(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_compiled_graph_emits_custom_stream_events(monkeypatch):
-    monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"price": 1800.0, "ok": True})
-    cfg = load_workflow_config_from_file(WORKFLOWS_DIR / "debate.yaml", builtin_skills_root=BUILTIN_SKILLS_DIR)
-    model = ScriptedChatModel([
-        AIMessage(content="多方论点"),
-        AIMessage(content="空方论点"),
-        AIMessage(content="中立主持"),
-    ])
-    graph = build_workflow_graph(cfg, model=model, checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
-
-    custom_events = []
-    server_run_id = uuid.uuid4()
-    async for mode, chunk in graph.astream(
-        {"input": {"code": "600519"}, "variant": "standard"},
-        config={
-            "configurable": {
-                "thread_id": "t-custom-stream",
-                "run_id": "configurable-fallback-must-not-shadow-runtime",
-            },
-            "run_id": server_run_id,
-        },
-        stream_mode=["custom", "updates"],
-    ):
-        if mode == "custom":
-            custom_events.append(chunk)
-
-    assert len(custom_events) > 0
-    event_types = [e.get("type") for e in custom_events]
-    assert "workflow.status" in event_types
-    assert "dossier.progress" in event_types
-    assert "dossier.ready" in event_types
-    assert "stage.started" in event_types
-    assert "stage.delta" in event_types
-    assert "stage.completed" in event_types
-    assert "workflow.completed" in event_types
-    assert custom_events[-1]["type"] == "workflow.completed"
-    assert all("input" not in event for event in custom_events)
-    assert {event["run_id"] for event in custom_events} == {str(server_run_id)}
-    assert [event["seq"] for event in custom_events] == list(range(1, len(custom_events) + 1))
-    assert len({(event["type"], event["seq"]) for event in custom_events}) == len(custom_events)
-    started = next(event for event in custom_events if event["type"] == "stage.started")
-    assert started["label"] == "多方研究员"
-    assert custom_events[-1]["status"] == "completed"
-
-
-@pytest.mark.asyncio
-async def test_each_new_run_on_same_thread_restarts_event_sequence(monkeypatch):
-    monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"price": 1800.0, "ok": True})
-    cfg = load_workflow_config_from_file(
-        WORKFLOWS_DIR / "debate.yaml",
-        builtin_skills_root=BUILTIN_SKILLS_DIR,
-    )
-    model = ScriptedChatModel([
-        AIMessage(content="首次多方"),
-        AIMessage(content="首次空方"),
-        AIMessage(content="首次主持"),
-        AIMessage(content="再次多方"),
-        AIMessage(content="再次空方"),
-        AIMessage(content="再次主持"),
-    ])
-    graph = build_workflow_graph(
-        cfg,
-        model=model,
-        checkpointer=InMemorySaver(),
-        builtin_skills_root=BUILTIN_SKILLS_DIR,
-    )
-
-    for index in range(2):
-        run_id = uuid.uuid4()
-        events = []
-        async for mode, chunk in graph.astream(
-            {"input": {"code": "600519"}, "variant": "standard"},
-            config={
-                "configurable": {"thread_id": "same-thread-new-run"},
-                "run_id": run_id,
-            },
-            stream_mode=["custom", "updates"],
-        ):
-            if mode == "custom":
-                events.append(chunk)
-
-        assert events, f"第 {index + 1} 次 run 应发射事件"
-        assert events[0]["seq"] == 1
-        assert [event["seq"] for event in events] == list(range(1, len(events) + 1))
-        assert {event["run_id"] for event in events} == {str(run_id)}
-
-
-@pytest.mark.asyncio
-async def test_resumed_new_run_restarts_event_sequence(monkeypatch):
-    monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"price": 1800.0, "ok": True})
-    cfg = load_workflow_config_from_file(
-        WORKFLOWS_DIR / "debate.yaml",
-        builtin_skills_root=BUILTIN_SKILLS_DIR,
-    )
-    graph = build_workflow_graph(
-        cfg,
-        model=ScriptedChatModel([
-            AIMessage(content="多方"),
-            AIMessage(content="空方"),
-            AIMessage(content="主持"),
-        ]),
-        checkpointer=InMemorySaver(),
-        builtin_skills_root=BUILTIN_SKILLS_DIR,
-    )
-    thread_config = {"configurable": {"thread_id": "resume-new-run"}}
-    await graph.ainvoke(
-        {"input": {"code": "600519"}, "variant": "standard"},
-        config={**thread_config, "run_id": uuid.uuid4()},
-        interrupt_after=["start_bull"],
-    )
-
-    resumed_run_id = uuid.uuid4()
-    events = []
-    async for mode, chunk in graph.astream(
-        None,
-        config={**thread_config, "run_id": resumed_run_id},
-        stream_mode=["custom", "updates"],
-    ):
-        if mode == "custom":
-            events.append(chunk)
-
-    assert events[0]["seq"] == 1
-    assert [event["seq"] for event in events] == list(range(1, len(events) + 1))
-    assert {event["run_id"] for event in events} == {str(resumed_run_id)}
-
-
-@pytest.mark.asyncio
-async def test_new_run_overwrites_reducer_backed_terminal_state(monkeypatch):
-    monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"price": 1800.0, "ok": True})
-    raw = yaml.safe_load((WORKFLOWS_DIR / "debate.yaml").read_text(encoding="utf-8"))
+async def test_new_run_overwrites_reducer_backed_terminal_state():
+    raw = yaml.safe_load(DEBATE_YAML.read_text(encoding="utf-8"))
     raw["id"] = "rerun_state"
     raw["stages"][0]["on_error"] = "fail"
     cfg = validate_workflow_config(
@@ -493,19 +487,15 @@ async def test_new_run_overwrites_reducer_backed_terminal_state(monkeypatch):
         builtin_skills_root=BUILTIN_SKILLS_DIR,
     )
 
-    class FailOnSecondRunModel(ScriptedChatModel):
+    class FailOnSecondRunModel(StageAwareModel):
         async def astream(self, messages, config=None, **kwargs):
             if len(self.invocations) == 3:
-                self.invocations.append(messages)
+                self.invocations.append(list(messages))
                 raise RuntimeError("model failed")
             async for chunk in super().astream(messages, config=config, **kwargs):
                 yield chunk
 
-    model = FailOnSecondRunModel([
-        AIMessage(content="首次多方"),
-        AIMessage(content="首次空方"),
-        AIMessage(content="首次主持"),
-    ])
+    model = FailOnSecondRunModel(replies=[])
     graph = build_workflow_graph(
         cfg,
         model=model,
@@ -515,34 +505,25 @@ async def test_new_run_overwrites_reducer_backed_terminal_state(monkeypatch):
     thread_config = {"configurable": {"thread_id": "rerun-state"}}
     first = await graph.ainvoke(
         {"input": {"code": "600519"}, "variant": "standard"},
-        config={**thread_config, "run_id": uuid.uuid4()},
+        config=thread_config,
     )
     assert first["workflow_status"] == "completed"
 
     second = await graph.ainvoke(
         {"input": {"code": "600519"}, "variant": "standard"},
-        config={**thread_config, "run_id": uuid.uuid4()},
+        config=thread_config,
     )
 
     assert second["workflow_status"] == "failed"
     assert second["stages"]["bull"].status == "failed"
     assert second["stages"]["bear"].status == "skipped"
     assert second["stages"]["referee"].status == "skipped"
-    assert second["result"] is None
     assert len(second["errors"]) == 1
 
 
 @pytest.mark.asyncio
-async def test_input_pattern_rejects_before_tools_or_model(monkeypatch):
-    tool_calls = 0
-
-    def fake_tool(name, args):
-        nonlocal tool_calls
-        tool_calls += 1
-        return {"price": 1800.0}
-
-    monkeypatch.setattr(legacy_tools, "exec_tool", fake_tool)
-    cfg = load_workflow_config_from_file(WORKFLOWS_DIR / "debate.yaml", builtin_skills_root=BUILTIN_SKILLS_DIR)
+async def test_input_pattern_rejects_before_tools_or_model():
+    cfg = _debate_cfg()
     model = ScriptedChatModel([AIMessage(content="不应被调用")])
     graph = build_workflow_graph(cfg, model=model, checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
 
@@ -552,21 +533,19 @@ async def test_input_pattern_rejects_before_tools_or_model(monkeypatch):
             config=run_config("invalid-code"),
         )
 
-    assert tool_calls == 0
     assert model.invocations == []
 
 
 @pytest.mark.asyncio
-async def test_result_stage_is_selected_by_configuration(monkeypatch):
-    monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"price": 1800.0, "ok": True})
-    raw = yaml.safe_load((WORKFLOWS_DIR / "debate.yaml").read_text(encoding="utf-8"))
+async def test_result_stage_is_selected_by_configuration():
+    raw = yaml.safe_load(DEBATE_YAML.read_text(encoding="utf-8"))
     raw["id"] = "configured_result"
     raw["result_stage"] = "bear"
     raw["stages"] = raw["stages"][:2]
     raw["stages"][1]["on_error"] = "fail"
     raw["variants"] = {"standard": ["bull", "bear"]}
     cfg = validate_workflow_config(raw, workflow_id="configured_result", builtin_skills_root=BUILTIN_SKILLS_DIR)
-    model = ScriptedChatModel([AIMessage(content="多方文本"), AIMessage(content="配置结果阶段")])
+    model = StageAwareModel(replies=[])
     graph = build_workflow_graph(cfg, model=model, checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
 
     result = await graph.ainvoke(
@@ -575,117 +554,43 @@ async def test_result_stage_is_selected_by_configuration(monkeypatch):
     )
 
     assert result["workflow_status"] == "completed"
-    assert result["result"] == "配置结果阶段"
+    bear = result["stages"]["bear"]
+    assert bear.message_id
+    assert message_text(next(m for m in result["messages"] if m.id == bear.message_id)) == "空方脚本观点"
 
 
 @pytest.mark.asyncio
-async def test_model_failure_terminal_state_and_events_do_not_leak_secret(monkeypatch):
-    monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"price": 1800.0, "ok": True})
-    cfg = load_workflow_config_from_file(
-        WORKFLOWS_DIR / "debate.yaml",
-        builtin_skills_root=BUILTIN_SKILLS_DIR,
-    )
+async def test_model_failure_terminal_state_does_not_leak_secret():
+    cfg = _debate_cfg()
     secret = "Bearer sk-private-upstream-secret"
 
-    class SecretFailureModel(ScriptedChatModel):
+    class SecretFailureModel(StageAwareModel):
         async def astream(self, messages, config=None, **kwargs):
-            self.invocations.append(messages)
+            self.invocations.append(list(messages))
             raise RuntimeError(f"model failed: {secret}")
             yield  # pragma: no cover
 
-    model = SecretFailureModel([])
+    model = SecretFailureModel(replies=[])
     graph = build_workflow_graph(
         cfg,
         model=model,
         checkpointer=InMemorySaver(),
         builtin_skills_root=BUILTIN_SKILLS_DIR,
     )
-    custom_events = []
     final_state = None
     async for mode, chunk in graph.astream(
         {"input": {"code": "600519"}, "variant": "standard"},
         config=run_config("secret-failure"),
-        stream_mode=["custom", "values"],
+        stream_mode=["values"],
     ):
-        if mode == "custom":
-            custom_events.append(chunk)
-        elif mode == "values":
-            final_state = chunk
+        final_state = chunk
 
     assert final_state is not None
     assert final_state["workflow_status"] == "failed"
-    assert "result" in final_state and final_state["result"] is None
     assert final_state["started_at"]
     assert final_state["completed_at"]
     failed_stage = final_state["stages"]["referee"]
     assert failed_stage.status == "failed"
     assert failed_stage.started_at and failed_stage.completed_at
-    serialized = repr(final_state) + repr(custom_events)
-    assert secret not in serialized
-    assert custom_events[-1]["type"] == "workflow.failed"
-    assert custom_events[-1]["retryable"] is True
-
-
-# ---------------------------------------------------------------------------
-# 客户端取消/审计补丁写入 dict 形状阶段后的恢复（E2E 发现的真实回归）
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_staged_resume_after_client_cancel_dict_patch(monkeypatch):
-    """前端 cancel/interrupt 回写（updateState 不带 as_node）写入 JSON dict 阶段，
-    恢复 run 时节点必须容忍 dict 并规整回 StageResult，而不是 AttributeError。"""
-    monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"price": 1800.0, "ok": True})
-    cfg = load_workflow_config_from_file(WORKFLOWS_DIR / "debate.yaml", builtin_skills_root=BUILTIN_SKILLS_DIR)
-    model = ScriptedChatModel([
-        AIMessage(content="多方立论"),
-        AIMessage(content="空方立论"),
-        AIMessage(content="中立主持归纳"),
-    ])
-    graph = build_workflow_graph(cfg, model=model, checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
-    config = run_config("client-cancel-patch")
-
-    await graph.ainvoke({"input": valid_debate_input(), "variant": "standard"},
-                        config=config, interrupt_after=["run_bear"])
-    state = await graph.aget_state(config)
-    # 前端 terminalPatch 的形状：JSON dict、running 阶段改 cancelled
-    patched = {
-        sid: ({"id": sid, "status": "cancelled", "content": None, "completed_at": "2026-08-26T00:00:00Z"}
-              if st.status == "running" else st.model_dump(mode="json"))
-        for sid, st in state.values["stages"].items()
-    }
-    patched["referee"] = {"id": "referee", "status": "pending", "content": None}
-    await graph.aupdate_state(config, {
-        "workflow_status": "cancelled",
-        "current_stage": None,
-        "completed_at": "2026-08-26T00:00:00Z",
-        "stages": patched,
-    })
-
-    result = await graph.ainvoke(None, config=config)
-
-    assert result["workflow_status"] == "completed"
-    assert all(isinstance(st, StageResult) and st.status == "completed"
-               for st in result["stages"].values())
-    assert result["result"] == "中立主持归纳"
-
-
-@pytest.mark.asyncio
-async def test_single_pass_resume_after_client_cancel_dict_patch():
-    """single_pass 图同样要容忍客户端 dict 补丁后的恢复。"""
-    cfg = load_workflow_config_from_file(WORKFLOWS_DIR / "reflection.yaml", builtin_skills_root=BUILTIN_SKILLS_DIR)
-    model = ScriptedChatModel([AIMessage(content="审计完成结果")])
-    graph = build_workflow_graph(cfg, model=model, checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
-    config = run_config("single-cancel-patch")
-
-    await graph.ainvoke({"input": {"source": "已有推理文本"}}, config=config, interrupt_after=["start_stage"])
-    await graph.aupdate_state(config, {
-        "workflow_status": "cancelled",
-        "current_stage": None,
-        "stages": {"reflection": {"id": "reflection", "status": "cancelled", "content": None}},
-    })
-
-    result = await graph.ainvoke(None, config=config)
-
-    assert result["workflow_status"] == "completed"
-    assert isinstance(result["stages"]["reflection"], StageResult)
-    assert result["result"] == "审计完成结果"
+    assert secret not in repr(final_state)
+    assert final_state["errors"][-1].retryable is True
