@@ -3,14 +3,15 @@
 测试覆盖：
 - 状态字面量校验（WorkflowStatus / StageStatus）；
 - Pydantic 模型 extra="forbid"；
-- merge_stage_results 不可变更新与单阶段覆盖；
+- merge_stage_results 不可变合并（纯类型化，无 dict 规约）；
 - append_workflow_errors 纯追加；
-- 阶段失败不可保留 content；
-- 序列化与哨兵标记。
+- 未完成阶段禁止持正文指针；
+- 按指针解析阶段正文（messages 通道）与哨兵标记。
 """
 from __future__ import annotations
 
 import pytest
+from langchain_core.messages import AIMessage
 from pydantic import ValidationError
 
 from agent.workflow_state import (
@@ -18,28 +19,13 @@ from agent.workflow_state import (
     DossierSection,
     StageResult,
     WorkflowError,
-    WorkflowState,
     append_workflow_errors,
+    format_stage_context,
     merge_stage_results,
+    message_text,
+    stage_content,
+    stage_unproduced_sentinel,
 )
-
-
-def stage(
-    stage_id: str,
-    status: str,
-    content: str | None = None,
-    error: WorkflowError | None = None,
-    truncated: bool = False,
-    completed_at: str | None = None,
-) -> StageResult:
-    return StageResult(
-        stage_id=stage_id,
-        status=status,
-        content=content,
-        error=error,
-        truncated=truncated,
-        completed_at=completed_at,
-    )
 
 
 def workflow_error(
@@ -54,31 +40,40 @@ def workflow_error(
     )
 
 
-def test_merge_stage_results_updates_only_named_stage() -> None:
-    old = {"bull": stage("bull", "running"), "bear": stage("bear", "pending")}
-    new = {"bull": stage("bull", "completed", content="多方文本")}
-    merged = merge_stage_results(old, new)
-    assert merged["bull"].status == "completed"
-    assert merged["bull"].content == "多方文本"
-    assert merged["bear"].status == "pending"
-    assert merged is not old
-
-
-def test_failed_stage_cannot_retain_content() -> None:
-    failed = stage("bull", "failed", error=workflow_error("MODEL_ERROR", "模型不可用", "bull"))
-    assert failed.content is None
-    assert failed.error is not None
-    assert failed.error.code == "MODEL_ERROR"
-
-
-def test_failed_stage_with_content_raises_validation_error() -> None:
+def test_stage_result_rejects_pointer_when_not_completed() -> None:
     with pytest.raises(ValidationError):
-        StageResult(
-            stage_id="bull",
-            status="failed",
-            content="不应存在内容",
-            error=workflow_error("MODEL_ERROR", "模型不可用", "bull"),
-        )
+        StageResult(id="bull", status="failed", message_id="m1")
+
+
+def test_merge_stage_results_is_plain_typed_merge() -> None:
+    old = {"bull": StageResult(id="bull", status="completed", message_id="m1")}
+    new = {"bear": StageResult(id="bear", status="running")}
+    merged = merge_stage_results(old, new)
+    assert set(merged) == {"bull", "bear"}
+    assert merged["bear"].status == "running"
+
+
+def test_stage_content_resolves_pointer_over_objects_and_dicts() -> None:
+    messages = [
+        AIMessage(id="m1", content="多方观点正文"),
+        {"id": "m2", "content": [{"type": "reasoning", "reasoning": "思考"}, {"type": "text", "text": "裁判"}]},
+    ]
+    assert stage_content(messages, StageResult(id="bull", status="completed", message_id="m1")) == "多方观点正文"
+    assert stage_content(messages, StageResult(id="referee", status="completed", message_id="m2")) == "裁判"
+    assert stage_content(messages, StageResult(id="x", status="completed")) is None
+
+
+def test_message_text_joins_text_blocks_only() -> None:
+    assert message_text({"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}) == "ab"
+    assert message_text({"content": "裸字符串"}) == "裸字符串"
+
+
+def test_format_stage_context_uses_pointer_and_sentinel() -> None:
+    messages = [AIMessage(id="m1", content="正文")]
+    done = StageResult(id="bull", status="completed", message_id="m1")
+    pending = StageResult(id="bear", status="running")
+    assert format_stage_context("bull", done, messages) == "正文"
+    assert format_stage_context("bear", pending, messages) == stage_unproduced_sentinel("bear")
 
 
 def test_append_workflow_errors_appends_immutably() -> None:
@@ -135,7 +130,6 @@ def test_state_models_expose_the_stable_design_contract() -> None:
     result = StageResult(
         id="bull",
         status="failed",
-        content=None,
         truncated=False,
         context_truncated=True,
         started_at="2026-08-25T12:00:00Z",
@@ -144,6 +138,7 @@ def test_state_models_expose_the_stable_design_contract() -> None:
     )
 
     assert result.id == "bull"
+    assert result.stage_id == "bull"
     assert result.context_truncated is True
     assert result.started_at == "2026-08-25T12:00:00Z"
     assert result.error is not None and result.error.retryable is True
