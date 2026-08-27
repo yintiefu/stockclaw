@@ -44,6 +44,11 @@ def _skill_name_valid(name: str, directory_name: str | None) -> bool:
     )
 
 
+def skill_name_grammar_valid(name: str) -> bool:
+    """目录名/frontmatter 名共用的公开语法检查（不含目录一致性）。"""
+    return _skill_name_valid(name, None)
+
+
 def parse_skill_document(content: str, directory_name: str | None, virtual_path: str) -> ParsedSkill:
     if len(content.encode("utf-8")) > MAX_SKILL_FILE_SIZE:
         raise SkillValidationError("SKILL.md 超过 10 MiB")
