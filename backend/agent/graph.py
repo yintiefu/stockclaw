@@ -10,7 +10,6 @@ import asyncio
 from typing import Any
 
 from deepagents.middleware.filesystem import FilesystemMiddleware
-from deepagents.middleware.skills import SkillsMiddleware
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -20,7 +19,8 @@ from agent.model_factory import build_model
 from agent.policy import fixed_system_policy
 from agent.session_trace import SessionTraceMiddleware
 from agent.settings import AgentSettings, load_agent_settings
-from agent.skill_backends import BUILTIN_SKILLS_DIR, build_skill_backend
+from agent.skill_backends import BUILTIN_SKILLS_DIR, SKILLS_SYSTEM_PROMPT, build_skill_backend
+from agent.skill_reload import ReloadableSkillsMiddleware
 from agent.tool_registry import build_builtin_tools
 
 
@@ -50,7 +50,12 @@ async def build_graph(
         # 追踪中间件置于列表第一位（wrap 链最外层，计时含其余中间件开销）
         middleware.append(SessionTraceMiddleware(resolved.trace))
     middleware += [
-        SkillsMiddleware(backend=backend, sources=["/builtin/", "/user/"]),
+        # later-wins：/builtin/ 放最后，用户与内置同名时内置保持最终优先
+        ReloadableSkillsMiddleware(
+            backend=backend,
+            sources=["/user/", "/builtin/"],
+            system_prompt=SKILLS_SYSTEM_PROMPT,
+        ),
         FilesystemMiddleware(backend=backend, tools=["ls", "read_file"]),
         HumanInTheLoopMiddleware({
             tool.name: {"allowed_decisions": ["approve", "reject"]}

@@ -80,7 +80,8 @@ async def test_build_graph_uses_fixed_prompt_and_complete_tool_surface(monkeypat
     assert captured["system_prompt"] == fixed_system_policy("Agent 工作台")
     assert {tool_.name for tool_ in captured["tools"]} == {*legacy_tools.TOOL_NAMES, "fixture_echo"}
     assert isinstance(captured["middleware"][0], SkillsMiddleware)
-    assert captured["middleware"][0].sources == ["/builtin/", "/user/"]
+    assert captured["middleware"][0].sources == ["/user/", "/builtin/"]
+    assert captured["middleware"][0].system_prompt_template == graph_module.SKILLS_SYSTEM_PROMPT
     assert isinstance(captured["middleware"][1], FilesystemMiddleware)
     assert [tool_.name for tool_ in captured["middleware"][1].tools] == ["ls", "read_file"]
     exposed = {tool_.name for tool_ in captured["tools"]}
@@ -263,3 +264,50 @@ async def test_skills_are_metadata_first_read_only_and_root_confined(monkeypatch
     assert len(escape) == 1 and escape[0].status == "error"
     assert "Path traversal not allowed" in str(escape[0].content)
     assert "OUTSIDE_SECRET" not in str(result["messages"])
+
+
+@pytest.mark.asyncio
+async def test_reload_skills_refreshes_session_without_model_call(monkeypatch, settings, tmp_path):
+    """精确 /reload-skills：不调用模型/工具，回显确定性数量并结束本轮；下一轮 state 无 jump_to 残留。"""
+    monkeypatch.setattr(graph_module.MultiServerMCPClient, "get_tools", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        graph_module,
+        "create_agent",
+        lambda **kwargs: real_create_agent(checkpointer=InMemorySaver(), **kwargs),
+    )
+    model = ScriptedChatModel([AIMessage(content="第一轮回复"), AIMessage(content="下一轮正常回复")])
+    graph = await graph_module.build_graph(model=model, settings=settings)
+    config = {"configurable": {"thread_id": "reload-skills"}}
+
+    await graph.ainvoke({"messages": [{"role": "user", "content": "你好"}]}, config=config)
+    first_system = "\n".join(
+        str(message.content) for message in model.invocations[0] if isinstance(message, SystemMessage)
+    )
+    assert "late-skill" not in first_system
+
+    # 管理侧启停/导入只影响磁盘；旧会话缓存不变，精确命令触发刷新
+    late_skill_dir = settings.skills.path / "late-skill"
+    late_skill_dir.mkdir(parents=True)
+    (late_skill_dir / "SKILL.md").write_text(
+        "---\nname: late-skill\ndescription: 刷新后的新描述。\n---\n\n# 新指令\n",
+        encoding="utf-8",
+    )
+    reloaded = await graph.ainvoke(
+        {"messages": [{"role": "user", "content": "/reload-skills"}]}, config=config
+    )
+
+    assert len(model.invocations) == 1  # 刷新轮没有第二次模型调用
+    final_message = reloaded["messages"][-1]
+    assert isinstance(final_message, AIMessage)
+    assert "技能已刷新" in str(final_message.content)
+    assert "jump_to" not in reloaded
+
+    # 刷新写入 state；下一轮模型收到的系统提示包含新技能描述
+    second = await graph.ainvoke({"messages": [{"role": "user", "content": "继续"}]}, config=config)
+    assert second["messages"][-1].content == "下一轮正常回复"
+    assert "jump_to" not in second
+    second_system = "\n".join(
+        str(message.content) for message in model.invocations[1] if isinstance(message, SystemMessage)
+    )
+    assert "late-skill" in second_system
+    assert "刷新后的新描述" in second_system
