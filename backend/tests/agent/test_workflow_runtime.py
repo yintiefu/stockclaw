@@ -18,7 +18,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langchain_core.runnables import RunnableConfig
 
 import tools as legacy_tools
-from agent.workflow_loader import DossierConfig, DossierSectionConfig
+from agent.workflow_loader import DossierConfig, DossierSectionConfig, StageConfig
 from agent.workflow_runtime import (
     WorkflowContextOverflow,
     build_stage_messages,
@@ -30,7 +30,17 @@ from agent.workflow_runtime import (
     summarize_dossier,
 )
 from agent.workflow_state import DossierResult, DossierSection, StageResult, WorkflowError
-from tests.agent.fakes import ScriptedChatModel
+from tests.agent.fakes import ScriptedChatModel, install_fake_exec_tool
+
+
+@pytest.fixture(autouse=True)
+def _fake_tools(monkeypatch):
+    """底稿工具离线化（本文件仅 collect_dossier 系测试真正触达，autouse 防遗漏）。"""
+    install_fake_exec_tool(monkeypatch)
+
+
+def _stage(sid, status="completed", message_id=None):
+    return StageResult(id=sid, status=status, message_id=message_id)
 
 
 def test_is_payload_empty_logic():
@@ -137,16 +147,12 @@ async def test_collect_dossier_section_respects_tiny_limit(monkeypatch):
     assert len(sections[0].body) <= 1
 
 
-def test_serialize_stage_context_uses_sentinels_for_failed_stages():
-    stages = {
-        "bull": StageResult(stage_id="bull", status="completed", content="多方有力论点"),
-        "bear": StageResult(stage_id="bear", status="failed", error=WorkflowError(code="ERR", message="fail", stage_id="bear")),
-    }
-    context, truncated = serialize_stage_context(stages, stage_ids=["bull", "bear"], max_chars=1000)
-    assert "多方有力论点" in context
-    assert "【阶段 bear 未产出】" in context
-    assert "fail" not in context
-    assert truncated is False
+def test_serialize_stage_context_reads_pointer_content():
+    messages = [AIMessage(id="m1", content="多方正文")]
+    stages = {"bull": _stage("bull", message_id="m1"), "bear": _stage("bear", status="failed")}
+    text, _ = serialize_stage_context(stages, ["bull", "bear"], messages, max_chars=1000)
+    assert "多方正文" in text
+    assert "【阶段 bear 未产出】" in text
 
 
 @pytest.mark.asyncio
@@ -270,9 +276,22 @@ async def test_run_stage_joins_text_blocks_across_chunks():
     assert truncated is False
 
 
-def test_build_stage_messages_budgets_the_final_serialized_prompt() -> None:
-    from agent.workflow_loader import StageConfig
+@pytest.mark.asyncio
+async def test_collect_dossier_emits_progress_directly(monkeypatch):
+    emitted: list[tuple] = []
+    monkeypatch.setattr("agent.workflow_runtime.emit_dossier_progress",
+                        lambda *a: emitted.append(a))
+    config = DossierConfig(
+        section_chars=100, dossier_summary_chars=1000,
+        sections=[DossierSectionConfig(id="q", tool="query_quote",
+                                       args={"codes": ["${input.code}"]}, empty_policy="gap_if_empty")],
+    )
+    sections, missing = await collect_dossier_sections("600519", config)
+    assert emitted and emitted[0][0] == "q"
+    assert sections[0].status == "completed"
 
+
+def test_build_stage_messages_budgets_the_final_serialized_prompt() -> None:
     dossier = DossierResult(
         sections=[DossierSection(
             id="quote",
@@ -287,7 +306,8 @@ def test_build_stage_messages_budgets_the_final_serialized_prompt() -> None:
         missing=["财务"],
         has_substantive_data=True,
     )
-    stages = {"bull": StageResult(id="bull", status="completed", content="多方阶段内容")}
+    stages = {"bull": _stage("bull", message_id="m1")}
+    stage_messages = [AIMessage(id="m1", content="多方阶段内容")]
     base_stage = StageConfig(
         id="bear",
         label="空方研究员",
@@ -305,6 +325,7 @@ def test_build_stage_messages_budgets_the_final_serialized_prompt() -> None:
         dossier=dossier,
         stages=stages,
         preceding_stage_ids=["bull"],
+        messages=stage_messages,
     )
     fixed_chars = sum(len(str(message.content)) for message in base_messages)
     budgeted_stage = base_stage.model_copy(update={
@@ -320,6 +341,7 @@ def test_build_stage_messages_budgets_the_final_serialized_prompt() -> None:
         dossier=dossier,
         stages=stages,
         preceding_stage_ids=["bull"],
+        messages=stage_messages,
     )
 
     serialized = "".join(str(message.content) for message in messages)
@@ -329,8 +351,6 @@ def test_build_stage_messages_budgets_the_final_serialized_prompt() -> None:
 
 
 def test_build_stage_messages_fails_when_fixed_prompt_exceeds_budget() -> None:
-    from agent.workflow_loader import StageConfig
-
     stage = StageConfig(
         id="bull",
         label="多方研究员",
@@ -353,8 +373,6 @@ def test_build_stage_messages_fails_when_fixed_prompt_exceeds_budget() -> None:
 
 
 def test_build_stage_messages_only_loads_declared_context() -> None:
-    from agent.workflow_loader import StageConfig
-
     dossier = DossierResult(
         sections=[DossierSection(
             id="quote",
@@ -386,10 +404,14 @@ def test_build_stage_messages_only_loads_declared_context() -> None:
         user_text="请分析 600519",
         dossier=dossier,
         stages={
-            "bull": StageResult(id="bull", status="completed", content="允许的多方阶段"),
-            "other": StageResult(id="other", status="completed", content="不应出现的其他阶段"),
+            "bull": _stage("bull", message_id="m1"),
+            "other": _stage("other", message_id="m2"),
         },
         preceding_stage_ids=["bull", "other"],
+        messages=[
+            AIMessage(id="m1", content="允许的多方阶段"),
+            AIMessage(id="m2", content="不应出现的其他阶段"),
+        ],
     )
 
     serialized = "".join(str(message.content) for message in messages)
@@ -399,8 +421,6 @@ def test_build_stage_messages_only_loads_declared_context() -> None:
 
 
 def test_build_stage_messages_uses_bounded_omission_marker() -> None:
-    from agent.workflow_loader import StageConfig
-
     dossier = DossierResult(
         sections=[DossierSection(
             id="quote",
@@ -415,7 +435,8 @@ def test_build_stage_messages_uses_bounded_omission_marker() -> None:
         missing=[],
         has_substantive_data=True,
     )
-    stages = {"bull": StageResult(id="bull", status="completed", content="多方阶段内容")}
+    stages = {"bull": _stage("bull", message_id="m1")}
+    stage_messages = [AIMessage(id="m1", content="多方阶段内容")]
     base_stage = StageConfig(
         id="bear",
         label="空方研究员",
@@ -433,6 +454,7 @@ def test_build_stage_messages_uses_bounded_omission_marker() -> None:
         dossier=dossier,
         stages=stages,
         preceding_stage_ids=["bull"],
+        messages=stage_messages,
     )
     fixed_chars = sum(len(str(message.content)) for message in base_messages)
     stage_block = "\n\n【前序阶段 bull】\n多方阶段内容"
@@ -449,6 +471,7 @@ def test_build_stage_messages_uses_bounded_omission_marker() -> None:
         dossier=dossier,
         stages=stages,
         preceding_stage_ids=["bull"],
+        messages=stage_messages,
     )
 
     serialized = "".join(str(message.content) for message in messages)
@@ -459,8 +482,6 @@ def test_build_stage_messages_uses_bounded_omission_marker() -> None:
 
 
 def test_build_stage_messages_fails_if_full_omission_id_cannot_fit() -> None:
-    from agent.workflow_loader import StageConfig
-
     dossier = DossierResult(
         sections=[DossierSection(
             id="unique-context-id",
