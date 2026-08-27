@@ -18,10 +18,11 @@ from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessageChunk, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 
 from agent.policy import fixed_system_policy
 from agent.tool_executor import execute_tool, tool_policy
-from agent.workflow_events import WorkflowEventEmitter, utc_now
+from agent.workflow_events import utc_now
 from agent.workflow_loader import DossierConfig, DossierSectionConfig, StageConfig
 from agent.workflow_state import (
     DossierResult,
@@ -29,7 +30,6 @@ from agent.workflow_state import (
     StageResult,
     WorkflowError,
     WorkflowStatus,
-    coerce_stage_map,
     format_stage_context,
     stage_unproduced_sentinel,
 )
@@ -289,7 +289,6 @@ def serialize_stage_context(
     max_chars: int = 24000,
 ) -> tuple[str, bool]:
     """序列化前序各阶段的输出为上下文文本。"""
-    stages = coerce_stage_map(stages)
     blocks = []
     for sid in stage_ids:
         st = stages.get(sid)
@@ -425,17 +424,23 @@ async def run_stage(
     model: BaseChatModel,
     messages: list[BaseMessage | dict[str, Any]],
     max_chars: int = 1200,
-    emitter: WorkflowEventEmitter | None = None,
     stage_id: str = "",
-) -> tuple[str, bool]:
-    """流式执行单个阶段模型推理并向 emitter 发送增量事件（硬上限控制与连接生命周期管理）。"""
+    config: RunnableConfig | None = None,
+) -> tuple[str, bool, str | None]:
+    """流式执行单个阶段模型推理（硬上限控制与连接生命周期管理）。
+
+    必须传入节点 config：token 增量才能进入 LangGraph 的 messages 通道，由
+    useStream 原生消费（打字机 + 权威归并）。捕获流式消息 id（常规路径下由
+    BaseChatModel 自动生成的 lc-run id），供完成后写权威 AIMessage 时对齐同一
+    id——增量与终态按 id 无缝合并。返回 (正文, 是否截断, 流式消息 id)。
+    """
     max_chars = max(0, max_chars)
     captured = ""
-    emitted_len = 0
     truncated = False
+    message_id: str | None = None
     suffix = _TRUNCATION_MARKER
 
-    stream = model.astream(messages)
+    stream = model.astream(messages, config=config) if config is not None else model.astream(messages)
     try:
         async for chunk in stream:
             piece = (
@@ -445,23 +450,14 @@ async def run_stage(
             )
             if not piece:
                 continue
-
+            if message_id is None and isinstance(chunk, BaseMessage) and chunk.id:
+                message_id = chunk.id
             remaining_probe = max_chars + 1 - len(captured)
             if remaining_probe > 0:
                 captured += piece[:remaining_probe]
             if len(captured) > max_chars:
                 truncated = True
                 break
-
-            # 暂留截断标记等长的尾部；若后续越界，已发 delta 仍与终态前缀一致。
-            safe_end = max(0, len(captured) - len(suffix))
-            if emitter and stage_id and safe_end > emitted_len:
-                await emitter.emit(
-                    "stage.delta",
-                    stage_id=stage_id,
-                    delta=captured[emitted_len:safe_end],
-                )
-                emitted_len = safe_end
     finally:
         if hasattr(stream, "aclose"):
             try:
@@ -475,15 +471,7 @@ async def run_stage(
         full_output = captured[:body_chars] + marker
     else:
         full_output = captured
-
-    if emitter and stage_id and len(full_output) > emitted_len:
-        await emitter.emit(
-            "stage.delta",
-            stage_id=stage_id,
-            delta=full_output[emitted_len:],
-        )
-
-    return full_output, truncated
+    return full_output, truncated, message_id
 
 
 def finalize_workflow(

@@ -13,16 +13,16 @@ from __future__ import annotations
 
 import asyncio
 import pytest
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.runnables import RunnableConfig
 
 import tools as legacy_tools
-from agent.workflow_events import WorkflowEventEmitter
 from agent.workflow_loader import DossierConfig, DossierSectionConfig
 from agent.workflow_runtime import (
     WorkflowContextOverflow,
     build_stage_messages,
     collect_dossier_sections,
-    format_stage_context,
     is_payload_empty,
     redact_workflow_error,
     run_stage,
@@ -155,7 +155,7 @@ async def test_run_stage_streaming_and_truncation():
     chunks = [AIMessageChunk(content="chunk1 "), AIMessageChunk(content="chunk2 " * 200)]
     model = ScriptedChatModel([AIMessage(content="".join(c.content for c in chunks))])
 
-    content, truncated = await run_stage(
+    content, truncated, message_id = await run_stage(
         model=model,
         messages=[{"role": "user", "content": "hello"}],
         max_chars=50,
@@ -163,6 +163,7 @@ async def test_run_stage_streaming_and_truncation():
     )
     assert len(content) <= 50
     assert truncated is True
+    assert message_id  # BaseChatModel 常规路径必有自动 lc-run id
 
 
 @pytest.mark.asyncio
@@ -170,7 +171,7 @@ async def test_run_stage_does_not_truncate_output_within_limit():
     expected = "客观分析" * 10
     model = ScriptedChatModel([AIMessage(content=expected)])
 
-    content, truncated = await run_stage(
+    content, truncated, message_id = await run_stage(
         model=model,
         messages=[{"role": "user", "content": "hello"}],
         max_chars=len(expected),
@@ -179,13 +180,14 @@ async def test_run_stage_does_not_truncate_output_within_limit():
 
     assert content == expected
     assert truncated is False
+    assert message_id
 
 
 @pytest.mark.asyncio
 async def test_run_stage_small_limit_still_respects_hard_cap():
     model = ScriptedChatModel([AIMessage(content="0123456789")])
 
-    content, truncated = await run_stage(
+    content, truncated, _ = await run_stage(
         model=model,
         messages=[{"role": "user", "content": "hello"}],
         max_chars=5,
@@ -231,8 +233,11 @@ async def test_run_stage_extracts_text_blocks_and_skips_reasoning():
         {"type": "text", "text": "客观结论", "index": 1},
     ])])
 
-    content, truncated = await run_stage(
-        model=model,
+    content, truncated, _ = await run_stage(
+        model=ScriptedChatModel([AIMessage(content=[
+            {"type": "reasoning", "reasoning": "先思考一下", "index": 0},
+            {"type": "text", "text": "客观结论", "index": 1},
+        ])]),
         messages=[{"role": "user", "content": "hello"}],
         max_chars=100,
         stage_id="bull",
@@ -254,7 +259,7 @@ async def test_run_stage_joins_text_blocks_across_chunks():
 
             return chunks()
 
-    content, truncated = await run_stage(
+    content, truncated, _ = await run_stage(
         model=BlockModel(),  # type: ignore[arg-type]
         messages=[{"role": "user", "content": "hello"}],
         max_chars=100,
@@ -504,3 +509,53 @@ def test_build_stage_messages_fails_if_full_omission_id_cannot_fit() -> None:
             stages={},
             preceding_stage_ids=[],
         )
+
+
+class RawStreamModel(BaseChatModel):
+    """直覆 astream：绕过 BaseChatModel 的流式包装（chunk 不带自动 id）。
+
+    不继承 ScriptedChatModel（其 replies: deque[AIMessage] 会校验元素类型——传
+    字符串 reply 构造即抛 AttributeError）；自定义状态必须声明为字段，给
+    Pydantic 模型实例赋未声明属性同样会抛错（均已探针核实）。
+    """
+    chunks: list
+    captured_config: RunnableConfig | None = None
+
+    @property
+    def _llm_type(self) -> str:
+        return "raw-stream-test"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        from langchain_core.outputs import ChatGeneration, ChatResult
+        last = self.chunks[-1] if self.chunks else AIMessageChunk(content="")
+        return ChatResult(generations=[ChatGeneration(message=last)])
+
+    async def astream(self, messages, config=None, **kwargs):
+        self.captured_config = config
+        for chunk in self.chunks:
+            yield chunk
+
+
+@pytest.mark.asyncio
+async def test_run_stage_propagates_config_and_captures_stream_id():
+    model = RawStreamModel(chunks=[
+        AIMessageChunk(content="多", id="stream-1"),
+        AIMessageChunk(content="方", id="stream-1"),
+    ])
+    cfg = RunnableConfig(tags=["node:run_bull"])
+    content, truncated, message_id = await run_stage(
+        model, [HumanMessage(content="hi")], max_chars=100, stage_id="bull", config=cfg,
+    )
+    assert content == "多方"
+    assert truncated is False
+    assert message_id == "stream-1"
+    assert model.captured_config is cfg
+
+
+@pytest.mark.asyncio
+async def test_run_stage_reports_none_id_when_stream_has_none():
+    """无 id 流（防御路径）：返回 None，由 builder 用 fallback id。"""
+    model = RawStreamModel(chunks=[AIMessageChunk(content="正文")])
+    content, _, message_id = await run_stage(model, [], max_chars=100)
+    assert content == "正文"
+    assert message_id is None
