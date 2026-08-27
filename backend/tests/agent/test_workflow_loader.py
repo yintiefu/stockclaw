@@ -665,3 +665,11 @@ def test_staged_input_pattern_is_compiled_at_load_time() -> None:
 
     with pytest.raises(WorkflowConfigError, match="input.code.pattern"):
         validate_workflow_config(doc, workflow_id="bad_pattern")
+
+
+def test_workflow_loader_does_not_import_private_skill_helpers() -> None:
+    import agent.workflow_loader as workflow_loader
+
+    source = Path(workflow_loader.__file__).read_text(encoding="utf-8")
+    assert "_parse_skill_metadata" not in source
+    assert "_validate_skill_name" not in source

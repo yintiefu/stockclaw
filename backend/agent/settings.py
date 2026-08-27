@@ -80,6 +80,19 @@ def agent_settings_path() -> Path:
     return Path(override).expanduser() if override else Path.home() / ".vibe-research" / "agent" / "settings.json"
 
 
+def resolve_skills_path(value: Path, *, create: bool) -> Path:
+    """解析并校验 Agent Skills 根目录：拒绝文件系统根，缺失时按需以 0700 创建。"""
+    resolved = value.expanduser().resolve()
+    if resolved.parent == resolved:
+        raise AgentSettingsError("Agent Skills 路径不能是文件系统根")
+    if create and not resolved.exists():
+        resolved.mkdir(parents=True, mode=0o700)
+        resolved.chmod(0o700)
+    if not resolved.is_dir() or not os.access(resolved, os.R_OK | os.W_OK):
+        raise AgentSettingsError("Agent Skills 目录不存在、不可读写或不是目录")
+    return resolved
+
+
 def load_agent_settings(path: Path | None = None) -> AgentSettings:
     resolved = (path or agent_settings_path()).expanduser().resolve()
     try:
@@ -95,10 +108,7 @@ def load_agent_settings(path: Path | None = None) -> AgentSettings:
     except ValidationError as exc:
         locations = [".".join(str(part) for part in error["loc"]) for error in exc.errors(include_input=False)]
         raise AgentSettingsError(f"Agent 配置字段无效：{resolved}（{', '.join(locations)}）") from exc
-    skill_root = settings.skills.path.expanduser().resolve()
-    if not skill_root.is_dir() or not os.access(skill_root, os.R_OK):
-        raise AgentSettingsError(f"Agent Skills 目录不存在、不可读或不是目录：{skill_root}")
-    settings.skills.path = skill_root
+    settings.skills.path = resolve_skills_path(settings.skills.path, create=True)
     settings.trace.dir = settings.trace.dir.expanduser().resolve()
     try:
         if resolved.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):

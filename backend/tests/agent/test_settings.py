@@ -59,10 +59,19 @@ def test_missing_settings_file_reports_path(tmp_path, monkeypatch):
         load_agent_settings()
 
 
-def test_missing_skills_directory_is_rejected(tmp_path, monkeypatch):
-    path = write_settings(tmp_path, skills=tmp_path / "no-such-skills")
+def test_load_settings_creates_missing_skill_root_with_0700(tmp_path, monkeypatch):
+    root = tmp_path / "new" / "skills"
+    path = write_settings(tmp_path, skills=root)
     monkeypatch.setenv("VR_AGENT_SETTINGS", str(path))
-    with pytest.raises(AgentSettingsError, match="Skills 目录"):
+    loaded = load_agent_settings()
+    assert loaded.skills.path == root.resolve()
+    assert root.stat().st_mode & 0o777 == 0o700
+
+
+def test_load_settings_rejects_filesystem_root(tmp_path, monkeypatch):
+    path = write_settings(tmp_path, skills=Path(tmp_path.anchor))
+    monkeypatch.setenv("VR_AGENT_SETTINGS", str(path))
+    with pytest.raises(AgentSettingsError, match="文件系统根"):
         load_agent_settings()
 
 
