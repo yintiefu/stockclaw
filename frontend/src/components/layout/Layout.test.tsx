@@ -147,3 +147,38 @@ describe("Layout 导航选中态", () => {
     expect(screen.getByRole("link", { name: "产业信号" })).not.toHaveClass("bg-primary/15");
   });
 });
+
+describe("Layout 技能管理导航", () => {
+  function renderAt(path: string) {
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route element={<Layout />}>
+            <Route path="*" element={<div />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  function navLinks() {
+    return Array.from(screen.getByRole("navigation").querySelectorAll(":scope > a, :scope > div > a"));
+  }
+
+  it("/skills 子路由高亮技能管理且不串扰其他一级菜单", () => {
+    renderAt("/skills/user/sample");
+    const skills = screen.getByRole("link", { name: "技能管理" });
+    expect(skills).toHaveClass("bg-primary/15");
+    expect(screen.getByRole("link", { name: "α-mind" })).not.toHaveClass("bg-primary/15");
+    expect(screen.getByRole("link", { name: "设置" })).not.toHaveClass("bg-primary/15");
+  });
+
+  it("技能管理入口在 DOM 顺序上紧跟 α-mind", () => {
+    renderAt("/skills");
+    const links = navLinks().map((node) => node.textContent);
+    const alphaIndex = links.findIndex((text) => text?.includes("α-mind"));
+    const skillsIndex = links.findIndex((text) => text?.includes("技能管理"));
+    expect(alphaIndex).toBeGreaterThanOrEqual(0);
+    expect(skillsIndex).toBe(alphaIndex + 1);
+  });
+});

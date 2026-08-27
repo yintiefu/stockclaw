@@ -13,6 +13,8 @@ import { MyReports } from "@/pages/MyReports";
 import { Notes } from "@/pages/Notes";
 import { Settings } from "@/pages/Settings";
 import { Agent } from "@/pages/Agent";
+import { Skills } from "@/pages/Skills";
+import { SkillDetail } from "@/pages/SkillDetail";
 
 export const router = createBrowserRouter([
   {
@@ -34,6 +36,8 @@ export const router = createBrowserRouter([
       { path: "/notes", element: <Notes /> },
       { path: "/settings", element: <Settings /> },
       { path: "/agent", element: <Agent /> },
+      { path: "/skills", element: <Skills /> },
+      { path: "/skills/:source/:name", element: <SkillDetail /> },
     ],
   },
 ]);

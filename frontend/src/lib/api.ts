@@ -56,7 +56,7 @@ export async function downloadReport(id: string, name: string): Promise<void> {
   URL.revokeObjectURL(url);
 }
 
-async function request<T>(path: string, method: "GET" | "POST" | "DELETE" = "GET", body?: unknown): Promise<T> {
+async function request<T>(path: string, method: "GET" | "POST" | "PATCH" | "DELETE" = "GET", body?: unknown): Promise<T> {
   let resp: Response;
   const headers: Record<string, string> = { ...authHeaders() };
   const opts: RequestInit = { method };
@@ -298,6 +298,31 @@ export interface AgentStatusSummary {
   reason?: string;
 }
 
+// 技能管理：后端 /api/skills 的严格形状
+export type SkillSource = "builtin" | "user";
+export interface SkillSummary {
+  name: string;
+  description: string | null;
+  source: SkillSource;
+  enabled: boolean;
+  valid: boolean;
+  effective: boolean;
+  error: string | null;
+}
+export interface SkillDetail extends SkillSummary {
+  path: string;
+  instructions: string | null;
+}
+export interface SkillsResponse {
+  builtin: SkillSummary[];
+  user: SkillSummary[];
+  user_available: boolean;
+  user_error?: string;
+}
+export type SkillImportPayload =
+  | { kind: "folder"; files: Array<{ path: string; content_b64: string }> }
+  | { kind: "zip"; filename: string; content_b64: string };
+
 export const api = {
   health: () => get<{ ok: boolean }>("/health"),
   agentStatus: () => get<AgentStatusSummary>("/agent/status"),
@@ -352,4 +377,13 @@ export const api = {
     ),
   deleteSector: (key: string, leaf: string, code: string) =>
     request<SectorStocksData>("/sectors/stocks/delete", "POST", { key, leaf, code, name: "" }),
+  skills: () => get<SkillsResponse>("/skills"),
+  skillDetail: (source: SkillSource, name: string) =>
+    get<SkillDetail>(`/skills/${source}/${encodeURIComponent(name)}`),
+  importSkill: (payload: SkillImportPayload) =>
+    request<SkillDetail>("/skills/import", "POST", payload),
+  setSkillEnabled: (name: string, enabled: boolean) =>
+    request<SkillDetail>(`/skills/user/${encodeURIComponent(name)}`, "PATCH", { enabled }),
+  deleteSkill: (name: string) =>
+    request<{ ok: boolean }>(`/skills/user/${encodeURIComponent(name)}`, "DELETE"),
 };
