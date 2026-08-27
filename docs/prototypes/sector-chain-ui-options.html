@@ -1,0 +1,805 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="data:," />
+  <title>产业链 UI 交互方案</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #080d17;
+      --surface: #0e1521;
+      --surface-2: #141d2b;
+      --surface-3: #192435;
+      --line: #28364a;
+      --line-soft: #1d2a3b;
+      --text: #edf2f8;
+      --muted: #9aa8ba;
+      --quiet: #6f8096;
+      --orange: #f06a3c;
+      --orange-soft: #3a211d;
+      --blue: #5f9eea;
+      --blue-soft: #14283f;
+      --green: #58b79a;
+      --red: #ef6b70;
+      --radius: 8px;
+      --shadow: 0 20px 60px rgb(0 0 0 / 0.34);
+      font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { min-width: 320px; background: var(--bg); }
+    body { margin: 0; min-height: 100vh; color: var(--text); background: var(--bg); }
+    button, input { font: inherit; }
+    button { color: inherit; }
+    button, [role="button"] { touch-action: manipulation; }
+    button:focus-visible, input:focus-visible {
+      outline: 2px solid #83baff;
+      outline-offset: 2px;
+    }
+
+    .app { min-height: 100vh; }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 30;
+      display: flex;
+      align-items: center;
+      min-height: 64px;
+      padding: 10px clamp(16px, 3vw, 40px);
+      border-bottom: 1px solid var(--line-soft);
+      background: rgb(8 13 23 / 0.94);
+      backdrop-filter: blur(16px);
+    }
+    .brand { display: flex; align-items: center; gap: 10px; min-width: 190px; }
+    .brand-mark {
+      display: grid;
+      width: 28px;
+      height: 28px;
+      place-items: center;
+      border: 1px solid #653326;
+      border-radius: 6px;
+      color: var(--orange);
+      background: var(--orange-soft);
+      font: 700 17px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .brand strong { font-size: 15px; letter-spacing: 0; }
+    .brand span { display: block; margin-top: 2px; color: var(--quiet); font-size: 11px; }
+
+    .option-tabs {
+      display: flex;
+      flex: 1;
+      justify-content: center;
+      gap: 4px;
+    }
+    .option-tab {
+      min-height: 42px;
+      padding: 7px 14px;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      color: var(--muted);
+      background: transparent;
+      cursor: pointer;
+      transition: background 180ms ease, color 180ms ease, border-color 180ms ease;
+    }
+    .option-tab span { display: block; color: var(--quiet); font-size: 10px; line-height: 1.2; }
+    .option-tab:hover { background: var(--surface-2); color: var(--text); }
+    .option-tab[aria-selected="true"] {
+      border-color: #72402f;
+      color: #fff5ef;
+      background: var(--orange-soft);
+    }
+    .option-tab[aria-selected="true"] span { color: #e6a088; }
+    .recommend-mark {
+      margin-left: 7px;
+      padding: 2px 5px;
+      border-radius: 4px;
+      color: #ffd7c9;
+      background: #6c2d1b;
+      font-size: 10px;
+      font-weight: 700;
+    }
+
+    .shell { width: min(1440px, 100%); margin: 0 auto; padding: 24px clamp(16px, 3vw, 40px) 48px; }
+    .page-head {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 20px;
+    }
+    .breadcrumb { margin: 0 0 8px; color: var(--quiet); font-size: 12px; }
+    h1 { margin: 0; font-size: clamp(24px, 3vw, 36px); line-height: 1.15; letter-spacing: 0; }
+    .subtitle { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
+    .head-meta { display: flex; align-items: center; gap: 10px; color: var(--quiet); font-size: 12px; }
+    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgb(88 183 154 / 0.1); }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 56px;
+      margin-bottom: 14px;
+      padding: 8px;
+      border: 1px solid var(--line-soft);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+    .search { position: relative; flex: 1; min-width: 180px; }
+    .search::before {
+      content: "⌕";
+      position: absolute;
+      top: 50%;
+      left: 13px;
+      color: var(--quiet);
+      font: 20px/1 ui-monospace, monospace;
+      transform: translateY(-52%);
+      pointer-events: none;
+    }
+    .search input {
+      width: 100%;
+      min-height: 40px;
+      padding: 8px 12px 8px 38px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--text);
+      background: #0a111d;
+    }
+    .search input::placeholder { color: var(--quiet); }
+    .segments { display: flex; gap: 3px; padding: 3px; border-radius: 6px; background: #0a111d; }
+    .segment {
+      min-height: 34px;
+      padding: 6px 12px;
+      border: 0;
+      border-radius: 4px;
+      color: var(--muted);
+      background: transparent;
+      cursor: pointer;
+    }
+    .segment[aria-pressed="true"] { color: var(--text); background: var(--surface-3); }
+    .icon-button {
+      display: inline-grid;
+      width: 40px;
+      height: 40px;
+      flex: 0 0 40px;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--muted);
+      background: transparent;
+      cursor: pointer;
+    }
+    .icon-button:hover { color: var(--text); background: var(--surface-2); }
+
+    .view { display: none; }
+    .view.active { display: block; animation: view-in 220ms ease-out; }
+    @keyframes view-in { from { opacity: 0; transform: translateY(4px); } }
+
+    /* A · 链路总览 */
+    .map-workspace {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 390px;
+      min-height: 620px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    .chain-map { min-width: 0; padding: 20px; overflow: auto; }
+    .flow {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      min-width: 0;
+    }
+    .stage {
+      min-width: 0;
+      padding: 16px;
+      border: 1px solid var(--line-soft);
+      border-radius: 7px;
+      background: #0d1623;
+    }
+    .stage-head { display: flex; align-items: center; gap: 10px; min-height: 42px; margin-bottom: 12px; }
+    .stage-no {
+      display: grid;
+      width: 26px;
+      height: 26px;
+      place-items: center;
+      border-radius: 50%;
+      color: #c7d7eb;
+      background: var(--surface-3);
+      font: 700 11px/1 ui-monospace, monospace;
+    }
+    .stage:first-child .stage-no { color: #ffd6c7; background: #55291e; }
+    .stage h2 { margin: 0; font-size: 15px; }
+    .stage h2 span { display: block; margin-top: 2px; color: var(--quiet); font-size: 11px; font-weight: 400; }
+    .connector { position: relative; height: 42px; }
+    .connector::before { content: ""; position: absolute; top: 5px; bottom: 5px; left: 50%; width: 1px; background: #40536d; }
+    .connector::after {
+      content: "";
+      position: absolute;
+      right: calc(50% - 4px);
+      bottom: 6px;
+      width: 7px;
+      height: 7px;
+      border-top: 1px solid #6e87a7;
+      border-right: 1px solid #6e87a7;
+      transform: rotate(135deg);
+    }
+    .node-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+    .stage.compact .node-grid { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+    .node {
+      position: relative;
+      min-height: 70px;
+      padding: 12px;
+      border: 1px solid var(--line-soft);
+      border-radius: 7px;
+      color: var(--text);
+      text-align: left;
+      background: #111a28;
+      cursor: pointer;
+      transition: background 160ms ease, border-color 160ms ease;
+    }
+    .node:hover { border-color: #425775; background: #152132; }
+    .node.selected { border-color: var(--orange); background: #261a1a; box-shadow: inset 3px 0 0 var(--orange); }
+    .node.hidden-by-filter { display: none; }
+    .node-title { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; font-weight: 700; }
+    .node-count { color: var(--quiet); font: 600 11px/1.4 ui-monospace, monospace; }
+    .node.selected .node-count { color: #ef9f82; }
+    .node-desc { display: block; max-width: 100%; margin-top: 5px; color: var(--quiet); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .detail-panel { border-left: 1px solid var(--line); background: #0a111c; }
+    .detail-inner { position: sticky; top: 65px; }
+    .detail-head { padding: 20px; border-bottom: 1px solid var(--line-soft); }
+    .eyebrow { color: var(--orange); font: 700 10px/1.4 ui-monospace, monospace; text-transform: uppercase; }
+    .detail-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-top: 6px; }
+    .detail-title-row h3 { margin: 0; font-size: 20px; }
+    .detail-desc { margin: 7px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+    .leaf-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
+    .leaf-chip {
+      min-height: 32px;
+      padding: 6px 9px;
+      border: 1px solid #315273;
+      border-radius: 5px;
+      color: #a9c8eb;
+      background: var(--blue-soft);
+      cursor: pointer;
+    }
+    .leaf-chip.active { border-color: var(--blue); color: #eef7ff; background: #1c3b5e; }
+    .stock-tabs { display: flex; border-bottom: 1px solid var(--line-soft); padding: 0 16px; }
+    .stock-tab {
+      min-height: 44px;
+      padding: 0 10px;
+      border: 0;
+      border-bottom: 2px solid transparent;
+      color: var(--quiet);
+      background: transparent;
+      cursor: pointer;
+    }
+    .stock-tab.active { border-color: var(--orange); color: var(--text); }
+    .stock-list { margin: 0; padding: 10px 16px; list-style: none; }
+    .stock-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; min-height: 54px; border-bottom: 1px solid var(--line-soft); }
+    .stock-name { display: block; font-size: 13px; font-weight: 600; }
+    .stock-code { color: var(--quiet); font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .text-button { min-height: 36px; padding: 6px 8px; border: 0; border-radius: 5px; color: var(--muted); background: transparent; cursor: pointer; }
+    .text-button:hover { color: var(--text); background: var(--surface-2); }
+    .add-relation {
+      display: flex;
+      width: calc(100% - 32px);
+      min-height: 42px;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      margin: 8px 16px 18px;
+      border: 1px dashed #72402f;
+      border-radius: 6px;
+      color: #f0a286;
+      background: transparent;
+      cursor: pointer;
+    }
+    .empty { padding: 24px 8px; color: var(--quiet); text-align: center; font-size: 12px; }
+
+    /* B · 分层目录 */
+    .directory-workspace {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      min-height: 620px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    .tree { padding: 12px; border-right: 1px solid var(--line); background: #0a111c; }
+    .tree-group { margin-bottom: 14px; }
+    .tree-label { padding: 8px 10px; color: var(--quiet); font-size: 11px; font-weight: 700; }
+    .tree-item {
+      display: flex;
+      width: 100%;
+      min-height: 42px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 10px;
+      border: 0;
+      border-radius: 5px;
+      color: var(--muted);
+      text-align: left;
+      background: transparent;
+      cursor: pointer;
+    }
+    .tree-item:hover { color: var(--text); background: var(--surface-2); }
+    .tree-item.selected { color: #fff3ee; background: var(--orange-soft); }
+    .tree-item small { color: var(--quiet); font: 10px ui-monospace, monospace; }
+    .table-area { min-width: 0; padding: 18px; overflow: auto; }
+    .table-head { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
+    .table-head h2 { margin: 0; font-size: 20px; }
+    .table-head p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
+    .secondary-button {
+      min-height: 40px;
+      padding: 7px 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--text);
+      background: var(--surface-2);
+      cursor: pointer;
+    }
+    .data-table { width: 100%; min-width: 650px; border-collapse: collapse; }
+    .data-table th { height: 42px; padding: 0 12px; border-bottom: 1px solid var(--line); color: var(--quiet); text-align: left; font-size: 11px; font-weight: 600; }
+    .data-table td { height: 54px; padding: 8px 12px; border-bottom: 1px solid var(--line-soft); font-size: 13px; }
+    .data-table tr:hover td { background: #111b29; }
+    .type-badge { padding: 3px 6px; border-radius: 4px; color: #aac9ec; background: var(--blue-soft); font-size: 10px; }
+    .type-badge.mine { color: #ffd2c2; background: var(--orange-soft); }
+    .row-actions { display: flex; justify-content: flex-end; }
+
+    /* C · 聚焦浏览 */
+    .focus-workspace {
+      min-height: 620px;
+      padding: clamp(16px, 4vw, 44px);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    .stepper { display: grid; grid-template-columns: repeat(3, 1fr); max-width: 720px; margin: 0 auto 36px; }
+    .step {
+      position: relative;
+      min-height: 52px;
+      padding: 0 12px;
+      border: 0;
+      color: var(--quiet);
+      text-align: center;
+      background: transparent;
+      cursor: pointer;
+    }
+    .step::before { content: ""; position: absolute; top: 14px; left: 0; right: 0; height: 1px; background: var(--line); }
+    .step:first-child::before { left: 50%; }
+    .step:last-child::before { right: 50%; }
+    .step-dot { position: relative; display: grid; width: 28px; height: 28px; margin: 0 auto 6px; place-items: center; border: 1px solid var(--line); border-radius: 50%; background: var(--surface); font: 700 10px ui-monospace, monospace; }
+    .step.active { color: var(--text); }
+    .step.active .step-dot { border-color: var(--orange); color: #ffd5c5; background: var(--orange-soft); }
+    .focus-head { max-width: 900px; margin: 0 auto 18px; }
+    .focus-head h2 { margin: 0; font-size: 22px; }
+    .focus-head p { margin: 7px 0 0; color: var(--muted); font-size: 13px; }
+    .focus-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); max-width: 900px; margin: auto; gap: 10px; }
+    .focus-card {
+      min-height: 118px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      color: var(--text);
+      text-align: left;
+      background: #111a28;
+      cursor: pointer;
+      transition: border-color 160ms ease, background 160ms ease;
+    }
+    .focus-card:hover { border-color: #527096; background: #162234; }
+    .focus-card strong { display: block; font-size: 15px; }
+    .focus-card span { display: block; margin-top: 7px; color: var(--quiet); font-size: 11px; line-height: 1.5; }
+    .focus-card em { display: block; margin-top: 14px; color: #93b8e3; font-size: 11px; font-style: normal; }
+    .focus-back { display: none; min-height: 40px; margin: 0 auto 14px; border: 0; color: var(--muted); background: transparent; cursor: pointer; }
+    .focus-back.visible { display: block; }
+
+    .note {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      margin-top: 14px;
+      color: var(--quiet);
+      font-size: 11px;
+      line-height: 1.6;
+    }
+    .note strong { color: var(--muted); }
+
+    dialog {
+      width: min(480px, calc(100vw - 32px));
+      padding: 0;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      color: var(--text);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    dialog::backdrop { background: rgb(0 0 0 / 0.62); backdrop-filter: blur(4px); }
+    .dialog-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 18px; border-bottom: 1px solid var(--line-soft); }
+    .dialog-head h2 { margin: 0; font-size: 16px; }
+    .dialog-form { display: grid; gap: 14px; padding: 18px; }
+    .field { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
+    .field input { min-height: 44px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 6px; color: var(--text); background: #0a111d; }
+    .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+    .primary-button { min-height: 40px; padding: 7px 14px; border: 1px solid #a84d2d; border-radius: 6px; color: #fff6f2; background: #9e4528; cursor: pointer; }
+    .primary-button:hover { background: #b95330; }
+    .toast {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      z-index: 60;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      max-width: min(380px, calc(100vw - 32px));
+      padding: 11px 12px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      color: var(--text);
+      background: #172131;
+      box-shadow: var(--shadow);
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(10px);
+      transition: opacity 180ms ease, transform 180ms ease;
+    }
+    .toast.show { opacity: 1; pointer-events: auto; transform: translateY(0); }
+    .toast button { min-height: 32px; border: 0; color: #ffab8d; background: transparent; cursor: pointer; }
+
+    @media (max-width: 980px) {
+      .topbar { align-items: flex-start; flex-wrap: wrap; }
+      .brand { flex: 1; }
+      .option-tabs { order: 2; width: 100%; overflow-x: auto; justify-content: flex-start; padding-top: 8px; }
+      .option-tab { flex: 0 0 auto; }
+      .map-workspace { grid-template-columns: 1fr; }
+      .detail-panel { border-top: 1px solid var(--line); border-left: 0; }
+      .detail-inner { position: static; }
+      .directory-workspace { grid-template-columns: 220px minmax(0, 1fr); }
+      .focus-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (min-width: 981px) and (max-width: 1200px) {
+      .node-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 680px) {
+      .shell { padding-top: 18px; }
+      .page-head { align-items: flex-start; flex-direction: column; gap: 10px; }
+      .head-meta { flex-wrap: wrap; }
+      .toolbar { align-items: stretch; flex-wrap: wrap; }
+      .search { flex-basis: 100%; }
+      .segments { flex: 1; overflow-x: auto; }
+      .segment { flex: 1; white-space: nowrap; }
+      .flow { grid-template-columns: 1fr; min-width: 0; }
+      .connector { height: 32px; }
+      .connector::before { top: 4px; bottom: 4px; left: 50%; right: auto; width: 1px; height: auto; }
+      .connector::after { top: auto; right: calc(50% - 4px); bottom: 5px; transform: rotate(135deg); }
+      .stage.compact .node-grid, .node-grid { grid-template-columns: 1fr; }
+      .directory-workspace { grid-template-columns: 1fr; }
+      .tree { display: flex; gap: 6px; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      .tree-group { display: contents; }
+      .tree-label { display: none; }
+      .tree-item { width: auto; min-width: max-content; }
+      .table-head { align-items: flex-start; flex-direction: column; }
+      .focus-grid { grid-template-columns: 1fr; }
+      .focus-workspace { min-height: 0; }
+      .step { padding: 0 4px; font-size: 11px; }
+      .note { flex-direction: column; gap: 4px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">⌁</div>
+        <div><strong>产业链交互提案</strong><span>Vibe-Research · 独立原型</span></div>
+      </div>
+      <nav class="option-tabs" role="tablist" aria-label="UI 方案">
+        <button class="option-tab" role="tab" aria-selected="true" aria-controls="view-map" data-view="map">A · 链路总览 <b class="recommend-mark">采用</b><span>纵向链路 + 右侧详情</span></button>
+        <button class="option-tab" role="tab" aria-selected="false" aria-controls="view-directory" data-view="directory">B · 分层目录<span>高密度查找维护</span></button>
+        <button class="option-tab" role="tab" aria-selected="false" aria-controls="view-focus" data-view="focus">C · 聚焦浏览<span>逐层探索</span></button>
+      </nav>
+    </header>
+
+    <main class="shell">
+      <header class="page-head">
+        <div>
+          <p class="breadcrumb">板块中心 / 产业链</p>
+          <h1>人形机器人</h1>
+          <p class="subtitle">从减速器到灵巧手，AI 具身智能的物理载体</p>
+        </div>
+        <div class="head-meta"><i class="status-dot" aria-hidden="true"></i><span>本地数据已导入</span><span>更新于 08-13 19:44</span></div>
+      </header>
+
+      <div class="toolbar" aria-label="产业链筛选">
+        <label class="search"><span hidden>搜索环节或标的</span><input id="searchInput" type="search" placeholder="搜索环节或标的" autocomplete="off" /></label>
+        <div class="segments" aria-label="产业层级">
+          <button class="segment" aria-pressed="true" data-filter="all">全部</button>
+          <button class="segment" aria-pressed="false" data-filter="upstream">上游</button>
+          <button class="segment" aria-pressed="false" data-filter="midstream">中游</button>
+          <button class="segment" aria-pressed="false" data-filter="downstream">下游</button>
+        </div>
+        <button class="icon-button" title="清除筛选" aria-label="清除筛选" id="resetFilter">×</button>
+      </div>
+
+      <section id="view-map" class="view active" role="tabpanel">
+        <div class="map-workspace">
+          <div class="chain-map">
+            <div class="flow">
+              <section class="stage" data-tier="upstream">
+                <header class="stage-head"><span class="stage-no">01</span><h2>上游 · 核心零部件<span>动力、传动、感知与智能</span></h2></header>
+                <div class="node-grid" id="mapUpstream"></div>
+              </section>
+              <div class="connector" aria-hidden="true"></div>
+              <section class="stage compact" data-tier="midstream">
+                <header class="stage-head"><span class="stage-no">02</span><h2>中游 · 整机集成<span>系统集成与制造</span></h2></header>
+                <div class="node-grid" id="mapMidstream"></div>
+              </section>
+              <div class="connector" aria-hidden="true"></div>
+              <section class="stage compact" data-tier="downstream">
+                <header class="stage-head"><span class="stage-no">03</span><h2>下游 · 应用场景<span>落地领域</span></h2></header>
+                <div class="node-grid" id="mapDownstream"></div>
+              </section>
+            </div>
+          </div>
+          <aside class="detail-panel" aria-live="polite"><div class="detail-inner" id="mapDetail"></div></aside>
+        </div>
+        <div class="note"><span><strong>适合：</strong>默认详情页，先理解产业关系，再查看局部标的。</span><span>来源数据原序展示，非排名；不推荐个股。</span></div>
+      </section>
+
+      <section id="view-directory" class="view" role="tabpanel" hidden>
+        <div class="directory-workspace">
+          <nav class="tree" id="directoryTree" aria-label="产业环节目录"></nav>
+          <section class="table-area" id="directoryTable"></section>
+        </div>
+        <div class="note"><span><strong>适合：</strong>研究员高频搜索、批量扫视和维护关联标的。</span><span>目录固定，切换环节时列表位置稳定。</span></div>
+      </section>
+
+      <section id="view-focus" class="view" role="tabpanel" hidden>
+        <div class="focus-workspace">
+          <nav class="stepper" id="focusSteps" aria-label="产业层级"></nav>
+          <button class="focus-back" id="focusBack">← 返回当前层级</button>
+          <div id="focusContent"></div>
+        </div>
+        <div class="note"><span><strong>适合：</strong>初次了解产业链或在窄屏设备上逐层查看。</span><span>每次只呈现一个决策层，减少信息负担。</span></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="addDialog">
+    <div class="dialog-head"><h2>添加我的关联</h2><button class="icon-button" id="closeDialog" aria-label="关闭">×</button></div>
+    <form class="dialog-form" id="addForm">
+      <label class="field">代码<input id="stockCode" required placeholder="SH.688017" pattern="(SH|SZ|HK|US)\..+" /></label>
+      <label class="field">名称<input id="stockName" required placeholder="绿的谐波" /></label>
+      <div class="dialog-actions"><button type="button" class="secondary-button" id="cancelDialog">取消</button><button class="primary-button" type="submit">保存关联</button></div>
+    </form>
+  </dialog>
+  <div class="toast" id="toast" role="status" aria-live="polite"><span id="toastText"></span><button id="undoButton">撤销</button></div>
+
+  <script>
+    const tiers = [
+      {
+        id: "upstream", label: "上游 · 核心零部件", short: "上游", desc: "动力、传动、感知与智能",
+        nodes: [
+          { id: "reducer", name: "减速器", desc: "传动核心", leaves: ["谐波减速器", "RV 减速器", "行星减速器"] },
+          { id: "motor", name: "电机", desc: "动力执行", leaves: ["无框力矩电机", "空心杯伺服电机", "伺服驱动器"] },
+          { id: "leadscrew", name: "丝杠", desc: "直线传动", leaves: ["行星滚柱丝杠", "滚珠丝杠"] },
+          { id: "sensor", name: "传感器", desc: "感知层", leaves: ["力/扭矩传感器", "IMU 惯导", "激光雷达", "摄像头"] },
+          { id: "bearing", name: "轴承", desc: "旋转支撑", leaves: ["轴承"] },
+          { id: "encoder", name: "编码器", desc: "位置反馈", leaves: ["编码器"] },
+          { id: "chip", name: "芯片", desc: "算力、存储、模拟", leaves: ["AI 芯片", "存储芯片", "模拟半导体"] },
+          { id: "cognition", name: "大脑 · 算法与模型", desc: "智能层", leaves: ["大模型", "仿真软件", "视觉算法"] },
+          { id: "struct", name: "结构件", desc: "机身、能源与材料", leaves: ["机身结构件", "电池系统", "热管理", "线束与连接器", "人工肌腱/仿生皮肤"] },
+          { id: "dexterous", name: "灵巧手", desc: "末端执行", leaves: ["灵巧手"] }
+        ]
+      },
+      { id: "midstream", label: "中游 · 整机集成", short: "中游", desc: "系统集成与制造", nodes: [{ id: "integrator", name: "整机厂商", desc: "整机集成", leaves: ["车企系", "消费电子系", "专业厂商", "互联网/电商系"] }] },
+      { id: "downstream", label: "下游 · 应用场景", short: "下游", desc: "落地领域", nodes: [
+        { id: "industrial", name: "工业制造", desc: "装配、搬运与质检", leaves: ["工业制造"] },
+        { id: "commercial", name: "商业服务", desc: "导览与服务", leaves: ["商业服务"] },
+        { id: "home", name: "家庭陪伴", desc: "家庭环境应用", leaves: ["家庭陪伴"] },
+        { id: "special", name: "特种作业", desc: "复杂环境作业", leaves: ["特种作业"] }
+      ] }
+    ];
+
+    const stockSets = {
+      "谐波减速器": [
+        { name: "大族激光", code: "SZ.002008", type: "source" },
+        { name: "绿的谐波", code: "SH.688017", type: "source" },
+        { name: "科达利", code: "SZ.002850", type: "source" },
+        { name: "双环传动", code: "SZ.002472", type: "source" },
+        { name: "昊志机电", code: "SZ.300503", type: "mine" }
+      ],
+      "RV 减速器": [{ name: "双环传动", code: "SZ.002472", type: "source" }, { name: "中大力德", code: "SZ.002896", type: "source" }],
+      "无框力矩电机": [{ name: "鸣志电器", code: "SH.603728", type: "source" }, { name: "步科股份", code: "SH.688160", type: "source" }],
+      "力/扭矩传感器": [{ name: "柯力传感", code: "SH.603662", type: "source" }, { name: "安培龙", code: "SZ.301413", type: "mine" }],
+      "整机厂商": [{ name: "拓斯达", code: "SZ.300607", type: "source" }, { name: "埃斯顿", code: "SZ.002747", type: "source" }]
+    };
+
+    let activeView = "map";
+    let selectedNode = tiers[0].nodes[0];
+    let selectedLeaf = selectedNode.leaves[0];
+    let selectedTier = "all";
+    let stockTab = "source";
+    let focusTierIndex = 0;
+    let focusNode = null;
+    let pendingUndo = null;
+    let toastTimer = null;
+
+    const allNodes = tiers.flatMap(tier => tier.nodes.map(node => ({ ...node, tier: tier.id, tierLabel: tier.label })));
+    const esc = value => String(value).replace(/[&<>'"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[c]);
+    const stocksFor = leaf => stockSets[leaf] || [];
+    const countFor = node => node.leaves.reduce((total, leaf) => total + stocksFor(leaf).length, 0);
+
+    function nodeButton(node) {
+      return `<button class="node ${selectedNode.id === node.id ? "selected" : ""}" data-node="${node.id}" data-search="${esc((node.name + " " + node.desc + " " + node.leaves.join(" ")).toLowerCase())}">
+        <span class="node-title"><span>${esc(node.name)}</span><span class="node-count">${countFor(node) || "—"}</span></span>
+        <span class="node-desc">${esc(node.desc)} · ${esc(node.leaves.slice(0, 3).join(" / "))}</span>
+      </button>`;
+    }
+
+    function renderMap() {
+      document.getElementById("mapUpstream").innerHTML = tiers[0].nodes.map(nodeButton).join("");
+      document.getElementById("mapMidstream").innerHTML = tiers[1].nodes.map(nodeButton).join("");
+      document.getElementById("mapDownstream").innerHTML = tiers[2].nodes.map(nodeButton).join("");
+      document.querySelectorAll(".node").forEach(button => button.addEventListener("click", () => selectNode(button.dataset.node)));
+      renderMapDetail();
+      applyFilter();
+    }
+
+    function renderMapDetail() {
+      const tier = tiers.find(item => item.nodes.some(node => node.id === selectedNode.id));
+      const stocks = stocksFor(selectedLeaf).filter(stock => stockTab === "all" || stock.type === stockTab);
+      document.getElementById("mapDetail").innerHTML = `
+        <header class="detail-head">
+          <div class="eyebrow">${esc(tier.label)}</div>
+          <div class="detail-title-row"><h3>${esc(selectedNode.name)}</h3><span class="node-count">${countFor(selectedNode) || "未导入"}</span></div>
+          <p class="detail-desc">${esc(selectedNode.desc)}。选择细分环节查看本地导入的来源成分与个人关联。</p>
+          <div class="leaf-chips">${selectedNode.leaves.map(leaf => `<button class="leaf-chip ${leaf === selectedLeaf ? "active" : ""}" data-leaf="${esc(leaf)}">${esc(leaf)}</button>`).join("")}</div>
+        </header>
+        <div class="stock-tabs">
+          <button class="stock-tab ${stockTab === "source" ? "active" : ""}" data-stock-tab="source">来源成分</button>
+          <button class="stock-tab ${stockTab === "mine" ? "active" : ""}" data-stock-tab="mine">我的关联</button>
+          <button class="stock-tab ${stockTab === "all" ? "active" : ""}" data-stock-tab="all">全部</button>
+        </div>
+        ${stocks.length ? `<ul class="stock-list">${stocks.map(stock => `<li class="stock-row"><span><b class="stock-name">${esc(stock.name)}</b><code class="stock-code">${esc(stock.code)}</code></span><button class="text-button hide-stock" data-leaf="${esc(selectedLeaf)}" data-code="${esc(stock.code)}" data-name="${esc(stock.name)}">${stock.type === "mine" ? "移除" : "隐藏"}</button></li>`).join("")}</ul>` : `<div class="empty">当前分组暂无标的</div>`}
+        <button class="add-relation" data-add>＋ 添加我的关联</button>`;
+      document.querySelectorAll(".leaf-chip").forEach(button => button.addEventListener("click", () => { selectedLeaf = button.dataset.leaf; renderMapDetail(); }));
+      document.querySelectorAll(".stock-tab").forEach(button => button.addEventListener("click", () => { stockTab = button.dataset.stockTab; renderMapDetail(); }));
+      bindStockActions();
+    }
+
+    function selectNode(id) {
+      const node = allNodes.find(item => item.id === id);
+      if (!node) return;
+      selectedNode = node;
+      selectedLeaf = node.leaves[0];
+      renderMap();
+      renderDirectory();
+    }
+
+    function renderDirectory() {
+      document.getElementById("directoryTree").innerHTML = tiers.map(tier => `<div class="tree-group"><div class="tree-label">${esc(tier.label)}</div>${tier.nodes.map(node => `<button class="tree-item ${node.id === selectedNode.id ? "selected" : ""}" data-tree-node="${node.id}"><span>${esc(node.name)}</span><small>${countFor(node) || "—"}</small></button>`).join("")}</div>`).join("");
+      document.querySelectorAll("[data-tree-node]").forEach(button => button.addEventListener("click", () => { const node = allNodes.find(item => item.id === button.dataset.treeNode); selectedNode = node; selectedLeaf = node.leaves[0]; renderDirectory(); }));
+      const rows = selectedNode.leaves.flatMap(leaf => stocksFor(leaf).map(stock => ({ ...stock, leaf })));
+      document.getElementById("directoryTable").innerHTML = `
+        <header class="table-head"><div><h2>${esc(selectedNode.name)}</h2><p>${esc(selectedNode.desc)} · ${selectedNode.leaves.map(esc).join(" / ")}</p></div><button class="secondary-button" data-add>＋ 添加我的关联</button></header>
+        ${rows.length ? `<table class="data-table"><thead><tr><th>名称</th><th>代码</th><th>细分环节</th><th>归属</th><th aria-label="操作"></th></tr></thead><tbody>${rows.map(stock => `<tr><td><strong>${esc(stock.name)}</strong></td><td><code class="stock-code">${esc(stock.code)}</code></td><td>${esc(stock.leaf)}</td><td><span class="type-badge ${stock.type === "mine" ? "mine" : ""}">${stock.type === "mine" ? "我的关联" : "来源成分"}</span></td><td><div class="row-actions"><button class="text-button hide-stock" data-leaf="${esc(stock.leaf)}" data-code="${esc(stock.code)}" data-name="${esc(stock.name)}">${stock.type === "mine" ? "移除" : "隐藏"}</button></div></td></tr>`).join("")}</tbody></table>` : `<div class="empty">该环节尚未导入来源成分，可先添加我的关联。</div>`}`;
+      bindStockActions();
+    }
+
+    function renderFocus() {
+      document.getElementById("focusSteps").innerHTML = tiers.map((tier, index) => `<button class="step ${index === focusTierIndex ? "active" : ""}" data-focus-tier="${index}"><span class="step-dot">0${index + 1}</span>${esc(tier.short)}</button>`).join("");
+      document.querySelectorAll("[data-focus-tier]").forEach(button => button.addEventListener("click", () => { focusTierIndex = Number(button.dataset.focusTier); focusNode = null; renderFocus(); }));
+      const tier = tiers[focusTierIndex];
+      const back = document.getElementById("focusBack");
+      back.classList.toggle("visible", Boolean(focusNode));
+      if (!focusNode) {
+        document.getElementById("focusContent").innerHTML = `<header class="focus-head"><h2>${esc(tier.label)}</h2><p>${esc(tier.desc)}</p></header><div class="focus-grid">${tier.nodes.map(node => `<button class="focus-card" data-focus-node="${node.id}"><strong>${esc(node.name)}</strong><span>${esc(node.desc)}</span><em>${node.leaves.length} 个细分环节 →</em></button>`).join("")}</div>`;
+        document.querySelectorAll("[data-focus-node]").forEach(button => button.addEventListener("click", () => { focusNode = allNodes.find(node => node.id === button.dataset.focusNode); renderFocus(); }));
+      } else {
+        document.getElementById("focusContent").innerHTML = `<header class="focus-head"><h2>${esc(focusNode.name)}</h2><p>${esc(focusNode.desc)} · 选择细分环节查看关联标的</p></header><div class="focus-grid">${focusNode.leaves.map(leaf => `<button class="focus-card" data-focus-leaf="${esc(leaf)}"><strong>${esc(leaf)}</strong><span>${stocksFor(leaf).length ? "已导入本地来源成分" : "暂无来源成分，可手工关联"}</span><em>${stocksFor(leaf).length || "—"} 只标的 →</em></button>`).join("")}</div>`;
+        document.querySelectorAll("[data-focus-leaf]").forEach(button => button.addEventListener("click", () => { selectedNode = focusNode; selectedLeaf = button.dataset.focusLeaf; stockTab = "all"; activeView = "map"; setView("map"); renderMap(); document.querySelector(".detail-panel").scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" }); }));
+      }
+    }
+
+    function bindStockActions() {
+      document.querySelectorAll("[data-add]").forEach(button => button.addEventListener("click", () => document.getElementById("addDialog").showModal()));
+      document.querySelectorAll(".hide-stock").forEach(button => button.addEventListener("click", () => {
+        const leaf = button.dataset.leaf || selectedLeaf;
+        const entries = stockSets[leaf] || [];
+        const index = entries.findIndex(item => item.code === button.dataset.code);
+        if (index < 0) return;
+        const removed = entries.splice(index, 1)[0];
+        pendingUndo = () => { entries.splice(index, 0, removed); refreshActive(); };
+        showToast(`${removed.name} 已${removed.type === "mine" ? "移除" : "隐藏"}`, true);
+        refreshActive();
+      }));
+    }
+
+    function refreshActive() {
+      if (activeView === "map") renderMap();
+      if (activeView === "directory") renderDirectory();
+      if (activeView === "focus") renderFocus();
+    }
+
+    function setView(view) {
+      activeView = view;
+      document.querySelectorAll(".option-tab").forEach(tab => tab.setAttribute("aria-selected", String(tab.dataset.view === view)));
+      document.querySelectorAll(".view").forEach(panel => {
+        const active = panel.id === `view-${view}`;
+        panel.classList.toggle("active", active);
+        panel.hidden = !active;
+      });
+      refreshActive();
+    }
+
+    function applyFilter() {
+      const term = document.getElementById("searchInput").value.trim().toLowerCase();
+      document.querySelectorAll(".stage").forEach(stage => stage.style.display = selectedTier === "all" || stage.dataset.tier === selectedTier ? "block" : "none");
+      document.querySelectorAll(".connector").forEach(connector => connector.style.display = selectedTier === "all" ? "block" : "none");
+      document.querySelectorAll(".node").forEach(node => node.classList.toggle("hidden-by-filter", Boolean(term) && !node.dataset.search.includes(term)));
+      if (activeView === "directory" && term) {
+        const match = allNodes.find(node => `${node.name} ${node.desc} ${node.leaves.join(" ")}`.toLowerCase().includes(term));
+        if (match) { selectedNode = match; selectedLeaf = match.leaves[0]; renderDirectory(); }
+      }
+    }
+
+    function showToast(text, canUndo = false) {
+      const toast = document.getElementById("toast");
+      document.getElementById("toastText").textContent = text;
+      document.getElementById("undoButton").style.display = canUndo ? "block" : "none";
+      toast.classList.add("show");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => { toast.classList.remove("show"); pendingUndo = null; }, 4000);
+    }
+
+    document.querySelectorAll(".option-tab").forEach(tab => tab.addEventListener("click", () => setView(tab.dataset.view)));
+    document.querySelectorAll(".segment").forEach(segment => segment.addEventListener("click", () => {
+      selectedTier = segment.dataset.filter;
+      document.querySelectorAll(".segment").forEach(item => item.setAttribute("aria-pressed", String(item === segment)));
+      applyFilter();
+    }));
+    document.getElementById("searchInput").addEventListener("input", applyFilter);
+    document.getElementById("resetFilter").addEventListener("click", () => {
+      selectedTier = "all";
+      document.getElementById("searchInput").value = "";
+      document.querySelectorAll(".segment").forEach(item => item.setAttribute("aria-pressed", String(item.dataset.filter === "all")));
+      applyFilter();
+    });
+    document.getElementById("focusBack").addEventListener("click", () => { focusNode = null; renderFocus(); });
+    ["closeDialog", "cancelDialog"].forEach(id => document.getElementById(id).addEventListener("click", () => document.getElementById("addDialog").close()));
+    document.getElementById("addForm").addEventListener("submit", event => {
+      event.preventDefault();
+      const code = document.getElementById("stockCode").value.trim().toUpperCase();
+      const name = document.getElementById("stockName").value.trim();
+      stockSets[selectedLeaf] ||= [];
+      stockSets[selectedLeaf].push({ name, code, type: "mine" });
+      event.target.reset();
+      document.getElementById("addDialog").close();
+      stockTab = "all";
+      showToast(`${name} 已添加到我的关联`);
+      refreshActive();
+    });
+    document.getElementById("undoButton").addEventListener("click", () => {
+      if (pendingUndo) pendingUndo();
+      pendingUndo = null;
+      document.getElementById("toast").classList.remove("show");
+    });
+
+    renderMap();
+    renderDirectory();
+    renderFocus();
+  </script>
+</body>
+</html>

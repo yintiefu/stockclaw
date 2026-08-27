@@ -1,8 +1,17 @@
 {
-  "_comment": "板块·环节骨架（开源版单一来源）。零具体标的：nodes 只有产业链环节名。verified=true 者环节已核实（来自做透的板块）；false 者为占位，待实时核实补全（禁止靠模型记忆编）。用户可在本地 my-watchlist.json 挂自己的标的，不进仓库。",
+  "_comment": "板块·环节骨架（开源版单一来源）。tiers 为产业链骨架：仅含 id+环节名+plate_id，不含任何标的与排名。verified=true 者已核实。成分股由用户本地导入（富途，数据源原序+limit，非市值排名）或手工『我的关联』维护，存 ~/.vibe-research/sector-stocks.json，不进仓库。无 tiers 的板块回退扁平 nodes。",
   "indices": {
-    "aShare": ["上证指数", "深证成指", "创业板指", "沪深300"],
-    "us": ["道琼斯", "纳斯达克", "标普500"]
+    "aShare": [
+      "上证指数",
+      "深证成指",
+      "创业板指",
+      "沪深300"
+    ],
+    "us": [
+      "道琼斯",
+      "纳斯达克",
+      "标普500"
+    ]
   },
   "sectors": [
     {
@@ -11,7 +20,233 @@
       "tagline": "从减速器到灵巧手，AI 具身智能的物理载体",
       "hot": true,
       "verified": true,
-      "nodes": ["谐波减速器", "行星滚柱丝杠", "无框力矩电机", "灵巧手", "六维力传感器", "具身大模型"]
+      "nodes": [
+        "谐波减速器",
+        "行星滚柱丝杠",
+        "无框力矩电机",
+        "灵巧手",
+        "六维力传感器",
+        "具身大模型"
+      ],
+      "chain_id": 9610089,
+      "tiers": [
+        {
+          "id": "brain",
+          "name": "大脑 / 智能层",
+          "items": [
+            {
+              "id": "large-model",
+              "name": "大模型",
+              "plate_id": "10104249",
+              "source": "futu"
+            },
+            {
+              "id": "ai-chip",
+              "name": "AI芯片",
+              "plate_id": "10104250",
+              "source": "futu"
+            },
+            {
+              "id": "storage",
+              "name": "存储芯片",
+              "plate_id": "10104251",
+              "source": "futu"
+            },
+            {
+              "id": "simulation",
+              "name": "仿真软件",
+              "plate_id": "10104252",
+              "source": "futu"
+            },
+            {
+              "id": "vision-algo",
+              "name": "视觉算法",
+              "plate_id": "10104253",
+              "source": "futu"
+            }
+          ]
+        },
+        {
+          "id": "hardware",
+          "name": "身体 / 硬件层",
+          "items": [
+            {
+              "id": "motor",
+              "name": "电机",
+              "children": [
+                {
+                  "id": "torque",
+                  "name": "无框力矩电机",
+                  "plate_id": "10104254",
+                  "source": "futu"
+                },
+                {
+                  "id": "hollow",
+                  "name": "空心杯伺服电机",
+                  "plate_id": "10104255",
+                  "source": "futu"
+                },
+                {
+                  "id": "servo",
+                  "name": "伺服驱动器",
+                  "plate_id": "10104256",
+                  "source": "futu"
+                }
+              ]
+            },
+            {
+              "id": "reducer",
+              "name": "减速器",
+              "children": [
+                {
+                  "id": "harmonic",
+                  "name": "谐波减速器",
+                  "plate_id": "10104257",
+                  "source": "futu"
+                },
+                {
+                  "id": "rv",
+                  "name": "RV 减速器",
+                  "plate_id": "10104258",
+                  "source": "futu"
+                },
+                {
+                  "id": "planetary",
+                  "name": "行星减速器",
+                  "plate_id": "10104259",
+                  "source": "futu"
+                }
+              ]
+            },
+            {
+              "id": "leadscrew",
+              "name": "丝杠",
+              "children": [
+                {
+                  "id": "ball-screw",
+                  "name": "滚珠丝杠",
+                  "plate_id": "10104260",
+                  "source": "futu"
+                },
+                {
+                  "id": "planetary-screw",
+                  "name": "行星滚柱丝杠",
+                  "plate_id": "10104261",
+                  "source": "futu"
+                }
+              ]
+            },
+            {
+              "id": "bearing",
+              "name": "轴承",
+              "plate_id": "10104262",
+              "source": "futu"
+            },
+            {
+              "id": "encoder",
+              "name": "编码器",
+              "plate_id": "10104263",
+              "source": "futu"
+            },
+            {
+              "id": "sensor",
+              "name": "传感器",
+              "children": [
+                {
+                  "id": "camera",
+                  "name": "摄像头",
+                  "plate_id": "10104264",
+                  "source": "futu"
+                },
+                {
+                  "id": "lidar",
+                  "name": "激光雷达",
+                  "plate_id": "10104265",
+                  "source": "futu"
+                },
+                {
+                  "id": "imu",
+                  "name": "IMU惯导",
+                  "plate_id": "10104266",
+                  "source": "futu"
+                },
+                {
+                  "id": "force",
+                  "name": "力/扭矩传感器",
+                  "plate_id": "10104267",
+                  "source": "futu"
+                }
+              ]
+            },
+            {
+              "id": "bionic-material",
+              "name": "人工肌腱 / 仿生皮肤",
+              "plate_id": "10104268",
+              "source": "futu"
+            },
+            {
+              "id": "analog-semi",
+              "name": "模拟半导体",
+              "plate_id": "10104269",
+              "source": "futu"
+            },
+            {
+              "id": "battery",
+              "name": "电池系统",
+              "plate_id": "10104270",
+              "source": "futu"
+            },
+            {
+              "id": "harness",
+              "name": "线束&连接器",
+              "plate_id": "10104271",
+              "source": "futu"
+            },
+            {
+              "id": "body",
+              "name": "机身结构件",
+              "plate_id": "10104272",
+              "source": "futu"
+            },
+            {
+              "id": "thermal",
+              "name": "热管理",
+              "plate_id": "10104273",
+              "source": "futu"
+            }
+          ]
+        },
+        {
+          "id": "integrator",
+          "name": "整机集成商",
+          "items": [
+            {
+              "id": "auto",
+              "name": "车企系人形整机",
+              "plate_id": "10104274",
+              "source": "futu"
+            },
+            {
+              "id": "consumer",
+              "name": "消费电子系人形整机",
+              "plate_id": "10104275",
+              "source": "futu"
+            },
+            {
+              "id": "internet",
+              "name": "互联网 / 电商系人形整机",
+              "plate_id": "10104276",
+              "source": "futu"
+            },
+            {
+              "id": "pro",
+              "name": "专业机器人厂商整机",
+              "plate_id": "10104277",
+              "source": "futu"
+            }
+          ]
+        }
+      ]
     },
     {
       "key": "ai-computing",
@@ -19,24 +254,337 @@
       "tagline": "算力基建的产业链——芯片、光互连、封装、散热",
       "hot": true,
       "verified": true,
-      "nodes": ["AI芯片", "光模块", "CPO光互连", "HBM存储", "先进封装", "PCB", "液冷散热"]
+      "nodes": [
+        "AI芯片",
+        "光模块",
+        "CPO光互连",
+        "HBM存储",
+        "先进封装",
+        "PCB",
+        "液冷散热"
+      ],
+      "chain_id": 9610020,
+      "tiers": [
+        {
+          "id": "ai-infra",
+          "name": "基础建设层",
+          "items": [
+            {
+              "id": "ai-compute",
+              "name": "算力基础",
+              "children": [
+                {
+                  "id": "ai-aichip",
+                  "name": "AI芯片",
+                  "plate_id": "10010158",
+                  "source": "futu"
+                },
+                {
+                  "id": "ai-hbm",
+                  "name": "内存芯片",
+                  "plate_id": "10010159",
+                  "source": "futu"
+                },
+                {
+                  "id": "ai-server",
+                  "name": "服务器与高性能计算中心",
+                  "plate_id": "10010160",
+                  "source": "futu"
+                },
+                {
+                  "id": "ai-cloud",
+                  "name": "云基础建设",
+                  "plate_id": "10010161",
+                  "source": "futu"
+                },
+                {
+                  "id": "ai-cpo",
+                  "name": "光通信",
+                  "plate_id": "10104067",
+                  "source": "futu"
+                },
+                {
+                  "id": "ai-liquid",
+                  "name": "液冷散热",
+                  "plate_id": "10104068",
+                  "source": "futu"
+                }
+              ]
+            },
+            {
+              "id": "ai-data",
+              "name": "数据服务",
+              "children": [
+                {
+                  "id": "ai-datacenter",
+                  "name": "数据中心及服务",
+                  "plate_id": "10010162",
+                  "source": "futu"
+                },
+                {
+                  "id": "ai-optical",
+                  "name": "光模块与网络设备",
+                  "plate_id": "10104063",
+                  "source": "futu"
+                },
+                {
+                  "id": "ai-heatsink",
+                  "name": "散热系统",
+                  "plate_id": "10104064",
+                  "source": "futu"
+                }
+              ]
+            },
+            {
+              "id": "ai-power-infra",
+              "name": "电力设施层",
+              "children": [
+                {
+                  "id": "ai-power",
+                  "name": "能源供给",
+                  "plate_id": "10104049",
+                  "source": "futu"
+                },
+                {
+                  "id": "ai-grid",
+                  "name": "电网设备",
+                  "plate_id": "10104050",
+                  "source": "futu"
+                },
+                {
+                  "id": "ai-storage-e",
+                  "name": "能源存储",
+                  "plate_id": "10104051",
+                  "source": "futu"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "ai-algo-layer",
+          "name": "算法层",
+          "items": [
+            {
+              "id": "ai-algo",
+              "name": "算法模型",
+              "plate_id": "10010163",
+              "source": "futu"
+            }
+          ]
+        },
+        {
+          "id": "ai-app-layer",
+          "name": "应用层",
+          "items": [
+            {
+              "id": "ai-app",
+              "name": "应用层",
+              "plate_id": "10010508",
+              "source": "futu"
+            }
+          ]
+        }
+      ]
     },
-    { "key": "hbm", "label": "HBM", "tagline": "高带宽存储——AI 芯片的内存瓶颈", "hot": true, "verified": false, "nodes": [] },
-    { "key": "cpo", "label": "光互联", "tagline": "光电共封装（CPO）——突破铜互连的带宽墙", "hot": true, "verified": false, "nodes": [] },
-    { "key": "semiconductor", "label": "半导体国产替代", "tagline": "设备、材料、EDA、制造的自主链条", "hot": true, "verified": false, "nodes": [] },
-    { "key": "solid-state-battery", "label": "固态电池", "tagline": "下一代电池的材料与工艺路线", "hot": true, "verified": false, "nodes": [] },
-    { "key": "low-altitude", "label": "低空经济", "tagline": "eVTOL、空管、基建与运营", "hot": true, "verified": false, "nodes": [] },
-    { "key": "smart-driving", "label": "智能驾驶", "tagline": "感知、算力、线控与整车", "hot": true, "verified": false, "nodes": [] },
-    { "key": "innovative-drug", "label": "创新药", "tagline": "靶点、临床、CXO 与出海", "hot": true, "verified": false, "nodes": [] },
-    { "key": "power-grid", "label": "电网与特高压", "tagline": "输配电设备与新型电力系统", "hot": false, "verified": false, "nodes": [] },
-    { "key": "defense", "label": "军工", "tagline": "航空、航天、船舶与信息化", "hot": false, "verified": false, "nodes": [] },
-    { "key": "fusion", "label": "可控核聚变", "tagline": "磁约束、超导与第一壁材料", "hot": true, "verified": false, "nodes": [] },
-    { "key": "business-space", "label": "商业航天", "tagline": "火箭、卫星制造与卫星互联网", "hot": true, "verified": false, "nodes": [] },
-    { "key": "ai-pharma", "label": "生物医药", "tagline": "创新药、AI 制药与生物技术", "hot": true, "verified": false, "nodes": [] },
-    { "key": "resources", "label": "资源卡口", "tagline": "稀土、锗、铟等被卡的关键资源", "hot": false, "verified": false, "nodes": [] },
-    { "key": "ai-application", "label": "AI 应用", "tagline": "大模型落地的应用与 Agent", "hot": true, "verified": false, "nodes": [] },
-    { "key": "ai-hardware", "label": "AI 硬件", "tagline": "端侧、AI 眼镜与消费终端", "hot": true, "verified": false, "nodes": [] },
-    { "key": "energy-storage", "label": "储能", "tagline": "电化学储能与电网侧调峰", "hot": false, "verified": false, "nodes": [] },
-    { "key": "data-element", "label": "数据要素", "tagline": "数据确权、交易与流通基建", "hot": false, "verified": false, "nodes": [] }
+    {
+      "key": "hbm",
+      "label": "HBM",
+      "tagline": "高带宽存储——AI 芯片的内存瓶颈",
+      "hot": true,
+      "verified": false,
+      "nodes": []
+    },
+    {
+      "key": "cpo",
+      "label": "光通信",
+      "tagline": "光通信产业链——光芯片、光器件、光模块到 CPO 共封装",
+      "hot": true,
+      "verified": false,
+      "nodes": [
+        "光芯片",
+        "光器件",
+        "光模块",
+        "光纤光缆",
+        "CPO封装",
+        "封装测试"
+      ],
+      "chain_id": 9610087,
+      "tiers": [
+        {
+          "id": "ic-design",
+          "name": "IC 设计与制造",
+          "items": [
+            { "id": "asic-xpu", "name": "ASIC与xPU设计", "plate_id": "10104185", "source": "futu" },
+            { "id": "photonic-ic", "name": "光子集成电路设计", "plate_id": "10104186", "source": "futu" },
+            { "id": "electronic-ic", "name": "电子集成电路（光模块配套电芯片）", "plate_id": "10104187", "source": "futu" },
+            { "id": "wafer-foundry", "name": "晶圆代工", "plate_id": "10104188", "source": "futu" }
+          ]
+        },
+        {
+          "id": "semi-material",
+          "name": "半导体材料",
+          "items": [
+            { "id": "inp-substrate", "name": "磷化铟衬底", "plate_id": "10104189", "source": "futu" },
+            { "id": "inp-epitaxial", "name": "磷化铟外延片", "plate_id": "10104190", "source": "futu" },
+            { "id": "gaas-substrate", "name": "砷化镓衬底", "plate_id": "10104191", "source": "futu" },
+            { "id": "copper-foil", "name": "铜箔", "plate_id": "10104192", "source": "futu" }
+          ]
+        },
+        {
+          "id": "optical-components",
+          "name": "光组件",
+          "items": [
+            { "id": "laser-silicon", "name": "激光器 / 光源（硅光方案）", "plate_id": "10104193", "source": "futu" },
+            { "id": "laser-eml", "name": "激光器 / 光源（电吸收调制激光器方案）", "plate_id": "10104194", "source": "futu" },
+            { "id": "fiber-array", "name": "光纤阵列单元", "plate_id": "10104195", "source": "futu" },
+            {
+              "id": "passive-optical",
+              "name": "无源光器件",
+              "children": [
+                { "id": "coupler", "name": "耦合器 / 分路器", "plate_id": "10104196", "source": "futu" },
+                { "id": "filter", "name": "滤波器", "plate_id": "10104197", "source": "futu" },
+                { "id": "attenuator", "name": "衰减器", "plate_id": "10104198", "source": "futu" },
+                { "id": "wdm", "name": "波分复用器", "plate_id": "10104199", "source": "futu" }
+              ]
+            },
+            { "id": "module-assembly", "name": "光模块组装与集成", "plate_id": "10104200", "source": "futu" },
+            { "id": "fiber", "name": "光纤", "plate_id": "10104201", "source": "futu" },
+            { "id": "mt-ferrule", "name": "MT插芯", "plate_id": "10104202", "source": "futu" },
+            { "id": "mpo-connector", "name": "MPO连接器", "plate_id": "10104203", "source": "futu" },
+            { "id": "vsff-connector", "name": "VSFF连接器", "plate_id": "10104204", "source": "futu" }
+          ]
+        },
+        {
+          "id": "packaging-test",
+          "name": "封装与测试",
+          "items": [
+            { "id": "packaging-service", "name": "封装与测试服务", "plate_id": "10104205", "source": "futu" },
+            { "id": "packaging-equipment", "name": "封装设备", "plate_id": "10104206", "source": "futu" },
+            { "id": "test-equipment", "name": "测试设备", "plate_id": "10104207", "source": "futu" }
+          ]
+        }
+      ]
+    },
+    {
+      "key": "semiconductor",
+      "label": "半导体国产替代",
+      "tagline": "设备、材料、EDA、制造的自主链条",
+      "hot": true,
+      "verified": false,
+      "nodes": []
+    },
+    {
+      "key": "solid-state-battery",
+      "label": "固态电池",
+      "tagline": "下一代电池的材料与工艺路线",
+      "hot": true,
+      "verified": false,
+      "nodes": []
+    },
+    {
+      "key": "low-altitude",
+      "label": "低空经济",
+      "tagline": "eVTOL、空管、基建与运营",
+      "hot": true,
+      "verified": false,
+      "nodes": []
+    },
+    {
+      "key": "smart-driving",
+      "label": "智能驾驶",
+      "tagline": "感知、算力、线控与整车",
+      "hot": true,
+      "verified": false,
+      "nodes": []
+    },
+    {
+      "key": "innovative-drug",
+      "label": "创新药",
+      "tagline": "靶点、临床、CXO 与出海",
+      "hot": true,
+      "verified": false,
+      "nodes": []
+    },
+    {
+      "key": "power-grid",
+      "label": "电网与特高压",
+      "tagline": "输配电设备与新型电力系统",
+      "hot": false,
+      "verified": false,
+      "nodes": []
+    },
+    {
+      "key": "defense",
+      "label": "军工",
+      "tagline": "航空、航天、船舶与信息化",
+      "hot": false,
+      "verified": false,
+      "nodes": []
+    },
+    {
+      "key": "fusion",
+      "label": "可控核聚变",
+      "tagline": "磁约束、超导与第一壁材料",
+      "hot": true,
+      "verified": false,
+      "nodes": []
+    },
+    {
+      "key": "business-space",
+      "label": "商业航天",
+      "tagline": "火箭、卫星制造与卫星互联网",
+      "hot": true,
+      "verified": false,
+      "nodes": []
+    },
+    {
+      "key": "ai-pharma",
+      "label": "生物医药",
+      "tagline": "创新药、AI 制药与生物技术",
+      "hot": true,
+      "verified": false,
+      "nodes": []
+    },
+    {
+      "key": "resources",
+      "label": "资源卡口",
+      "tagline": "稀土、锗、铟等被卡的关键资源",
+      "hot": false,
+      "verified": false,
+      "nodes": []
+    },
+    {
+      "key": "ai-application",
+      "label": "AI 应用",
+      "tagline": "大模型落地的应用与 Agent",
+      "hot": true,
+      "verified": false,
+      "nodes": []
+    },
+    {
+      "key": "ai-hardware",
+      "label": "AI 硬件",
+      "tagline": "端侧、AI 眼镜与消费终端",
+      "hot": true,
+      "verified": false,
+      "nodes": []
+    },
+    {
+      "key": "energy-storage",
+      "label": "储能",
+      "tagline": "电化学储能与电网侧调峰",
+      "hot": false,
+      "verified": false,
+      "nodes": []
+    },
+    {
+      "key": "data-element",
+      "label": "数据要素",
+      "tagline": "数据确权、交易与流通基建",
+      "hot": false,
+      "verified": false,
+      "nodes": []
+    }
   ]
 }

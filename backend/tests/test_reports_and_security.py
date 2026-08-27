@@ -20,7 +20,7 @@ _B64 = "data:application/pdf;base64," + base64.b64encode(b"%PDF-1.4 test").decod
 # ---- 我的研报 ----
 
 def test_classify_by_filename():
-    assert mr.classify("东吴证券_中际旭创_光模块深度.pdf") == "光互联"
+    assert mr.classify("东吴证券_中际旭创_光模块深度.pdf") == "光通信"
     assert mr.classify("宇树科技_人形机器人.pdf") == "人形机器人"
     assert mr.classify("随手记.txt") == "未分类"
 

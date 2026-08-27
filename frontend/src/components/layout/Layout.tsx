@@ -53,7 +53,7 @@ const SECTOR_LINKS = [
   { to: "/sectors/humanoid", icon: Cog, label: "人形机器人" },
   { to: "/sectors/ai-computing", icon: Cpu, label: "AI 算力" },
   { to: "/sectors/hbm", icon: Database, label: "HBM" },
-  { to: "/sectors/cpo", icon: Cable, label: "光互联" },
+  { to: "/sectors/cpo", icon: Cable, label: "光通信" },
   { to: "/sectors/business-space", icon: Rocket, label: "商业航天" },
   { to: "/sectors/ai-pharma", icon: FlaskConical, label: "生物医药" },
 ];
@@ -123,7 +123,9 @@ export function Layout() {
         {/* Nav */}
         <nav className={cn("flex-1 space-y-1 overflow-auto", effectiveCollapsed ? "p-1.5" : "p-2.5")}>
           {NAV.map(({ to, icon: Icon, label }) => {
-            const active = pathname === to;
+            // 选中 = 当前路由属于该菜单（父页或其下子栏目/动态详情页，如 /sectors/cpo）；
+            // 子菜单展开与否由小三角表达，不参与选中态——避免多个一级菜单同时高亮
+            const active = pathname === to || pathname.startsWith(`${to}/`);
             const group = NAV_GROUPS[to];
             const groupOpen = group ? openGroups[to] : false;
             return (
@@ -131,24 +133,22 @@ export function Layout() {
                 <Link
                   to={to}
                   title={effectiveCollapsed ? label : undefined}
+                  // 导航组：整行点击即开合子栏目（点击仍照常进总览页）；侧栏收起时子栏目恒显示，不参与开合
+                  onClick={group && !effectiveCollapsed ? () => toggleGroup(to) : undefined}
+                  aria-expanded={group && !effectiveCollapsed ? groupOpen : undefined}
                   className={cn(
                     "flex items-center rounded-lg text-sm transition-colors",
                     effectiveCollapsed ? "justify-center p-2.5" : "gap-2.5 px-3 py-2.5",
-                    active || groupOpen
+                    active
                       ? "bg-primary/15 font-medium text-primary shadow-glow"
                       : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
                   )}
                 >
                   <Icon className="h-4 w-4 shrink-0" />
                   {!effectiveCollapsed && (group ? <span className="flex-1">{label}</span> : label)}
-                  {/* 导航组：小三角展开/收起子栏目（点三角不跳转，点文字仍进总览页） */}
+                  {/* 开合状态指示（装饰性，交互在整行 Link 上） */}
                   {group && !effectiveCollapsed && (
-                    <span
-                      role="button"
-                      aria-label={groupOpen ? "收起子栏目" : "展开子栏目"}
-                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); toggleGroup(to); }}
-                      className="-mr-1 rounded p-0.5 hover:bg-muted/60"
-                    >
+                    <span aria-hidden="true" className="-mr-1 rounded p-0.5">
                       <ChevronDown className={cn("h-3.5 w-3.5 transition-transform", !groupOpen && "-rotate-90")} />
                     </span>
                   )}
