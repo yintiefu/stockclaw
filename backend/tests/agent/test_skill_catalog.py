@@ -180,3 +180,88 @@ def test_parse_skill_file_uses_parent_directory_name(tmp_path: Path) -> None:
     (skill / "SKILL.md").write_text(_document(name="other"), encoding="utf-8")
     with pytest.raises(SkillValidationError):
         parse_skill_file(skill / "SKILL.md", "/user/sample-skill/SKILL.md")
+
+
+# ---------------------------------------------------------------------------
+# Task 2：过滤只读 backend
+# ---------------------------------------------------------------------------
+
+def write_skill(directory: Path, name: str, *, description: str = "测试技能。") -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {description}\n---\n\n# 指令\n",
+        encoding="utf-8",
+    )
+    return directory
+
+
+def test_filtered_backend_hides_invalid_and_excluded_skills(tmp_path: Path) -> None:
+    from agent.skill_catalog import FilteredSkillBackend
+
+    write_skill(tmp_path / "valid", "valid")
+    write_skill(tmp_path / "blocked", "other")
+    backend = FilteredSkillBackend(tmp_path, excluded_names={"conflict"})
+    assert [entry["path"] for entry in backend.ls("/").entries or []] == ["/valid/"]
+    assert backend.read("/blocked/SKILL.md").error is not None
+    assert backend.download_files(["/blocked/SKILL.md"])[0].error == "file_not_found"
+
+
+def test_valid_skill_names_skips_invalid_directories(tmp_path: Path) -> None:
+    from agent.skill_catalog import valid_skill_names
+
+    write_skill(tmp_path / "valid", "valid")
+    write_skill(tmp_path / "blocked", "other")
+    assert valid_skill_names(tmp_path) == frozenset({"valid"})
+
+
+@pytest.mark.asyncio
+async def test_filtered_backend_async_contract_matches_sync(tmp_path: Path) -> None:
+    from agent.skill_catalog import FilteredSkillBackend
+
+    write_skill(tmp_path / "valid", "valid")
+    backend = FilteredSkillBackend(tmp_path)
+    assert (await backend.als("/")).entries == backend.ls("/").entries
+    assert (await backend.aread("/valid/SKILL.md")).file_data
+    assert (await backend.adownload_files(["/valid/SKILL.md"]))[0].content
+
+
+def test_filtered_backend_lists_subdirectory_only_when_authorized(tmp_path: Path) -> None:
+    from agent.skill_catalog import FilteredSkillBackend
+
+    write_skill(tmp_path / "valid", "valid")
+    (tmp_path / "valid" / "references").mkdir()
+    (tmp_path / "valid" / "references" / "note.md").write_text("NOTE", encoding="utf-8")
+    write_skill(tmp_path / "blocked", "other")
+    backend = FilteredSkillBackend(tmp_path)
+    listed = backend.ls("/valid/references")
+    assert listed.error is None
+    assert [entry["path"] for entry in listed.entries or []] == ["/valid/references/note.md"]
+    assert backend.ls("/blocked").error == "path_not_found"
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "symlink"), reason="platform lacks symlink")
+def test_filtered_backend_blocks_symlink_escape(tmp_path: Path) -> None:
+    import os
+
+    from agent.skill_catalog import FilteredSkillBackend
+
+    secret = write_skill(tmp_path / "blocked", "other") / "SKILL.md"
+    valid = write_skill(tmp_path / "valid", "valid")
+    references = valid / "references"
+    references.mkdir()
+    os.symlink(secret.parent, references / "escape")
+    os.symlink(secret, valid.parent / "valid-link")
+    backend = FilteredSkillBackend(tmp_path)
+    assert [entry["path"] for entry in backend.ls("/").entries or []] == ["/valid/"]
+    assert backend.read("/valid/references/escape/SKILL.md").error == "file_not_found"
+    assert backend.download_files(["/valid/references/escape/SKILL.md"])[0].error == "file_not_found"
+
+
+def test_filtered_backend_rejects_traversal_and_root_paths(tmp_path: Path) -> None:
+    from agent.skill_catalog import FilteredSkillBackend
+
+    write_skill(tmp_path / "valid", "valid")
+    backend = FilteredSkillBackend(tmp_path)
+    assert backend.read("/../etc/passwd").error == "file_not_found"
+    assert backend.read("/SKILL.md").error == "file_not_found"
+    assert backend.ls("/valid/../blocked").error == "path_not_found"

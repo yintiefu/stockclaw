@@ -107,13 +107,28 @@ async def test_embedded_graph_injects_snapshot_and_persists_across_turns():
 
 
 @pytest.mark.asyncio
-async def test_embedded_graph_has_no_mcp_hitl_or_user_skills():
+async def test_embedded_graph_has_no_mcp_hitl_or_user_skills(monkeypatch):
+    from deepagents.backends import CompositeBackend, FilesystemBackend
+
+    from agent import embedded_graph as embedded_module
+    from agent.skill_catalog import SKILLS_SYSTEM_PROMPT, FilteredSkillBackend
+
+    captured: dict = {}
+    compiled = object()
+    monkeypatch.setattr(embedded_module, "create_agent", lambda **kwargs: captured.update(kwargs) or compiled)
     model = ScriptedChatModel([AIMessage(content="回答")])
     graph = await build_embedded_graph(model=model, checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
 
-    # Inspect nodes / tools if exposed
-    # Built-in tools and /builtin/ skills only
-    assert graph is not None
+    assert graph is compiled
+    skills_middleware = captured["middleware"][0]
+    assert skills_middleware.sources == ["/builtin/"]
+    assert skills_middleware.system_prompt_template == SKILLS_SYSTEM_PROMPT
+    backend = skills_middleware._backend
+    assert isinstance(backend, CompositeBackend)
+    assert set(backend.routes) == {"/builtin/"}
+    for routed in backend.routes.values():
+        assert isinstance(routed, FilteredSkillBackend)
+        assert not isinstance(routed, FilesystemBackend)
 
 
 @pytest.mark.asyncio

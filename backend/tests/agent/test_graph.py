@@ -88,6 +88,20 @@ async def test_build_graph_uses_fixed_prompt_and_complete_tool_surface(monkeypat
     hitl = captured["middleware"][2]
     assert isinstance(hitl, HumanInTheLoopMiddleware)
     assert hitl.interrupt_on == {"fixture_echo": {"allowed_decisions": ["approve", "reject"]}}
+    # 技能路由必须是过滤 backend：无 raw FilesystemBackend 直挂路由
+    from deepagents.backends import CompositeBackend, FilesystemBackend
+
+    from agent.skill_catalog import FilteredSkillBackend, valid_skill_names
+    from agent.skill_backends import BUILTIN_SKILLS_DIR
+
+    routed_backend = captured["middleware"][0]._backend
+    assert isinstance(routed_backend, CompositeBackend)
+    assert set(routed_backend.routes) == {"/builtin/", "/user/"}
+    for routed in routed_backend.routes.values():
+        assert isinstance(routed, FilteredSkillBackend)
+        assert not isinstance(routed, FilesystemBackend)
+    user_backend = routed_backend.routes["/user/"]
+    assert user_backend._excluded == valid_skill_names(BUILTIN_SKILLS_DIR)
 
 
 @pytest.mark.asyncio

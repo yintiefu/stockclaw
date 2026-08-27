@@ -1,24 +1,23 @@
 """Skills 后端构造模块。
 
-提供只读 /builtin/ 与 /user/ 命名空间的 CompositeBackend 构造。
+只保留仓库内置技能根常量；严格过滤的 CompositeBackend 构造统一由
+`agent.skill_catalog` 提供并在此再导出，保持既有 import 路径稳定。
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
+from agent.skill_catalog import (
+    SKILLS_SYSTEM_PROMPT,
+    build_builtin_skill_backend,
+    build_skill_backend,
+)
 
 BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "builtin_skills"
 
-
-def build_skill_backend(builtin_root: Path | str, user_root: Path | str) -> CompositeBackend:
-    """构造支持 /builtin/ 与 /user/ 命名空间的只读 CompositeBackend。"""
-    builtin_path = Path(builtin_root).resolve()
-    user_path = Path(user_root).resolve()
-    return CompositeBackend(
-        default=StateBackend(),
-        routes={
-            "/builtin/": FilesystemBackend(root_dir=str(builtin_path), virtual_mode=True),
-            "/user/": FilesystemBackend(root_dir=str(user_path), virtual_mode=True),
-        },
-    )
+__all__ = [
+    "BUILTIN_SKILLS_DIR",
+    "SKILLS_SYSTEM_PROMPT",
+    "build_builtin_skill_backend",
+    "build_skill_backend",
+]

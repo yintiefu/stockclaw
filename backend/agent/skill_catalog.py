@@ -106,3 +106,92 @@ def parse_skill_file(path: Path, virtual_path: str) -> ParsedSkill:
     except UnicodeDecodeError:
         raise SkillValidationError("SKILL.md 必须是 UTF-8 文本") from None
     return parse_skill_document(content, path.parent.name, virtual_path)
+
+
+class FilteredSkillBackend(BackendProtocol):
+    """在文件系统之上强制技能边界的只读 backend。
+
+    CompositeBackend 会先剥离路由前缀（`/user/<name>/...` 到达时已是
+    `/<name>/...`），因此授权判断以第一段路径为技能名。无效、冲突、
+    symlink 目录与任何逃逸技能根的相对路径一律按不存在处理。
+    """
+
+    def __init__(self, root: Path | str, *, excluded_names: set[str] | frozenset[str] = frozenset()):
+        self.root = Path(root).resolve()
+        self._excluded = frozenset(excluded_names)
+        self._delegate = FilesystemBackend(root_dir=self.root, virtual_mode=True)
+
+    def _authorized(self, virtual_path: str) -> bool:
+        normalized = PurePosixPath("/" + virtual_path.lstrip("/"))
+        if ".." in normalized.parts or len(normalized.parts) < 2:
+            return False
+        name = normalized.parts[1]
+        skill_root = self.root / name
+        if name in self._excluded or skill_root.is_symlink():
+            return False
+        try:
+            parse_skill_file(skill_root / "SKILL.md", f"/{name}/SKILL.md")
+            (self.root / str(normalized).lstrip("/")).resolve().relative_to(skill_root.resolve())
+        except (OSError, UnicodeDecodeError, ValueError, SkillValidationError):
+            return False
+        return True
+
+    def ls(self, path: str) -> LsResult:
+        if path.rstrip("/") in {"", "."}:
+            result = self._delegate.ls("/")
+            entries = [entry for entry in result.entries or [] if self._authorized(entry["path"])]
+            return LsResult(error=result.error, entries=entries)
+        return self._delegate.ls(path) if self._authorized(path) else LsResult(error="path_not_found")
+
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        return self._delegate.read(file_path, offset, limit) if self._authorized(file_path) else ReadResult(error="file_not_found")
+
+    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        return [
+            self._delegate.download_files([path])[0]
+            if self._authorized(path)
+            else FileDownloadResponse(path=path, content=None, error="file_not_found")
+            for path in paths
+        ]
+
+
+def valid_skill_names(root: Path) -> frozenset[str]:
+    """枚举根目录下严格可解析的技能名（symlink 与无效目录一律跳过）。"""
+    if not root.is_dir():
+        return frozenset()
+    names: set[str] = set()
+    for child in root.iterdir():
+        if not child.is_dir() or child.is_symlink() or not (child / "SKILL.md").is_file():
+            continue
+        try:
+            parsed = parse_skill_file(child / "SKILL.md", f"/builtin/{child.name}/SKILL.md")
+        except (OSError, SkillValidationError):
+            continue
+        names.add(parsed.metadata["name"])
+    return frozenset(names)
+
+
+SKILLS_SYSTEM_PROMPT = """## Skills
+{skills_locations}{skills_load_warnings}
+
+可用技能：
+{skills_list}
+
+先按名称与描述判断是否适用，再用 `read_file` 读取列出的 SKILL.md；附属文件和脚本仅作只读参考，不能执行。
+"""
+
+
+def build_skill_backend(builtin_root: Path | str, user_root: Path | str) -> CompositeBackend:
+    """工作台复合视图：/builtin/ 与 /user/ 都挂过滤 backend，用户侧排除内置同名。"""
+    builtin_names = valid_skill_names(Path(builtin_root))
+    return CompositeBackend(default=StateBackend(), routes={
+        "/builtin/": FilteredSkillBackend(builtin_root),
+        "/user/": FilteredSkillBackend(user_root, excluded_names=builtin_names),
+    })
+
+
+def build_builtin_skill_backend(builtin_root: Path | str) -> CompositeBackend:
+    """嵌入式视图：只暴露 /builtin/，永不挂 /user/。"""
+    return CompositeBackend(default=StateBackend(), routes={
+        "/builtin/": FilteredSkillBackend(builtin_root),
+    })
