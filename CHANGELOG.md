@@ -3,6 +3,25 @@
 本项目的版本号唯一来源是 `frontend/package.json`；后端 HTTP API、`/api/health`、
 前端界面与 MCP `serverInfo` 全部从它读取（见 `backend/version.py`）。
 
+## 未发布 — 2026-08-28：工作流 AI 层迁移 v2 流（破坏性重构）
+
+- 阶段正文从 `StageResult.content` 迁到 `messages` 通道（`add_messages` 按 id 归并），
+  `StageResult` 退化为状态机 + `message_id` 指针；`result` 状态键删除。
+- `run_stage` 传播节点 config：token 增量原生进入 messages 通道；每 token 一个
+  custom 事件的旧机制与 seq/cursor/轮询对账协议整体删除。
+- 重试改为独立 `resume` 控制通道（`{resume: true}`，绝不覆写 `input`）+ 后端
+  `entry` 版本门控与 `auto_resume` 路由；取消不再客户端回写状态。
+- **config_version 升至 2（状态 schema 破坏性变更）**：迁移前需对**仍在运行旧代码的
+  Agent** 执行一次定向清理：
+
+  ```bash
+  node scripts/prune-workflow-threads.mjs   # 删除 channel=workflow 线程
+  ```
+
+  dev pickle 为六个图共用（`$VR_AGENT_WORK_DIR/.langgraph_api/`）——**禁止直接删
+  .pckl 文件**，否则 workspace/embedded 历史一并丢失；`scripts/dev` 的
+  pickle-backups 仅能整体回滚。
+
 ## 未发布 — 2026-08-27：精简 Agent 自定义面（重构迭代第一轮）
 
 - 删除遗留死代码 `agent/client.py`（自研 SSE 客户端）及其测试：旧 FastAPI AI 路由
