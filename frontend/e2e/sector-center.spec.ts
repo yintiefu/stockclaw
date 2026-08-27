@@ -111,23 +111,26 @@ test.describe("板块中心（只读回归，不新增数据）", () => {
     expect(body.data.leaves).toEqual({});
   });
 
-  test("侧栏「板块中心」导航组：子栏目可收起、刷新后记忆、直达子板块", async ({ page }) => {
+  test("侧栏「板块中心」导航组：整行点击开合、刷新后记忆、直达子板块", async ({ page }) => {
     await page.goto("/sectors/humanoid");
 
-    // 默认展开：子栏目链接可见，可收起（三个导航组都有同名按钮，限定到板块中心组）
-    const collapse = page.locator("nav a[href='/sectors'] [role='button'][aria-label='收起子栏目']");
-    await expect(collapse).toBeVisible();
+    // 默认展开：子栏目链接可见；整行（菜单项本身）点击即收起，并照常回到总览页
+    const groupLink = page.locator("nav a[href='/sectors']");
+    await expect(groupLink).toHaveAttribute("aria-expanded", "true");
     await expect(page.locator("nav a[href='/sectors/cpo']")).toBeVisible();
 
-    await collapse.click();
+    await groupLink.click();
     await expect(page.locator("nav a[href='/sectors/cpo']")).toBeHidden();
+    await expect(groupLink).toHaveAttribute("aria-expanded", "false");
     expect(await page.evaluate(() => localStorage.getItem("vr-sectors-open"))).toBe("closed");
+    await expect(page).toHaveURL(/\/sectors$/);
 
-    // 刷新后保持收起；再展开恢复
+    // 刷新后保持收起；再点整行展开恢复
     await page.reload();
     await expect(page.locator("nav a[href='/sectors/cpo']")).toBeHidden();
-    await page.locator("nav a[href='/sectors'] [role='button'][aria-label='展开子栏目']").click();
+    await groupLink.click();
     await expect(page.locator("nav a[href='/sectors/cpo']")).toBeVisible();
+    await expect(groupLink).toHaveAttribute("aria-expanded", "true");
 
     // 子栏目直达光通信详情
     await page.locator("nav a[href='/sectors/cpo']").click();

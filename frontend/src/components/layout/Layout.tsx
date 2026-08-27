@@ -131,6 +131,9 @@ export function Layout() {
                 <Link
                   to={to}
                   title={effectiveCollapsed ? label : undefined}
+                  // 导航组：整行点击即开合子栏目（点击仍照常进总览页）；侧栏收起时子栏目恒显示，不参与开合
+                  onClick={group && !effectiveCollapsed ? () => toggleGroup(to) : undefined}
+                  aria-expanded={group && !effectiveCollapsed ? groupOpen : undefined}
                   className={cn(
                     "flex items-center rounded-lg text-sm transition-colors",
                     effectiveCollapsed ? "justify-center p-2.5" : "gap-2.5 px-3 py-2.5",
@@ -141,14 +144,9 @@ export function Layout() {
                 >
                   <Icon className="h-4 w-4 shrink-0" />
                   {!effectiveCollapsed && (group ? <span className="flex-1">{label}</span> : label)}
-                  {/* 导航组：小三角展开/收起子栏目（点三角不跳转，点文字仍进总览页） */}
+                  {/* 开合状态指示（装饰性，交互在整行 Link 上） */}
                   {group && !effectiveCollapsed && (
-                    <span
-                      role="button"
-                      aria-label={groupOpen ? "收起子栏目" : "展开子栏目"}
-                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); toggleGroup(to); }}
-                      className="-mr-1 rounded p-0.5 hover:bg-muted/60"
-                    >
+                    <span aria-hidden="true" className="-mr-1 rounded p-0.5">
                       <ChevronDown className={cn("h-3.5 w-3.5 transition-transform", !groupOpen && "-rotate-90")} />
                     </span>
                   )}
