@@ -123,7 +123,9 @@ export function Layout() {
         {/* Nav */}
         <nav className={cn("flex-1 space-y-1 overflow-auto", effectiveCollapsed ? "p-1.5" : "p-2.5")}>
           {NAV.map(({ to, icon: Icon, label }) => {
-            const active = pathname === to;
+            // 选中 = 当前路由属于该菜单（父页或其下子栏目/动态详情页，如 /sectors/cpo）；
+            // 子菜单展开与否由小三角表达，不参与选中态——避免多个一级菜单同时高亮
+            const active = pathname === to || pathname.startsWith(`${to}/`);
             const group = NAV_GROUPS[to];
             const groupOpen = group ? openGroups[to] : false;
             return (
@@ -137,7 +139,7 @@ export function Layout() {
                   className={cn(
                     "flex items-center rounded-lg text-sm transition-colors",
                     effectiveCollapsed ? "justify-center p-2.5" : "gap-2.5 px-3 py-2.5",
-                    active || groupOpen
+                    active
                       ? "bg-primary/15 font-medium text-primary shadow-glow"
                       : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
                   )}
