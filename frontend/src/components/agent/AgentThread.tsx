@@ -1,4 +1,5 @@
-/** 聊天线程：共享 Thread / 工具渲染 + 标准发送/取消 Composer，无自定义运行态。 */
+/** 聊天线程：共享 Thread / 工具渲染 + 标准发送/取消 Composer，无自定义运行态。
+ * 待审批（HITL interrupt）时输入与发送禁用，审批面板仍是唯一恢复入口。 */
 import type { ComponentType, PropsWithChildren } from "react";
 import {
   AuiIf,
@@ -39,22 +40,28 @@ const STATIC_COMPONENTS: ThreadComponents = {
   ToolGroup: WorkspaceToolGroup,
 };
 
-/** 标准 Composer：中文占位、运行中锁输入并显示停止。 */
-function WorkspaceComposer() {
+/** 标准 Composer：中文占位、运行中锁输入并显示停止；待审批时同样锁定。 */
+function WorkspaceComposer({ approvalPending }: { approvalPending: boolean }) {
   const isRunning = useAuiState((s) => s.thread.isRunning);
+  const locked = isRunning || approvalPending;
   return (
     <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
       <div
         data-slot="aui_composer-shell"
         className="border-border/60 focus-within:border-border dark:border-muted-foreground/15 dark:focus-within:border-muted-foreground/30 flex w-full cursor-text flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) transition-[border-color]"
       >
+        {approvalPending && (
+          <p className="px-2.5 text-xs text-warning" role="status">
+            请先处理待审批工具调用
+          </p>
+        )}
         <ComposerPrimitive.Input
           placeholder="输入投研问题"
           className="aui-composer-input caret-primary placeholder:text-muted-foreground/60 max-h-48 min-h-10 w-full resize-none bg-transparent px-2.5 py-1 text-base leading-6 outline-none"
           rows={1}
           enterKeyHint="send"
           aria-label="Agent 消息"
-          disabled={isRunning}
+          disabled={locked}
         />
         <div className="aui-composer-action-wrapper relative flex items-center justify-end">
           <div className="flex items-center gap-1.5">
@@ -69,6 +76,7 @@ function WorkspaceComposer() {
                     size="icon"
                     className="aui-composer-send size-7 rounded-full"
                     aria-label="发送"
+                    disabled={locked}
                   />
                 }
               >
@@ -98,6 +106,6 @@ function WorkspaceComposer() {
   );
 }
 
-export function AgentThread() {
-  return <Thread components={STATIC_COMPONENTS} composer={<WorkspaceComposer />} />;
+export function AgentThread({ approvalPending = false }: { approvalPending?: boolean }) {
+  return <Thread components={STATIC_COMPONENTS} composer={<WorkspaceComposer approvalPending={approvalPending} />} />;
 }

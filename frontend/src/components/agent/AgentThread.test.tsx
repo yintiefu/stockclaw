@@ -44,3 +44,27 @@ describe("AgentThread", () => {
     expect(screen.queryByText(/Inspector/)).toBeNull();
   });
 });
+
+describe("AgentThread 待审批锁定", () => {
+  it("approvalPending 时输入与发送禁用并显示提示", () => {
+    render(
+      <TestAgentRuntimeProvider>
+        <AgentThread approvalPending />
+      </TestAgentRuntimeProvider>,
+    );
+    const input = screen.getByRole("textbox", { name: "Agent 消息" });
+    expect(input).toBeDisabled();
+    expect(screen.getByRole("button", { name: "发送", hidden: true })).toBeDisabled();
+    expect(screen.getByText("请先处理待审批工具调用")).toBeInTheDocument();
+  });
+
+  it("无待审批时保持可用且无提示", () => {
+    render(
+      <TestAgentRuntimeProvider>
+        <AgentThread approvalPending={false} />
+      </TestAgentRuntimeProvider>,
+    );
+    expect(screen.getByRole("textbox", { name: "Agent 消息" })).toBeEnabled();
+    expect(screen.queryByText("请先处理待审批工具调用")).toBeNull();
+  });
+});

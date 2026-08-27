@@ -51,3 +51,47 @@ describe("Agent page", () => {
     expect(screen.getByRole("region", { name: "MCP 工具审批" })).toHaveTextContent("暂无待审批工具调用");
   });
 });
+
+describe("Agent page 待审批 Composer 锁定", () => {
+  const hooks = vi.hoisted(() => ({
+    interrupts: [] as Array<{ id?: string; value?: unknown }>,
+  }));
+  vi.mock("@assistant-ui/react-langchain", () => ({
+    useLangChainInterrupts: () => hooks.interrupts,
+    useLangChainRespond: () => vi.fn(),
+  }));
+
+  const pendingInterrupt = () => [{
+    id: "interrupt-1",
+    value: {
+      action_requests: [
+        { name: "fixture_echo", args: { value: "x" }, description: "审批项" },
+      ],
+      review_configs: [
+        { action_name: "fixture_echo", allowed_decisions: ["approve", "reject"] },
+      ],
+    },
+  }];
+
+  it("存在待审批 interrupt 时 Composer 禁用而审批控件可用", () => {
+    window.matchMedia = vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() });
+    hooks.interrupts = pendingInterrupt() as never;
+    render(<Agent />);
+
+    expect(screen.getByLabelText("Agent 消息")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "发送", hidden: true })).toBeDisabled();
+    expect(screen.getByText("请先处理待审批工具调用")).toBeVisible();
+
+    const radio = screen.getByRole("radio", { name: "批准 fixture_echo" });
+    expect(radio).toBeEnabled();
+    expect(screen.getByRole("button", { name: "提交全部决定" })).toBeInTheDocument();
+  });
+
+  it("无 interrupt 时 Composer 行为不变", () => {
+    window.matchMedia = vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() });
+    hooks.interrupts = [];
+    render(<Agent />);
+    expect(screen.getByLabelText("Agent 消息")).toBeEnabled();
+    expect(screen.queryByText("请先处理待审批工具调用")).toBeNull();
+  });
+});
