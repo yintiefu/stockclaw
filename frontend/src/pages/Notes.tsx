@@ -7,7 +7,10 @@ import { GlassCard } from "@/components/ui/GlassCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
 import { WorkflowHistory } from "@/components/workflow/WorkflowHistory";
 import { useWorkflowRun } from "@/hooks/useWorkflowRun";
+import { stageContent, type WorkflowState } from "@/lib/agent/workflow-types";
 import { loadNotes, deleteNote, clearNotes, addNote, type Note } from "@/lib/notes";
+
+const EMPTY_STATE: WorkflowState = { workflow_status: "pending", stages: {} };
 
 const KIND_COLOR: Record<string, string> = {
   复盘: "bg-primary/15 text-primary",
@@ -27,7 +30,7 @@ export function Notes() {
   // 反思工作流：thread 按 subject=<note.id> 隔离，历史只挂在对应记录下。
   const run = useWorkflowRun({ assistantId: "reflection" });
   const reflecting = run.running;
-  const reflectText = run.state?.result ?? run.transient.reflection ?? "";
+  const reflectText = stageContent(run.state ?? EMPTY_STATE, "reflection") ?? run.transient.reflection ?? "";
   const reflectErr = run.error ?? "";
 
   async function runReflect(n: Note) {

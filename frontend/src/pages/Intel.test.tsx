@@ -1,26 +1,57 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  createWorkflowThread,
-  getWorkflowState,
-  searchWorkflowHistory,
-  startWorkflowRun,
-  type WorkflowStartOptions,
-} from "@/lib/agent/workflow-client";
-import type { WorkflowState } from "@/lib/agent/workflow-types";
+import { getWorkflowState, searchWorkflowHistory } from "@/lib/agent/workflow-client";
+import type { WorkflowState, WorkflowStatus } from "@/lib/agent/workflow-types";
 import { Intel } from "./Intel";
+
+// 页面唯一的消费面是 useWorkflowRun：替身直接驱动渲染。
+const runMock = vi.hoisted(() => {
+  const fields: {
+    threadId: string | null;
+    state: WorkflowState | null;
+    transient: Record<string, string>;
+    running: boolean;
+    status: WorkflowStatus;
+    error: string | null;
+  } = { threadId: null, state: null, transient: {}, running: false, status: "pending", error: null };
+  const listeners = new Set<() => void>();
+  const set = (patch: Partial<typeof fields>) => {
+    Object.assign(fields, patch);
+    for (const l of [...listeners]) l();
+  };
+  const reset = () => {
+    Object.assign(fields, { threadId: null, state: null, transient: {}, running: false, status: "pending", error: null });
+  };
+  const start = vi.fn(async () => ({ state: fields.state, error: fields.error }));
+  const stop = vi.fn(async () => {});
+  const retry = vi.fn(async () => {});
+  const restore = vi.fn(async () => {});
+  const remove = vi.fn(async () => {});
+  return { fields, listeners, set, reset, start, stop, retry, restore, remove };
+});
+
+vi.mock("@/hooks/useWorkflowRun", async () => {
+  const { useEffect, useState } = await import("react");
+  return {
+    useWorkflowRun: vi.fn(() => {
+      const [, bump] = useState(0);
+      useEffect(() => {
+        const l = () => bump((v) => v + 1);
+        runMock.listeners.add(l);
+        return () => { runMock.listeners.delete(l); };
+      }, []);
+      return { ...runMock.fields, start: runMock.start, stop: runMock.stop, retry: runMock.retry, restore: runMock.restore, remove: runMock.remove };
+    }),
+  };
+});
 
 vi.mock("@/lib/agent/workflow-client", () => ({
   createWorkflowThread: vi.fn(),
-  startWorkflowRun: vi.fn(),
-  cancelWorkflowRun: vi.fn(),
-  retryWorkflowRun: vi.fn(),
-  getEffectiveWorkflowDetail: vi.fn(),
-  getWorkflowState: vi.fn(),
-  reconnectWorkflowRun: vi.fn(),
   deleteWorkflowThread: vi.fn(),
+  getWorkflowState: vi.fn(),
+  getEffectiveWorkflowDetail: vi.fn(),
   searchWorkflowHistory: vi.fn(),
 }));
 
@@ -37,40 +68,17 @@ vi.mock("@/lib/watchlist", () => ({
   loadWatch: vi.fn(() => []),
 }));
 
-const mocked = {
-  createWorkflowThread: vi.mocked(createWorkflowThread),
-  startWorkflowRun: vi.mocked(startWorkflowRun),
-  searchWorkflowHistory: vi.mocked(searchWorkflowHistory),
-  getWorkflowState: vi.mocked(getWorkflowState),
-};
+const mocked = { searchWorkflowHistory: vi.mocked(searchWorkflowHistory), getWorkflowState: vi.mocked(getWorkflowState) };
 
 const digestText = "## 要点\n\n- AI 需求持续";
 
-function mockDigestRun() {
-  mocked.startWorkflowRun.mockImplementation(async (options: WorkflowStartOptions) => {
-    options.onRunCreated?.("run-n");
-    const checkpoint: WorkflowState = {
-      workflow_id: "news_digest",
-      workflow_status: "completed",
-      stages: { news_digest: { id: "news_digest", status: "completed", content: digestText } },
-      result: digestText,
-      result_summary: "提炼完成",
-    };
-    options.onState?.({
-      runId: "run-n",
-      lastSeq: 1,
-      currentStage: null,
-      transient: {},
-      dirtyStages: [],
-      dirtyRuns: [],
-      pendingCheckpointStages: [],
-      checkpoint,
-      checkpointRequired: false,
-      recoverableError: null,
-    });
-    return { threadId: options.threadId, runId: "run-n", stream: { checkpoint } as never };
-  });
-}
+const digestState = (): WorkflowState => ({
+  workflow_id: "news_digest",
+  workflow_status: "completed",
+  stages: { news_digest: { id: "news_digest", status: "completed", message_id: "m-n" } },
+  messages: [{ id: "m-n", content: digestText }],
+  result_summary: "提炼完成",
+});
 
 afterEach(() => {
   cleanup();
@@ -79,6 +87,7 @@ afterEach(() => {
 });
 
 beforeEach(() => {
+  runMock.reset();
   vi.mocked(api.radar).mockResolvedValue({
     generated_at: "2026-08-25 11:00",
     recent_days: 3,
@@ -101,9 +110,7 @@ beforeEach(() => {
       },
     ],
   } as never);
-  mocked.createWorkflowThread.mockResolvedValue("thread-n");
   mocked.searchWorkflowHistory.mockResolvedValue([]);
-  mockDigestRun();
 });
 
 async function renderIntelWithRadar() {
@@ -121,21 +128,20 @@ describe("Intel news digest workflow", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "让 AI 提炼今日要点" }));
 
-    await waitFor(() => expect(mocked.startWorkflowRun).toHaveBeenCalled());
-    expect(mocked.createWorkflowThread).toHaveBeenCalledWith("news_digest", {
-      title: "AI 算力 今日要点",
-      subject: "ai",
-      config_version: 1,
-    });
-    const call = mocked.startWorkflowRun.mock.calls[0]?.[0];
-    const snapshot = (call.input as { input: { news_snapshot?: string } }).input.news_snapshot;
-    expect(snapshot).toContain("AI news one");
-    expect(snapshot).toContain("AI news two");
-    expect(snapshot).not.toContain("Energy news");
+    await waitFor(() => expect(runMock.start).toHaveBeenCalled());
+    const params = runMock.start.mock.calls[0]?.[0];
+    expect(params?.metadata).toEqual({ title: "AI 算力 今日要点", subject: "ai" });
+    expect(params?.input.news_snapshot).toContain("AI news one");
+    expect(params?.input.news_snapshot).toContain("AI news two");
+    expect(params?.input.news_snapshot).not.toContain("Energy news");
   });
 
   it("renders the digest markdown with save-note preserved", async () => {
     await renderIntelWithRadar();
+    // 运行结束：outcome.state 经指针解析出正文（start 在 resolve 时读取当前 fields）
+    act(() => {
+      runMock.set({ threadId: "thread-n", state: digestState(), status: "completed" });
+    });
     await userEvent.click(screen.getByRole("button", { name: "让 AI 提炼今日要点" }));
 
     expect(await screen.findByText("AI 需求持续")).toBeInTheDocument();
@@ -153,8 +159,8 @@ describe("Intel news digest workflow", () => {
   });
 
   it("shows a terminal error when the digest fails", async () => {
-    mocked.startWorkflowRun.mockRejectedValueOnce(new Error("提炼失败"));
     await renderIntelWithRadar();
+    runMock.start.mockImplementation(async () => ({ state: null, error: "提炼失败" }));
 
     await userEvent.click(screen.getByRole("button", { name: "让 AI 提炼今日要点" }));
 
@@ -176,19 +182,14 @@ describe("Intel news digest workflow", () => {
         resultSummary: "历史要点",
       },
     ]);
-    mocked.getWorkflowState.mockResolvedValue({
-      workflow_id: "news_digest",
-      workflow_status: "completed",
-      stages: {},
-      result: digestText,
-      result_summary: "提炼完成",
-    } as WorkflowState);
+
+    mocked.getWorkflowState.mockResolvedValue(digestState());
 
     await renderIntelWithRadar();
 
     await userEvent.click(await screen.findByRole("button", { name: "查看" }));
 
-    expect(mocked.getWorkflowState).toHaveBeenCalledWith("thread-nh");
+    // onOpen 经 getState 拿到指针态，stageContent 解析出正文
     expect(await screen.findByText("AI 需求持续")).toBeInTheDocument();
   });
 });

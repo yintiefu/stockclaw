@@ -42,7 +42,7 @@ export function useWorkflowStream(
   const progressRef = useRef(onDossierProgress);
   progressRef.current = onDossierProgress;
 
-  const controller = (stream as Record<symbol, unknown>)[STREAM_CONTROLLER] as
+  const controller = (stream as unknown as Record<symbol, unknown>)[STREAM_CONTROLLER] as
     | { registry: Parameters<typeof acquireChannelEffect>[0] }
     | undefined;
   useEffect(() => {
@@ -56,7 +56,7 @@ export function useWorkflowStream(
     });
   }, [controller]);
 
-  const state = (stream.values ?? {}) as WorkflowState;
+  const state = (stream.values ?? {}) as unknown as WorkflowState;
   const transient = useMemo(() => {
     const claimed = new Set(
       Object.values(state.stages ?? {})

@@ -51,8 +51,8 @@ const asWorkflowStatus = (value: unknown): WorkflowStatus => {
 
 function projectThread(thread: Thread<WorkflowState>): WorkflowThreadProjection {
   const metadata = isRecord(thread.metadata) ? thread.metadata : {};
-  const extracted = isRecord(thread.extracted) ? thread.extracted : {};
-  const values = isRecord(thread.values) ? thread.values : {};
+  const extracted = isRecord(thread.extracted) ? thread.extracted : {} as Record<string, unknown>;
+  const values = isRecord(thread.values) ? thread.values : {} as Record<string, unknown>;
   const workflowStatus = asWorkflowStatus(extracted.workflow_status ?? values.workflow_status);
   return {
     threadId: thread.thread_id,

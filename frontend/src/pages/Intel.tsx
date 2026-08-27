@@ -9,9 +9,12 @@ import { Disclaimer } from "@/components/ui/Disclaimer";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
 import { WorkflowHistory } from "@/components/workflow/WorkflowHistory";
 import { useWorkflowRun } from "@/hooks/useWorkflowRun";
+import { stageContent, type WorkflowState } from "@/lib/agent/workflow-types";
 import { api, ApiError, type RadarData, type Industry, type Announcement, type NewsItem } from "@/lib/api";
 import { loadWatch } from "@/lib/watchlist";
 import { cn } from "@/lib/utils";
+
+const EMPTY_STATE: WorkflowState = { workflow_status: "pending", stages: {} };
 
 const TABS = [
   { key: "events", label: "事件概率", icon: TrendingUp, integrated: false, desc: "全球宏观预期概率（公开数据、免登录只读），后续接入" },
@@ -61,7 +64,7 @@ function InvestmentNewsPanel() {
     if (outcome.error) {
       setDigests((d) => ({ ...d, [ind.key]: { err: outcome.error ?? "生成失败" } }));
     } else {
-      setDigests((d) => ({ ...d, [ind.key]: { text: outcome.state?.result ?? "" } }));
+      setDigests((d) => ({ ...d, [ind.key]: { text: stageContent(outcome.state ?? EMPTY_STATE, "news_digest") ?? "" } }));
     }
     setRunIndustry(null);
     setHistoryKeys((k) => ({ ...k, [ind.key]: (k[ind.key] ?? 0) + 1 }));
@@ -81,7 +84,7 @@ function InvestmentNewsPanel() {
   const isRunning = runIndustry != null && runIndustry === cur?.key;
   const dg = digests[cur?.key ?? ""];
   const digestText = isRunning
-    ? (digestRun.state?.result ?? digestRun.transient.news_digest ?? "")
+    ? (stageContent(digestRun.state ?? EMPTY_STATE, "news_digest") ?? digestRun.transient.news_digest ?? "")
     : dg?.text ?? "";
   const digestErr = isRunning ? null : dg?.err ?? null;
 
@@ -170,7 +173,7 @@ function InvestmentNewsPanel() {
                     subject={cur.key}
                     refreshKey={historyKeys[cur.key] ?? 0}
                     onOpen={(_thread, state) => {
-                      setDigests((d) => ({ ...d, [cur.key]: { text: state.result ?? "" } }));
+                      setDigests((d) => ({ ...d, [cur.key]: { text: stageContent(state ?? EMPTY_STATE, "news_digest") ?? "" } }));
                     }}
                     onRerun={(_thread, state) => {
                       const snapshot = typeof state.input?.news_snapshot === "string"
@@ -183,7 +186,7 @@ function InvestmentNewsPanel() {
                         if (outcome.error) {
                           setDigests((d) => ({ ...d, [cur.key]: { err: outcome.error ?? "生成失败" } }));
                         } else {
-                          setDigests((d) => ({ ...d, [cur.key]: { text: outcome.state?.result ?? "" } }));
+                          setDigests((d) => ({ ...d, [cur.key]: { text: stageContent(outcome.state ?? EMPTY_STATE, "news_digest") ?? "" } }));
                         }
                         setHistoryKeys((k) => ({ ...k, [cur.key]: (k[cur.key] ?? 0) + 1 }));
                       });

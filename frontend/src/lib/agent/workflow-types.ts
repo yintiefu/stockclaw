@@ -125,5 +125,11 @@ export function parseDossierProgress(payload: unknown): DossierProgressEvent | n
   if (typeof section_id !== "string" || !section_id
     || typeof section_status !== "string" || !DOSSIER_STATUSES.has(section_status)
     || !Number.isInteger(completed) || !Number.isInteger(total)) return null;
-  return { type: "dossier.progress", section_id, section_status, completed, total };
+  return {
+    type: "dossier.progress",
+    section_id,
+    section_status: section_status as DossierProgressEvent["section_status"],
+    completed: completed as number,
+    total: total as number,
+  };
 }
