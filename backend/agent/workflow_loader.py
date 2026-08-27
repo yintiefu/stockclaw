@@ -11,12 +11,6 @@ import yaml
 
 import tools as legacy_tools
 from agent.skill_backends import BUILTIN_SKILLS_DIR
-from agent.tool_executor import (
-    EASTMONEY_SERIAL_TOOLS,
-    PARALLEL_SAFE_TOOLS,
-    ToolExecutionPolicy,
-    tool_policy,
-)
 
 HARD_LIMITS: dict[str, int] = {
     "section_chars": 4000,
@@ -26,25 +20,9 @@ HARD_LIMITS: dict[str, int] = {
     "max_chars": 60000,
 }
 
-DEBATE_DOSSIER_CONTRACT: tuple[
-    tuple[str, str, dict[str, Any], str, ToolExecutionPolicy], ...
-] = (
-    ("quote", "query_quote", {"codes": ["${input.code}"]}, "gap_if_empty", ToolExecutionPolicy.PARALLEL_SAFE),
-    ("valuation", "query_valuation", {"code": "${input.code}"}, "gap_if_empty", ToolExecutionPolicy.EASTMONEY_SERIAL),
-    ("valuation_percentile", "query_valuation_percentile", {"code": "${input.code}"}, "gap_if_empty", ToolExecutionPolicy.PARALLEL_SAFE),
-    ("financials", "query_financials", {"code": "${input.code}"}, "gap_if_empty", ToolExecutionPolicy.PARALLEL_SAFE),
-    ("kline", "query_kline", {"code": "${input.code}", "count": 60}, "gap_if_empty", ToolExecutionPolicy.PARALLEL_SAFE),
-    ("fund_flow", "query_fund_flow", {"code": "${input.code}", "days": 5}, "gap_if_empty", ToolExecutionPolicy.EASTMONEY_SERIAL),
-    ("margin", "query_margin", {"code": "${input.code}"}, "allow_no_record", ToolExecutionPolicy.EASTMONEY_SERIAL),
-    ("holders", "query_holders", {"code": "${input.code}"}, "allow_no_record", ToolExecutionPolicy.EASTMONEY_SERIAL),
-    ("announcements", "query_announcements", {"code": "${input.code}"}, "allow_no_record", ToolExecutionPolicy.PARALLEL_SAFE),
-    ("lockup", "query_lockup", {"code": "${input.code}"}, "allow_no_record", ToolExecutionPolicy.EASTMONEY_SERIAL),
-    ("concepts", "query_concepts", {"code": "${input.code}"}, "gap_if_empty", ToolExecutionPolicy.EASTMONEY_SERIAL),
-    ("reports", "query_reports", {"code": "${input.code}"}, "allow_no_record", ToolExecutionPolicy.PARALLEL_SAFE),
-    ("news", "query_news", {"code": "${input.code}"}, "allow_no_record", ToolExecutionPolicy.PARALLEL_SAFE),
-)
-
-DEBATE_DOSSIER_TOOLS = tuple((section_id, tool) for section_id, tool, _, _, _ in DEBATE_DOSSIER_CONTRACT)
+# debate 的 13 项底稿固定契约不在运行时校验：防回归不变量由
+# tests/agent/test_workflow_loader.py 的契约测试在 CI 阶段兜底，
+# 加载器只负责通用 schema 校验（工具注册名、参数引用、预算上限等）。
 
 _INPUT_REFERENCE_RE = re.compile(r"^\$\{input\.([A-Za-z_][A-Za-z0-9_]*)\}$")
 _BUILTIN_SKILL_RE = re.compile(r"^builtin/[a-z0-9][a-z0-9-]*$")
@@ -255,20 +233,6 @@ def _validate_staged_config(cfg: StagedResearchConfig, skills_root: Path) -> Non
                 raise _config_error(path, "input 参数必须是完整引用 ${input.<field>}")
             if match.group(1) not in cfg.input:
                 raise _config_error(path, "input 引用指向未声明字段")
-
-    if cfg.id == "debate":
-        actual_contract = tuple(
-            (section.id, section.tool, section.args, section.empty_policy, tool_policy(section.tool))
-            for section in cfg.dossier.sections
-        )
-        if actual_contract != DEBATE_DOSSIER_CONTRACT:
-            raise _config_error(
-                "dossier.sections",
-                "debate 必须严格使用固定 13 项工具、参数、空值策略与执行策略",
-            )
-        contract_tools = {tool for _, tool, _, _, _ in DEBATE_DOSSIER_CONTRACT}
-        if contract_tools != set(EASTMONEY_SERIAL_TOOLS) | set(PARALLEL_SAFE_TOOLS):
-            raise _config_error("dossier.sections", "debate 工具契约与执行器白名单不一致")
 
     stage_ids = [stage.id for stage in cfg.stages]
     if not stage_ids:

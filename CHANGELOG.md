@@ -3,6 +3,15 @@
 本项目的版本号唯一来源是 `frontend/package.json`；后端 HTTP API、`/api/health`、
 前端界面与 MCP `serverInfo` 全部从它读取（见 `backend/version.py`）。
 
+## 未发布 — 2026-08-27：精简 Agent 自定义面（重构迭代第一轮）
+
+- 删除遗留死代码 `agent/client.py`（自研 SSE 客户端）及其测试：旧 FastAPI AI 路由
+  （`/api/chat` 等）下线后已无任何生产调用方，前端直连 LangGraph Server。
+- debate 底稿 13 项固定契约（工具、参数、空值策略、执行策略）从 `workflow_loader`
+  的运行时校验外移为 pytest 契约测试：加载器只做通用 schema 校验，防回归不变量由
+  `tests/agent/test_workflow_loader.py` 的契约比对在 CI 兜底；同时解除 loader 对
+  `tool_executor` 的反向依赖。
+
 ## 未发布 — 2026-08-24：Agent 思考过程展示（thinking 开关）
 
 - `settings.json` 的 `model.thinking`（默认 `false`）：开启后请求带上游思考参数，模型
