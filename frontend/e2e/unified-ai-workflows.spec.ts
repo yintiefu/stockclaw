@@ -1,13 +1,15 @@
-// Task 13 统一 LangGraph AI 工作流浏览器验收（隔离、确定性、零真实网络/模型/数据源）。
+// 统一 LangGraph AI 工作流浏览器验收 v2（隔离、确定性、零真实网络/模型/数据源）。
 //
 // 三个隔离服务（FastAPI :8873 / LangGraph :2873 / Vite :5873）由 playwright.config 启动：
 // - LangGraph 六图全部来自 tests/agent_e2e/unified_graphs.py（脚本化模型 + 假工具）；
+// - 工作流断言走 v2 契约：values = 状态机、messages = 阶段正文（StageResult.message_id
+//   指针）、custom = 底稿进度；重试 = {resume: true} 经后端 entry 版本门控 + auto_resume 路由；
 // - FastAPI 数据接口在页面级用 route.abort() 掐断（页面自带优雅降级），资讯雷达用固定 JSON；
 // - 断言全程没有任何 /api/chat、/api/debate、/api/reflect 流量，浏览器请求不带模型密钥。
 //
 // 服务重启说明：langgraph dev 是内存运行时——thread 元数据落盘，checkpoint 不落盘。
 // 重启场景按真实行为断言：历史列表仍在、丢态行派生为「已中断」而非永久「生成中」、
-// 新 run 可继续发起。checkpoint 级恢复由「刷新页面恢复」场景覆盖（同进程权威 checkpoint）。
+// 新 run 可继续发起。checkpoint 级恢复由「运行中刷新」场景覆盖（同进程权威 checkpoint）。
 import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
 
@@ -161,7 +163,18 @@ test("嵌入式问答按 scope 持久化、更新快照版本、恢复、隔离�
 });
 
 // ---------------------------------------------------------------- T3 辩论 standard
-test("standard 辩论展示配置阶段与数据缺口，历史可恢复、重跑开新 thread", async ({ page }) => {
+// 选择器依据（真实 DOM，勿凭记忆改）：
+// - WorkflowHistory 列表常驻渲染，没有「历史」按钮；标题区刷新按钮 title="刷新历史"
+//   ——getByRole("button", { name: /历史/ }) 会误中它，禁止使用；
+// - 行内动作按钮：「查看」「重新运行」（RotateCcw 图标+文本）、删除（aria-label）；
+// - 行标题 = metadata.title（Debate 发起时写「多空辩论 · <code>」）；
+// - Debate 页按钮：「开始辩论」「中止」（仅 running）「从失败阶段重试」
+//   （仅 status∈{failed,interrupted,cancelled} 且非 running）。
+const historyRow = (page: Page, title: string) =>
+  page.locator("li", { hasText: title }).first();
+
+// T3 standard 辩论：values 驱动阶段 + 正文经指针渲染
+test("standard 辩论按状态机推进，裁判正文可恢复", async ({ page }) => {
   await blockDataApi(page);
   await page.goto("/debate");
   await page.getByPlaceholder("6 位代码，如 600519").fill("600519");
@@ -171,21 +184,20 @@ test("standard 辩论展示配置阶段与数据缺口，历史可恢复、重�
   await expect(page.getByText("空方脚本观点").first()).toBeVisible({ timeout: 60_000 });
   await expect(page.getByText(/中立主持脚本归纳/).first()).toBeVisible({ timeout: 60_000 });
   await expect(page.getByText(/未取到：板块与概念归属/)).toBeVisible();
-  // 中立边界：不出现任何胜负裁决文案
+
+  // 中立边界（产品硬边界，重写时不得删除）：不出现任何胜负裁决文案
   for (const banned of [page.getByText(/赢家/), page.getByText(/获胜/), page.getByText(/多方胜/)]) {
     await expect(banned).toHaveCount(0);
   }
-  // 历史行出现
-  await expect(page.getByText("多空辩论 · 600519").first()).toBeVisible({ timeout: 15_000 });
 
-  // 刷新后历史仍在，打开即从 checkpoint 恢复完整阶段
+  // 刷新恢复：历史列表常驻，「查看」触发 run.restore → v2 hydrate 装载 checkpoint
   await page.reload();
-  await expect(page.getByText("多空辩论 · 600519").first()).toBeVisible({ timeout: 15_000 });
-  await page.getByRole("button", { name: "查看" }).first().click();
+  await page.goto("/debate");
+  await historyRow(page, "多空辩论 · 600519").getByRole("button", { name: "查看" }).click();
   await expect(page.getByText(/中立主持脚本归纳/).first()).toBeVisible({ timeout: 15_000 });
 
-  // 重新运行 = 新 thread，旧结果保留（出现两条历史）
-  await page.getByRole("button", { name: "重新运行" }).first().click();
+  // 重新运行 = 新 thread，旧结果保留（两条历史）
+  await historyRow(page, "多空辩论 · 600519").getByRole("button", { name: "重新运行" }).click();
   await expect(page.getByText("多方脚本观点").first()).toBeVisible({ timeout: 60_000 });
   await expect(async () => {
     const threads = await searchThreads({ channel: "workflow", workflow_type: "debate", subject: "600519" });
@@ -207,72 +219,56 @@ test("cross_exam 辩论执行五个配置阶段（含交叉反驳）", async ({ 
   await expect(page.getByText(/中立主持脚本归纳/).first()).toBeVisible({ timeout: 60_000 });
 });
 
-// ---------------------------------------------------------------- T5 停止 + 从失败阶段重试
-test("辩论可中止并从失败阶段重试，不重放已完成阶段", async ({ page }) => {
+// ---------------------------------------------------------------- T5 停止 + resume（不重放已完成阶段，按内容计数，不按 id）
+test("辩论可中止并经 resume 从失败阶段继续，已完成阶段不重放", async ({ page }) => {
   await blockDataApi(page);
   await page.goto("/debate");
   await page.getByPlaceholder("6 位代码，如 600519").fill("600519");
   await page.getByRole("button", { name: "开始辩论" }).click();
-  // 阶段模型带 1.5s 延迟：首个阶段出现后立即中止
-  await expect(page.getByText("生成中…").first()).toBeVisible({ timeout: 30_000 });
-  await page.getByRole("button", { name: "中止" }).click();
+  await expect(page.getByText("多方脚本观点").first()).toBeVisible({ timeout: 60_000 });
 
-  await expect(page.getByRole("button", { name: /从失败阶段重试/ })).toBeVisible({ timeout: 30_000 });
-  await page.getByRole("button", { name: /从失败阶段重试/ }).click();
-  await expect(page.getByText(/中立主持脚本归纳/).first()).toBeVisible({ timeout: 90_000 });
+  await page.getByRole("button", { name: "中止" }).click();
+  // stop() 内部会轮询到线程脱离 busy 才返回（≤10s），页面 finally 里的 historyKey
+  // 自增发生在其后——badge「已中断」与重试按钮的出现是确定性的，不存在竞态。
+  await expect(page.getByRole("button", { name: "从失败阶段重试" })).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText("已中断").first()).toBeVisible({ timeout: 15_000 });
+
+  await page.getByRole("button", { name: "从失败阶段重试" }).click();
+  await expect(page.getByText(/中立主持脚本归纳/).first()).toBeVisible({ timeout: 60_000 });
+
+  const threads = await searchThreads({ channel: "workflow", workflow_type: "debate" });
+  const state = await threadState(threads[0].thread_id);
+  const contents = (state.values.messages ?? []).map((m: { content: unknown }) =>
+    typeof m.content === "string" ? m.content : JSON.stringify(m.content));
+  expect(contents.filter((c: string) => c.includes("多方脚本观点"))).toHaveLength(1);  // bull 未重放
+  expect(state.values.stages.referee.status).toBe("completed");
+  expect(state.values.input).toEqual({ code: "600519" });  // resume 不覆写 input
+  expect(state.values.stages.bull.message_id).toBeTruthy();
 });
 
-// ---------------------------------------------------------------- T6 序号缺口与重复
-test("重复序号事件被幂等忽略，序号缺口清空临时文本等待 checkpoint", async ({ page }) => {
+// ---------------------------------------------------------------- T6 运行中刷新
+// 断开只停本地，Server run 跑完，重开 hydrate 完整恢复；
+// 且陈旧 busy 不得让页面永远「生成中」（C2 回归）
+test("运行中刷新页面后重开历史，完整结果从 checkpoint 恢复", async ({ page }) => {
   await blockDataApi(page);
-  // 合成 SSE：seq 1 状态、2 阶段开始、3 增量、3 重复增量、5 缺口增量（4 缺失）
-  const sse = [
-    'event: metadata\ndata: {"run_id": "run-synthetic-seq"}\n\n',
-    'event: custom\ndata: ' + JSON.stringify({
-      type: "workflow.status", workflow_id: "debate", run_id: "run-synthetic-seq", seq: 1,
-      emitted_at: "2026-08-25T12:00:00Z", status: "running", message: "工作流已启动",
-    }) + "\n\n",
-    'event: custom\ndata: ' + JSON.stringify({
-      type: "stage.started", workflow_id: "debate", run_id: "run-synthetic-seq", seq: 2,
-      emitted_at: "2026-08-25T12:00:01Z", stage_id: "bull", label: "多方研究员",
-    }) + "\n\n",
-    'event: custom\ndata: ' + JSON.stringify({
-      type: "stage.delta", workflow_id: "debate", run_id: "run-synthetic-seq", seq: 3,
-      emitted_at: "2026-08-25T12:00:02Z", stage_id: "bull", delta: "不应残留的临时文本",
-    }) + "\n\n",
-    'event: custom\ndata: ' + JSON.stringify({
-      type: "stage.delta", workflow_id: "debate", run_id: "run-synthetic-seq", seq: 3,
-      emitted_at: "2026-08-25T12:00:03Z", stage_id: "bull", delta: "重复事件",
-    }) + "\n\n",
-    'event: custom\ndata: ' + JSON.stringify({
-      type: "stage.delta", workflow_id: "debate", run_id: "run-synthetic-seq", seq: 5,
-      emitted_at: "2026-08-25T12:00:04Z", stage_id: "bull", delta: "缺口后增量",
-    }) + "\n\n",
-  ].join("");
-  await page.route("**/agent-api/**runs/stream*", (route) => {
-    // onRunCreated 由 Content-Location 响应头触发（与真实 LangGraph Server 一致）
-    const tid = new URL(route.request().url()).pathname.match(/threads\/([^/]+)\//)?.[1] ?? "unknown";
-    return route.fulfill({
-      status: 200,
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Content-Location": `/threads/${tid}/runs/run-synthetic-seq`,
-      },
-      body: sse,
-    });
-  });
-
   await page.goto("/debate");
   await page.getByPlaceholder("6 位代码，如 600519").fill("600519");
   await page.getByRole("button", { name: "开始辩论" }).click();
+  await expect(page.getByText("多方脚本观点").first()).toBeVisible({ timeout: 60_000 });
 
-  // 缺口触发：临时文本被清空、不再拼接、回到 Loading
-  await expect(page.getByText("多方研究员", { exact: true })).toBeVisible({ timeout: 15_000 });
-  await expect(page.getByText("不应残留的临时文本")).toHaveCount(0);
-  await expect(page.getByText("重复事件")).toHaveCount(0);
-  await expect(page.getByText("缺口后增量")).toHaveCount(0);
-  await expect(page.getByText("生成中…").first()).toBeVisible();
-  await page.unroute("**/agent-api/**runs/stream*");
+  await page.reload();  // 杀页面连接；fixture 服务端继续跑完
+  await page.goto("/debate");
+  // 服务端可能仍在跑：反复打开历史行（restore 幂等），直到 run 跑完
+  await expect(async () => {
+    await historyRow(page, "多空辩论 · 600519")
+      .getByRole("button", { name: "查看" }).click({ timeout: 2_000 });
+    await expect(page.getByText(/中立主持脚本归纳/).first()).toBeVisible({ timeout: 5_000 });
+  }).toPass({ timeout: 90_000 });
+
+  // C2 断言：attached run 已完成 → 中止按钮与「生成中」标记都必须消失，
+  // 不能只看正文出现（正文可见 ≠ running 复位）。
+  await expect(page.getByRole("button", { name: "中止" })).toHaveCount(0);
+  await expect(page.getByText("生成中…")).toHaveCount(0);
 });
 
 // ---------------------------------------------------------------- T7 取消孤儿 → interrupted
@@ -396,38 +392,30 @@ test("设置页只读展示脱敏配置状态与占位模板，不出现密钥�
   await expect(page.getByPlaceholder(/VR_API_KEY/)).toBeVisible();
 });
 
-// ---------------------------------------------------------------- T11 配置版本不兼容
-test("配置版本不兼容的历史只允许查看，不提供恢复入口", async ({ page }) => {
+// ---------------------------------------------------------------- T11 版本门控（后端持有）
+// 篡改 config_version 后 UI 触发 resume 被拒。
+// 注意：重试按钮仅在 status∈{failed,interrupted,cancelled} 时渲染——篡改时必须
+// 同时把 workflow_status 写成 "failed"，否则按钮不出现、场景无法驱动。
+test("配置版本不兼容的历史允许查看但 resume 被后端拒绝", async ({ page }) => {
   await blockDataApi(page);
-  const incompatible = await createThread({
-    channel: "workflow", workflow_type: "debate",
-    title: "E2E 旧版本辩论", subject: "600519", config_version: 99,
-  });
-  // 新 thread 必须先跑过一次才有 graph id；完整跑完后回写「旧版本失败」形状
-  await lg(`/threads/${incompatible}/runs/wait`, {
+  await page.goto("/debate");
+  await page.getByPlaceholder("6 位代码，如 600519").fill("600519");
+  await page.getByRole("button", { name: "开始辩论" }).click();
+  await expect(page.getByText(/中立主持脚本归纳/).first()).toBeVisible({ timeout: 60_000 });
+
+  const threads = await searchThreads({ channel: "workflow", workflow_type: "debate" });
+  await lg(`/threads/${threads[0].thread_id}/state`, {
     method: "POST",
-    body: JSON.stringify({
-      assistant_id: "debate",
-      input: { input: { code: "600519" }, variant: "standard" },
-    }),
-  });
-  await lg(`/threads/${incompatible}/state`, {
-    method: "POST",
-    body: JSON.stringify({
-      values: {
-        workflow_id: "debate", workflow_status: "failed", config_version: 99,
-        stages: { bull: { id: "bull", status: "failed", content: null } },
-      },
-    }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ values: { config_version: 999, workflow_status: "failed" } }),
   });
 
+  await page.reload();
   await page.goto("/debate");
-  await expect(page.getByText("E2E 旧版本辩论")).toBeVisible({ timeout: 15_000 });
-  await expect(page.getByText("失败").first()).toBeVisible();
-  // 打开只允许查看；恢复入口存在但拒绝不兼容版本（不静默用新配置续跑旧 checkpoint）
-  await page.getByRole("button", { name: "查看" }).first().click();
-  await page.getByRole("button", { name: /从失败阶段重试/ }).click();
-  await expect(page.getByText(/配置版本不兼容|重新发起/).first()).toBeVisible({ timeout: 15_000 });
+  await historyRow(page, "多空辩论 · 600519").getByRole("button", { name: "查看" }).click();
+  await page.getByRole("button", { name: "从失败阶段重试" }).click();
+  // 后端 entry 抛「配置版本不兼容」→ run failed → 页面错误横幅（errorText）
+  await expect(page.getByText(/配置版本不兼容/).first()).toBeVisible({ timeout: 15_000 });
 });
 
 // ---------------------------------------------------------------- T12 服务重启（内存运行时真实行为）
