@@ -2,7 +2,7 @@
 
 **日期：** 2026-08-27
 
-**状态：** 已完成第一轮对抗性评审修订，待用户复审
+**状态：** 已完成第二轮对抗性评审修订，待用户复审
 
 ## 1. 背景
 
@@ -128,6 +128,10 @@ Vibe-Research 已经有两类 Agent Skills：
 `~/.vibe-research/agent/skills.disabled`。两个目录位于同一文件系统，使启停可以使用
 `os.replace` 原子移动。停用目录不挂载到 `/user/`，模型无法列出或读取其中内容。
 
+路径派生前统一执行 `expanduser().resolve()`。解析后的 `skills.path` 若满足
+`resolved_path.parent == resolved_path`（POSIX `/` 或 Windows 卷根），直接判为无效设置；不以
+fallback 名称在文件系统根旁创建停用目录，也不允许管理 API 把整个卷当作技能根。
+
 用户直接放入活动根的合法技能视为已启用；直接放入停用根的合法技能视为已停用。管理 API
 不维护第二份 JSON 索引，目录位置就是启停状态的唯一事实来源。
 
@@ -137,6 +141,12 @@ Vibe-Research 已经有两类 Agent Skills：
 也在进程内首次初始化时读取并固化同一份设置，后续请求不得热读出另一个根。修改
 `settings.json` 后必须同时重启两个服务，设置页继续显示 `restart_required: true`。开发脚本
 负责成对重启，文档不得暗示只重启一侧即可生效。
+
+FastAPI 的读取请求继续使用进程内快照。每次导入、启停或删除在持有管理锁后、落盘前，重新
+读取磁盘 `settings.json` 中的 `skills.path`，按相同规则解析并与快照比较；配置缺失、无效或
+路径不一致时返回 `409`：“Agent 技能路径设置已变更，请先重启 FastAPI 与 LangGraph Server
+后再管理技能”，且不得触碰旧根或新根。此检查只防止重启窗口内误写旧目录，不把其他设置热
+加载进当前进程，也不宣称协调外部进程直接修改文件的分布式事务。
 
 有效设置指向尚不存在的 `skills.path` 时，设置加载器以 `0700` 创建活动根，技能管理器同样
 创建停用根。创建失败、路径不是目录或不可读写时，用户技能功能不可用。配置文件缺失或整体
@@ -159,8 +169,9 @@ FastAPI 进程的自托管模型设计，不宣称支持多 worker 分布式锁�
 
 模块边界如下：
 
-- `agent/skill_catalog.py`：项目自有的公开严格校验器与只读 overlay。它只使用公开依赖 API，
-  不 import Deep Agents 的 `_parse_skill_metadata`、`_validate_skill_name` 或其他私有 helper。
+- `agent/skill_catalog.py`：项目自有的公开严格校验器与实现 `BackendProtocol` 读取合同的过滤
+  backend。它只使用公开依赖 API，不 import Deep Agents 的 `_parse_skill_metadata`、
+  `_validate_skill_name`、`_list_skills` 或其他私有 helper。
 - `skillmgr.py`：FastAPI 使用的磁盘管理层，负责导入、枚举、启停、删除、锁和原子操作。
 - `agent/skill_reload.py`：`α-mind` 使用的可重载 Skills middleware 与命令文本提取。
 - `agent/skill_backends.py`：把经过严格 overlay 的内置和用户 backend 分别挂到
@@ -224,15 +235,22 @@ Deep Agents 0.7.7 的默认 loader 有两项不能直接作为本项目安全边
 技能覆盖前者，且 `name` 与目录名不一致时只 warning、仍返回 metadata。因此运行时不能把
 原始用户 FilesystemBackend 直接交给 `SkillsMiddleware`。
 
-`agent/skill_catalog.py` 提供项目自有的严格解析器和动态只读 overlay：
+`agent/skill_catalog.py` 提供项目自有的严格解析器和动态只读过滤 backend：
 
 - 严格解析器按钉住的 Agent Skills 合同校验 frontmatter、名称与目录名，不合规则不产生可
   加载 metadata；它不调用 Deep Agents 私有 helper。
-- 内置和用户 source 都经 overlay 在 `ls`、`read` 和 `download_files` 时生成严格目录视图，
-  只暴露格式合法的技能子树；用户视图再排除与内置名称冲突的目录。被阻止目录不能从
-  `/user/` 直接读取，格式损坏的内置目录也不能被宽松加载。
+- 内置和用户 source 都经该 backend 包装，不能把原始 `FilesystemBackend` 直接挂到
+  `CompositeBackend`。它在 `ls`、`read`、`download_files` 及其异步等价路径执行相同的路径
+  授权：根目录只列出严格有效的技能目录；其他请求规范化虚拟路径后，其首个目录分量必须在
+  当时严格校验通过的集合中，否则统一表现为文件不存在。用户视图再排除与内置名称冲突的
+  目录。
+- 授权不能只检查请求字符串。过滤 backend 必须拒绝符号链接技能根，并在每次文件操作时确认
+  解析后的物理目标仍位于获准技能目录内，防止获准目录中的链接跳入同一活动根下的无效或
+  冲突目录。被阻止目录不能通过 `/user/` 的 `ls`、`read_file` 或 Skills 内部批量下载读取；
+  格式损坏的内置目录也不能被宽松加载。
 - 新会话初次加载和 `/reload-skills` 才会触发 overlay 枚举；已有会话的普通消息沿用缓存，
-  不产生每轮扫描。
+  不产生每轮扫描。模型实际调用 `ls`/`read_file` 时仍执行上述单次工具访问授权，这属于文件
+  工具的安全边界，不是每轮后台刷新或版本比较。
 - `SkillsMiddleware.sources` 调整为 `["/user/", "/builtin/"]`，利用 later-wins 让内置技能
   具有最终优先级；严格 overlay 同时剔除同名用户目录，形成双重防线。
 - 直接丢入活动根的同名或无效技能只出现在管理 API 的“已阻止”诊断中，不进入技能提示，
@@ -258,6 +276,10 @@ Deep Agents 默认 `SKILLS_SYSTEM_PROMPT` 中的 “Executing Skill Scripts” �
 校验规则：
 
 - 使用 `agent/skill_catalog.py` 的公开严格解析器；管理 API 与运行时 overlay 共享该合同。
+- frontmatter 强制使用 PyYAML `yaml.safe_load()`，禁止 `yaml.load()`、`FullLoader` 或自定义
+  Python 对象构造器。调用 `safe_load()` 前先扫描 YAML token 并拒绝任何 anchor 或 alias，
+  防止递归/指数别名结构造成资源耗尽；`safe_load()` 本身只负责阻止不安全对象标签，不能被
+  当作 Billion Laughs 防护。
 - `name`、`description` 必填，目录名必须与 `name` 一致。
 - `name`、`description`、`compatibility` 和可选 metadata/allowed-tools 必须满足钉住的 Agent
   Skills 长度与类型合同；超限一律拒绝，不采用 Deep Agents 的截断或 warn-and-load 行为。
@@ -284,16 +306,23 @@ Deep Agents 默认 `SKILLS_SYSTEM_PROMPT` 中的 “Executing Skill Scripts” �
 
 当前 Deep Agents `SkillsMiddleware` 会把 `skills_metadata` 缓存在会话 checkpoint 中，后续
 运行不再加载。为避免每轮扫描或版本比较，`agent/skill_reload.py` 提供
-`ReloadableSkillsMiddleware`，复用公开 `SkillsMiddleware` 的正常加载入口和第 7 节严格
-overlay，不复制或 import Deep Agents 的私有枚举函数：
+`ReloadableSkillsMiddleware`，复用公开 `SkillsMiddleware.before_agent()` 的正常加载入口和
+第 7 节严格 overlay，不复制或 import Deep Agents 的私有枚举函数：
 
 - 新会话没有技能缓存时，按现有行为加载内置根与用户活动根。
 - 已有会话继续使用缓存，不检查磁盘版本。
 - 命令识别只查看最后一条 `HumanMessage`。字符串 content 直接取值；block content 仅在所有
   block 都是 `{ type: "text", text: string }` 时按顺序拼接。存在图片、文件或未知 block 时不
   识别为命令。提取文本去除首尾空白后必须精确等于 `/reload-skills`。
-- 命中后删除传给正常 loader 的旧 `skills_metadata`/`skills_load_errors` 视图，强制重新枚举
-  严格 `/user/` 与 `/builtin/`，再以新结果替换当前会话缓存。
+- 命中后构造不含旧 `skills_metadata`/`skills_load_errors` 的浅 state 副本，并在自身 hook 中
+  调用 `super().before_agent(...)` 强制重新枚举严格 `/user/` 与 `/builtin/`；异步 hook 必须
+  对称地调用公开的 `super().abefore_agent(...)`，不能让 LangGraph Server 的异步执行路径绕过
+  命令。禁止直接调用 Deep Agents 模块级私有 `_list_skills`、`_alist_skills` 或对应的
+  `_with_errors` 变体。
+- `skills_metadata` 与 `skills_load_errors` 都是 `PrivateStateAttr` 且没有 `add` reducer，因此
+  hook 直接返回完整新列表即可覆盖旧值；即使本次没有加载错误，也必须显式返回
+  `skills_load_errors: []`，避免上次错误残留。该更新同时包含确定性 `AIMessage` 和
+  `jump_to: "end"`，不能先提交一个“删除旧值”的中间状态。
 - 命令追加确定性 AI 消息，例如“技能已重新加载：内置技能 5 个，已启用用户技能 2 个”，
   然后结束本次运行，不调用模型或工具。
 - 非精确匹配文本按普通用户消息处理，不做隐式命令猜测。
@@ -303,6 +332,10 @@ overlay，不复制或 import Deep Agents 的私有枚举函数：
 `@hook_config(can_jump_to=["end"])` 声明跳转；禁止在 `wrap_model_call` 中伪造 goto。初次加载
 和显式重载复用同一个公开 loader 与严格 overlay。刷新 middleware 只加入 `agent` graph；
 `embedded_agent` 和四个固定工作流不变。
+
+当前钉住的 LangChain 会把 `jump_to: "end"` 路由到 `after_agent` 链后再到 `END`，因此
+`SessionTraceMiddleware.after_agent` 仍会记录本次确定性刷新 run；`jump_to` 使用
+`EphemeralValue`，本轮结束后自动清除，不进入后续轮次。测试必须锁定这两个生命周期合同。
 
 HITL interrupt 的优先级高于刷新。当前依赖允许新普通输入旁路待审批 run，因此官方前端必须
 在 `useLangChainInterrupts()` 非空时禁用 Workspace Composer，不能创建包含
@@ -316,10 +349,15 @@ HITL interrupt 的优先级高于刷新。当前依赖允许新普通输入旁�
 |---|---|
 | `400` | base64、ZIP、目录结构、路径或 `SKILL.md` 格式非法 |
 | `404` | 技能不存在 |
-| `409` | 与内置、活动或停用技能同名，或活动/停用根出现冲突状态 |
+| `409` | 与内置、活动或停用技能同名，活动/停用根冲突，或进程启动后 `skills.path` 已漂移 |
 | `413` | 编码 JSON body、文件数量、单文件或解码/解压后总大小超限 |
 | `503` | 用户技能接口所需的 Agent 设置缺失、无效或技能根不可用 |
 | `500` | 未分类本地文件系统错误，响应不含绝对路径 |
+
+`skillmgr.py` 必须在 `mkdir`、临时目录写入、`os.replace` 和删除边界捕获 `OSError`，不得把
+异常文本、绝对路径或设置内容直接返回前端。`EEXIST`/`ENOTEMPTY` 等目标冲突映射为 `409`；
+权限、只读文件系统或根目录不可用映射为 `503`；其余无法分类的本地错误返回通用中文 `500`。
+清理临时目录失败只写脱敏日志，不得覆盖原始领域错误。
 
 列表页、详情页和导入弹窗都提供加载、空、成功和错误状态。`GET /api/skills` 在用户配置不可用
 时仍以 `200` 返回内置技能和 `user_available: false`；用户分区显示配置提示而不是整页错误。
@@ -333,12 +371,15 @@ HITL interrupt 的优先级高于刷新。当前依赖允许新普通输入旁�
 - 活动/停用目录之间的原子切换、PATCH 同状态幂等 `200` 和永久删除。
 - 内置、活动、停用三类同名冲突。
 - 非法 frontmatter、目录名不一致、多个技能根、空包。
+- 不安全 YAML tag、anchor、alias 和递归别名结构均被拒绝，解析过程不执行对象构造。
 - `\\` 路径、绝对路径、`.`/`..`、ZIP 穿越、ZIP 符号链接、重复路径、加密/损坏 ZIP。
 - 纯 base64、合法/非法 `data:` 前缀、`__MACOSX`/`.DS_Store` 忽略规则。
 - 伪造或缺少 `Content-Length` 时仍按流式累计限制 36 MiB body；高压缩比 ZIP 按实际解压
   字节在 25 MiB 处中止，而非信任 archive metadata。
 - 任一步失败后目标目录和临时目录均无残留。
 - 单个手工损坏目录不会阻断其他技能枚举。
+- `skills.path` 为文件系统根时配置无效，不创建 `.skills.disabled`；`mkdir`、`os.replace` 和
+  删除抛出的 `OSError` 都转换为不含物理路径的稳定中文错误。
 
 ### 11.2 FastAPI
 
@@ -346,6 +387,8 @@ HITL interrupt 的优先级高于刷新。当前依赖允许新普通输入旁�
 - `400/404/409/413/503` 的中文错误合同。
 - 配置缺失时内置列表/详情仍为 `200`；有效配置的缺失用户根自动以 `0700` 创建；配置路径在
   FastAPI 进程生命周期内固定，不随文件热变更。
+- FastAPI 启动后若磁盘设置中的 `skills.path` 缺失、无效或改为另一目录，导入、启停和删除
+  均返回 `409` 且新旧目录都不发生变化；仅修改其他设置字段不误报路径漂移。
 - `VR_API_KEY` 继续保护全部技能 API。
 - 测试只使用 `conftest.py` 在导入 `app` 前设置的临时 Agent 设置和技能目录。
 - 响应、异常和日志均不包含真实路径或设置密钥。
@@ -361,6 +404,13 @@ HITL interrupt 的优先级高于刷新。当前依赖允许新普通输入旁�
 - `embedded_agent` 仍只有 `/builtin/`，固定工作流行为不变。
 - 直接放入活动根的用户技能与内置同名时，内置 metadata 始终获胜，冲突用户路径不能被
   `read_file`；名称/目录不一致或其他严格校验失败的用户技能也不能进入提示或文件视图。
+- 对被阻止目录直接调用同步/异步 `ls`、`read`、`download_files` 都得到不存在；从有效技能
+  内通过符号链接指向被阻止目录同样失败，正常技能附属文件仍可读取。
+- 刷新完整覆盖旧 `skills_metadata` 和 `skills_load_errors`，无新错误时清空旧错误；生产代码
+  不 import 或调用 Deep Agents 的私有同步/异步枚举函数；同步 `invoke` 与异步 `ainvoke` 的
+  命令识别、刷新结果、消息和跳转行为一致。
+- `/reload-skills` 经 `jump_to: "end"` 后仍执行 `SessionTraceMiddleware.after_agent`，下一轮
+  state 不再包含 `jump_to`。
 - 自定义 Skills system prompt 不包含执行脚本文案，只提及 `ls`/`read_file`；固定中立政策
   始终存在。
 - 测试或静态检查证明生产代码不 import `deepagents.middleware.skills` 的下划线私有 helper。
