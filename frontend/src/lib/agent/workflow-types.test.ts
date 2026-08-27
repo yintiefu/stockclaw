@@ -1,64 +1,50 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
-import { describe, expect, it, vi } from "vitest";
-import { effectiveWorkflowStatus, parseWorkflowEvent } from "./workflow-types";
+import { describe, expect, it } from "vitest";
+import {
+  effectiveWorkflowStatus,
+  messageText,
+  parseDossierProgress,
+  stageContent,
+  type WorkflowState,
+} from "./workflow-types";
 
-describe("workflow event contract", () => {
-  it("accepts all nine Python contract examples", () => {
-    const path = resolve(process.cwd(), "../docs/contracts/workflow-custom-events.json");
-    const examples = JSON.parse(readFileSync(path, "utf8")) as unknown[];
-    expect(examples).toHaveLength(9);
-    expect(examples.map(parseWorkflowEvent).map((result) => result.kind)).toEqual(
-      Array.from({ length: 9 }, () => "event"),
-    );
+const state: WorkflowState = {
+  workflow_status: "completed",
+  stages: {
+    bull: { id: "bull", status: "completed", message_id: "m1" },
+    bear: { id: "bear", status: "failed" },
+  },
+  messages: [
+    { id: "m1", content: "多方正文" },
+    { id: "m2", content: [{ type: "text", text: "裁" }, { type: "text", text: "判" }] },
+  ],
+};
+
+describe("workflow v2 contract", () => {
+  it("resolves stage content via message pointer", () => {
+    expect(stageContent(state, "bull")).toBe("多方正文");
+    expect(stageContent(state, "bear")).toBeNull();
+    expect(stageContent(state, "nope")).toBeNull();
   });
 
-  it("logs and ignores unknown event types", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    const result = parseWorkflowEvent({ type: "future.event", seq: 1 });
-    expect(result).toEqual({ kind: "ignored", type: "future.event" });
-    expect(warn).toHaveBeenCalledOnce();
+  it("joins only text blocks", () => {
+    expect(messageText(state.messages![1])).toBe("裁判");
   });
 
-  it("returns a recoverable parse error for missing required fields", () => {
-    const result = parseWorkflowEvent({
-      type: "stage.delta", workflow_id: "debate", run_id: "run-1", seq: 1,
-      emitted_at: "2026-08-25T12:00:00Z", stage_id: "bull",
-    });
-    expect(result.kind).toBe("error");
-    if (result.kind === "error") {
-      expect(result.error).toMatchObject({ code: "MALFORMED_WORKFLOW_EVENT", retryable: true });
-    }
+  it("parses dossier progress payloads and rejects others", () => {
+    expect(parseDossierProgress({ type: "dossier.progress", section_id: "q", section_status: "completed", completed: 1, total: 13 }))
+      .toEqual({ type: "dossier.progress", section_id: "q", section_status: "completed", completed: 1, total: 13 });
+    expect(parseDossierProgress({ type: "stage.delta" })).toBeNull();
+    expect(parseDossierProgress(null)).toBeNull();
   });
 
-  it("rejects extra fields like Python extra=forbid", () => {
-    const result = parseWorkflowEvent({
-      type: "stage.delta", workflow_id: "debate", run_id: "run-1", seq: 1,
-      emitted_at: "2026-08-25T12:00:00Z", stage_id: "bull", delta: "text",
-      secret: "must-not-pass",
-    });
-    expect(result.kind).toBe("error");
-    if (result.kind === "error") {
-      expect(result.error.code).toBe("MALFORMED_WORKFLOW_EVENT");
-      expect(result.error.message).not.toContain("must-not-pass");
-    }
-  });
-});
-
-describe("effectiveWorkflowStatus", () => {
-  it.each([
-    ["busy", "pending", "running"],
-    ["idle", "completed", "completed"],
-    ["error", "completed", "completed"],
-    ["interrupted", "partial", "partial"],
-    ["busy", "completed", "running"],
-    ["busy", "interrupted", "running"],
-    ["busy", "cancelled", "running"],
-    ["idle", "running", "interrupted"],
-    ["interrupted", "running", "interrupted"],
-    ["error", "running", "failed"],
-    ["idle", "cancelled", "cancelled"],
-  ] as const)("maps %s + %s to %s", (threadStatus, workflowStatus, expected) => {
-    expect(effectiveWorkflowStatus(threadStatus, workflowStatus)).toBe(expected);
+  it("keeps effective status derivation (terminal beats stale busy)", () => {
+    expect(effectiveWorkflowStatus("busy", "pending")).toBe("running");
+    expect(effectiveWorkflowStatus("busy", "running")).toBe("running");
+    // C2 回归：restore 读到的 busy 可能已过时（attach 的 run 早已完成），
+    // 终态必须压过陈旧 busy，否则页面永远「生成中」。
+    expect(effectiveWorkflowStatus("busy", "completed")).toBe("completed");
+    expect(effectiveWorkflowStatus("busy", "failed")).toBe("failed");
+    expect(effectiveWorkflowStatus("interrupted", "running")).toBe("interrupted");
+    expect(effectiveWorkflowStatus("idle", "completed")).toBe("completed");
   });
 });

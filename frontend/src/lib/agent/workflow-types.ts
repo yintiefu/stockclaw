@@ -1,3 +1,5 @@
+// 工作流 v2 状态契约：阶段权威正文只住在 state.messages（add_messages 按 id 归并），
+// StageResult 是状态机 + message_id 指针；custom 通道只剩底稿进度（可丢弃提示）。
 export type WorkflowStatus =
   | "pending"
   | "running"
@@ -26,7 +28,8 @@ export interface WorkflowError {
 export interface StageResult {
   id: string;
   status: StageStatus;
-  content?: string | null;
+  /** 权威正文在 state.messages 里的指针。 */
+  message_id?: string | null;
   truncated?: boolean;
   context_truncated?: boolean;
   started_at?: string | null;
@@ -52,6 +55,7 @@ export interface WorkflowState {
   completed_at?: string | null;
   config_version?: number;
   input?: Record<string, unknown>;
+  resume?: boolean;
   variant?: string | null;
   dossier?: {
     sections: DossierSection[];
@@ -60,28 +64,52 @@ export interface WorkflowState {
     has_substantive_data: boolean;
   } | null;
   stages: Record<string, StageResult>;
+  /** 阶段正文唯一载体（add_messages 按 id 归并）。 */
+  messages?: unknown[];
   current_stage?: string | null;
-  result?: string | null;
   result_summary?: string | null;
   errors?: WorkflowError[];
-  event_seq?: number;
-  event_run_id?: string;
 }
 
-interface EventBase {
-  workflow_id: string;
-  run_id: string;
-  seq: number;
-  emitted_at: string;
+export function effectiveWorkflowStatus(
+  threadStatus: "idle" | "busy" | "interrupted" | "error",
+  workflowStatus: WorkflowStatus,
+): WorkflowStatus {
+  // 终态优先：restoredStatus 只在 restore 时读一次服务端，之后不再更新——
+  // 陈旧 busy 不得遮蔽 values 里的权威终态。
+  if (workflowStatus !== "pending" && workflowStatus !== "running") return workflowStatus;
+  if (threadStatus === "busy") return "running";
+  if (threadStatus === "error") return "failed";
+  if (threadStatus === "interrupted") return "interrupted";
+  // 到这里 workflowStatus 只能是 pending/running 且服务端视角已停（idle）。
+  return "interrupted";
 }
 
-export interface WorkflowStatusEvent extends EventBase {
-  type: "workflow.status";
-  status: WorkflowStatus;
-  message: string;
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+
+export function messageText(message: unknown): string {
+  if (!isRecord(message)) return "";
+  const content = message.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((b) => (isRecord(b) && typeof b.text === "string" ? b.text : ""))
+      .join("");
+  }
+  return "";
 }
 
-export interface DossierProgressEvent extends EventBase {
+export function stageContent(state: WorkflowState, stageId: string): string | null {
+  const stage = state.stages?.[stageId];
+  if (!stage?.message_id) return null;
+  for (const m of state.messages ?? []) {
+    if (isRecord(m) && m.id === stage.message_id) return messageText(m);
+  }
+  return null;
+}
+
+export interface DossierProgressEvent {
   type: "dossier.progress";
   section_id: string;
   section_status: "completed" | "no_record" | "gap" | "failed";
@@ -89,172 +117,13 @@ export interface DossierProgressEvent extends EventBase {
   total: number;
 }
 
-export interface DossierReadyEvent extends EventBase {
-  type: "dossier.ready";
-  completed: number;
-  missing: string[];
-  has_substantive_data: boolean;
-}
-
-export interface StageStartedEvent extends EventBase {
-  type: "stage.started";
-  stage_id: string;
-  label: string;
-}
-
-export interface StageDeltaEvent extends EventBase {
-  type: "stage.delta";
-  stage_id: string;
-  delta: string;
-}
-
-export interface StageCompletedEvent extends EventBase {
-  type: "stage.completed";
-  stage_id: string;
-  truncated: boolean;
-}
-
-export interface StageFailedEvent extends EventBase {
-  type: "stage.failed";
-  stage_id: string;
-  error_code: string;
-  message: string;
-  retryable: boolean;
-}
-
-export interface WorkflowCompletedEvent extends EventBase {
-  type: "workflow.completed";
-  status: "completed" | "partial";
-}
-
-export interface WorkflowFailedEvent extends EventBase {
-  type: "workflow.failed";
-  error_code: string;
-  message: string;
-  retryable: boolean;
-}
-
-export type WorkflowEvent =
-  | WorkflowStatusEvent
-  | DossierProgressEvent
-  | DossierReadyEvent
-  | StageStartedEvent
-  | StageDeltaEvent
-  | StageCompletedEvent
-  | StageFailedEvent
-  | WorkflowCompletedEvent
-  | WorkflowFailedEvent;
-
-export type WorkflowEventParseResult =
-  | { kind: "event"; event: WorkflowEvent }
-  | { kind: "ignored"; type: string }
-  | { kind: "error"; error: WorkflowError };
-
-const EVENT_TYPES = new Set<WorkflowEvent["type"]>([
-  "workflow.status", "dossier.progress", "dossier.ready", "stage.started",
-  "stage.delta", "stage.completed", "stage.failed", "workflow.completed", "workflow.failed",
-]);
-const WORKFLOW_STATUSES = new Set<WorkflowStatus>([
-  "pending", "running", "completed", "partial", "failed", "cancelled", "interrupted",
-]);
 const DOSSIER_STATUSES = new Set(["completed", "no_record", "gap", "failed"]);
-const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
-const COMMON_FIELDS = ["type", "workflow_id", "run_id", "seq", "emitted_at"];
-const EVENT_FIELDS: Record<WorkflowEvent["type"], string[]> = {
-  "workflow.status": ["status", "message"],
-  "dossier.progress": ["section_id", "section_status", "completed", "total"],
-  "dossier.ready": ["completed", "missing", "has_substantive_data"],
-  "stage.started": ["stage_id", "label"],
-  "stage.delta": ["stage_id", "delta"],
-  "stage.completed": ["stage_id", "truncated"],
-  "stage.failed": ["stage_id", "error_code", "message", "retryable"],
-  "workflow.completed": ["status"],
-  "workflow.failed": ["error_code", "message", "retryable"],
-};
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
-const isString = (value: unknown): value is string => typeof value === "string";
-const isNonEmptyString = (value: unknown): value is string => isString(value) && value.length > 0;
-const isCount = (value: unknown): value is number => Number.isInteger(value) && Number(value) >= 0;
-
-function malformed(message: string): WorkflowEventParseResult {
-  return {
-    kind: "error",
-    error: { code: "MALFORMED_WORKFLOW_EVENT", message, retryable: true },
-  };
-}
-
-export function parseWorkflowEvent(raw: unknown): WorkflowEventParseResult {
-  if (!isRecord(raw) || !isString(raw.type)) return malformed("工作流事件格式无效");
-  if (!EVENT_TYPES.has(raw.type as WorkflowEvent["type"])) {
-    console.warn(`忽略未知工作流事件: ${raw.type}`);
-    return { kind: "ignored", type: raw.type };
-  }
-  const allowed = new Set([...COMMON_FIELDS, ...EVENT_FIELDS[raw.type as WorkflowEvent["type"]]]);
-  if (Object.keys(raw).some((field) => !allowed.has(field))) {
-    return malformed(`工作流事件 ${raw.type} 包含未允许字段`);
-  }
-  if (!isNonEmptyString(raw.workflow_id) || !isNonEmptyString(raw.run_id)
-    || !Number.isInteger(raw.seq) || Number(raw.seq) < 1
-    || !isString(raw.emitted_at) || !ISO_UTC.test(raw.emitted_at)) {
-    return malformed(`工作流事件 ${raw.type} 缺少有效公共字段`);
-  }
-
-  let valid = false;
-  switch (raw.type) {
-    case "workflow.status":
-      valid = WORKFLOW_STATUSES.has(raw.status as WorkflowStatus) && isString(raw.message);
-      break;
-    case "dossier.progress":
-      valid = isNonEmptyString(raw.section_id) && DOSSIER_STATUSES.has(String(raw.section_status))
-        && isCount(raw.completed) && isCount(raw.total);
-      break;
-    case "dossier.ready":
-      valid = isCount(raw.completed) && Array.isArray(raw.missing)
-        && raw.missing.every(isString) && typeof raw.has_substantive_data === "boolean";
-      break;
-    case "stage.started":
-      valid = isNonEmptyString(raw.stage_id) && isNonEmptyString(raw.label);
-      break;
-    case "stage.delta":
-      valid = isNonEmptyString(raw.stage_id) && isString(raw.delta);
-      break;
-    case "stage.completed":
-      valid = isNonEmptyString(raw.stage_id) && typeof raw.truncated === "boolean";
-      break;
-    case "stage.failed":
-      valid = isNonEmptyString(raw.stage_id) && isNonEmptyString(raw.error_code)
-        && isNonEmptyString(raw.message) && typeof raw.retryable === "boolean";
-      break;
-    case "workflow.completed":
-      valid = raw.status === "completed" || raw.status === "partial";
-      break;
-    case "workflow.failed":
-      valid = isNonEmptyString(raw.error_code) && isNonEmptyString(raw.message)
-        && typeof raw.retryable === "boolean";
-      break;
-  }
-  if (!valid) return malformed(`工作流事件 ${raw.type} 缺少有效必填字段`);
-  return { kind: "event", event: raw as unknown as WorkflowEvent };
-}
-
-/** 与 backend/agent/workflows/*.yaml 的 config_version 一一对应；升级配置时同步更新。 */
-export const WORKFLOW_CONFIG_VERSIONS: Record<string, number> = {
-  debate: 1,
-  reflection: 1,
-  daily_review: 1,
-  news_digest: 1,
-};
-
-export function effectiveWorkflowStatus(
-  threadStatus: "idle" | "busy" | "interrupted" | "error",
-  workflowStatus: WorkflowStatus,
-): WorkflowStatus {
-  if (threadStatus === "busy") return "running";
-  if (workflowStatus !== "pending" && workflowStatus !== "running") return workflowStatus;
-  if (threadStatus === "error") return "failed";
-  if (threadStatus === "interrupted") return "interrupted";
-  if (workflowStatus === "running" || workflowStatus === "pending") return "interrupted";
-  return workflowStatus;
+export function parseDossierProgress(payload: unknown): DossierProgressEvent | null {
+  if (!isRecord(payload) || payload.type !== "dossier.progress") return null;
+  const { section_id, section_status, completed, total } = payload;
+  if (typeof section_id !== "string" || !section_id
+    || typeof section_status !== "string" || !DOSSIER_STATUSES.has(section_status)
+    || !Number.isInteger(completed) || !Number.isInteger(total)) return null;
+  return { type: "dossier.progress", section_id, section_status, completed, total };
 }
