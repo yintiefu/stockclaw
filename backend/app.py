@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import os
 import re
+from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 import astock
 import gstock
@@ -25,6 +26,8 @@ import market
 import myreports as mr
 import signals
 import sectorstocks
+import skillmgr
+from skillmgr import SkillManagerError, get_skill_manager
 
 
 from version import read_version
@@ -94,6 +97,105 @@ def _agent_status_payload() -> dict:
 def agent_status():
     """Agent 配置只读摘要（脱敏；受 VR_API_KEY 中间件保护，不调用模型）。"""
     return _agent_status_payload()
+
+
+# ---------------------------------------------------------------------------
+# 技能管理：纯本地磁盘/业务操作，不 import LangGraph 客户端或运行时、
+# 不调用模型、不改线程状态。
+# ---------------------------------------------------------------------------
+
+_SKILL_ERROR_STATUS = {
+    "bad_request": 400,
+    "not_found": 404,
+    "conflict": 409,
+    "too_large": 413,
+    "unavailable": 503,
+    "internal": 500,
+}
+
+
+def _skill_api_call(operation, *args):
+    try:
+        return operation(*args)
+    except SkillManagerError as exc:
+        raise HTTPException(_SKILL_ERROR_STATUS[exc.kind], exc.args[0]) from None
+
+
+class FolderFileIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: str
+    content_b64: str
+
+
+class FolderImportIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["folder"]
+    files: list[FolderFileIn]
+
+
+class ZipImportIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["zip"]
+    filename: str
+    content_b64: str
+
+
+SkillImportIn = Annotated[FolderImportIn | ZipImportIn, Field(discriminator="kind")]
+SKILL_IMPORT_ADAPTER: TypeAdapter = TypeAdapter(SkillImportIn)
+
+
+class SkillEnabledIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool
+
+
+async def _bounded_json_body(request: Request) -> bytes:
+    """流式读取请求体并强制 36 MiB 上限，避免超大 JSON 进入解析。"""
+    raw_length = request.headers.get("content-length")
+    if raw_length and raw_length.isdigit() and int(raw_length) > skillmgr.MAX_BODY_BYTES:
+        raise HTTPException(413, "导入请求超过 36 MiB")
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > skillmgr.MAX_BODY_BYTES:
+            raise HTTPException(413, "导入请求超过 36 MiB")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+@app.get("/api/skills")
+def skills_list():
+    return get_skill_manager().list_skills()
+
+
+@app.get("/api/skills/{source}/{name}")
+def skill_detail(source: str, name: str):
+    # source 的取值域由 skillmgr 统一校验（400），避免 FastAPI Literal 路径校验的 422
+    return _skill_api_call(get_skill_manager().get_skill, source, name)
+
+
+@app.post("/api/skills/import")
+async def skill_import(request: Request):
+    body = await _bounded_json_body(request)
+    try:
+        payload = SKILL_IMPORT_ADAPTER.validate_json(body)
+    except ValidationError:
+        raise HTTPException(400, "导入请求格式无效") from None
+    manager = get_skill_manager()
+    if isinstance(payload, FolderImportIn):
+        return _skill_api_call(manager.import_folder, [item.model_dump() for item in payload.files])
+    return _skill_api_call(manager.import_zip, payload.filename, payload.content_b64)
+
+
+@app.patch("/api/skills/user/{name}")
+def skill_toggle(name: str, payload: SkillEnabledIn):
+    return _skill_api_call(get_skill_manager().set_enabled, name, payload.enabled)
+
+
+@app.delete("/api/skills/user/{name}")
+def skill_delete(name: str):
+    return _skill_api_call(get_skill_manager().delete, name)
 
 
 class HoldingIn(BaseModel):
