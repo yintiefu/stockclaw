@@ -111,6 +111,10 @@ export function Debate() {
       setStatus(currentStage
         ? `${(STAGE_LABEL as Record<string, string>)[currentStage] ?? currentStage} 正在生成…`
         : "辩论进行中");
+    } else {
+      // 底稿收集期 custom 进度事件经 langgraph v3 流路径被上游丢弃（实测
+      // astream_events(version="v3") 0 条转发），此窗口只能给静态状态行。
+      setStatus("正在拉取客观事实底稿…（约 35 秒，走公开数据接口，不消耗 token）");
     }
   }, [run.running, currentStage, run.state?.dossier, run.state?.workflow_status]);
 

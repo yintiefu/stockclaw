@@ -205,6 +205,23 @@ describe("Debate streaming display", () => {
     expect(await screen.findByText(/未取到：板块与概念归属/)).toBeInTheDocument();
   });
 
+  it("falls back to a static dossier-phase status when custom events never arrive (v2 runtime drops them)", async () => {
+    renderPage();
+    await startDebate();
+    // 运行中但既无 dossier 快照也无 custom 事件（langgraph v3 流路径实测不转发）——
+    // 页面仍必须有可感知的进度反馈，不能静默 35 秒。
+    act(() => {
+      runMock.set({
+        threadId: "thread-1",
+        running: true,
+        status: "running",
+        state: { workflow_status: "running", stages: {} },
+      });
+    });
+
+    expect(await screen.findByText(/正在拉取客观事实底稿/)).toBeInTheDocument();
+  });
+
   it("replaces transient text with authoritative message-pointer stage content", async () => {
     renderPage();
     await startDebate();

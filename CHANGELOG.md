@@ -13,6 +13,9 @@
   `auto_resume` 版本门控（写入式拒绝：拒绝原因落 checkpoint `errors`，run 正常收尾
   ——节点 raise 在 inmem 上既无 lifecycle failed 事件也无 run.error 文本，前端只能靠
   checkpoint 感知）；取消不再客户端回写状态。
+- 已知上游缺口：langgraph 1.2.11 的 v3 流路径不转发 `get_stream_writer` custom 事件
+  （实测 13 发 0 收），底稿收集期进度 UI 降级为静态状态行；custom 通道接线保留，
+  升级 langgraph 后需复测。
 - **config_version 升至 2（状态 schema 破坏性变更）**：迁移前需对**仍在运行旧代码的
   Agent** 执行一次定向清理：
 

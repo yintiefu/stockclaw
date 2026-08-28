@@ -103,10 +103,14 @@ def _build_staged_graph(
         return {}
 
     def _resume_target(state: WorkflowState) -> str:
-        """被门控拒绝（failed 终态已写入）直接收尾；否则按变体顺序找第一个
-        非终态阶段；全部完成则收尾（幂等）。"""
+        """被门控拒绝（failed 终态已写入）直接收尾；底稿收集期被中断（无
+        dossier）先补收集；否则按变体顺序找第一个非终态阶段；全部完成则收尾（幂等）。"""
         if state.get("workflow_status") == "failed":
             return END
+        # dossier=None 时 _context_candidates 会静默跳过全部底稿块，阶段模型
+        # 在无数据状态下空跑——必须回到 collect_dossier 重取客观底稿。
+        if state.get("dossier") is None:
+            return "collect_dossier"
         variant = state.get("variant") or list(cfg.variants.keys())[0]
         stages = state.get("stages", {})
         for sid in cfg.variants.get(variant, []):
@@ -129,6 +133,7 @@ def _build_staged_graph(
 
     start_targets_with_finalize = {f"start_{s.id}": f"start_{s.id}" for s in cfg.stages}
     start_targets_with_finalize["finalize"] = "finalize"
+    start_targets_with_finalize["collect_dossier"] = "collect_dossier"
     start_targets_with_finalize[END] = END
 
     builder.add_node("entry", entry)

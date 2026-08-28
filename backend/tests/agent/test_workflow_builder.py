@@ -196,6 +196,36 @@ async def test_resume_rejected_on_version_mismatch_writes_failed_state():
 
 
 @pytest.mark.asyncio
+async def test_resume_recollects_dossier_when_collection_was_interrupted():
+    """底稿收集期被中断（state 无 dossier）：resume 必须回到 collect_dossier。
+
+    否则 _resume_target 直接路由到首个阶段，而 _context_candidates 对
+    dossier=None 静默跳过全部底稿块——模型在无数据状态下空跑辩论，
+    违反「分析必须有客观底稿支撑」的产品红线。
+    """
+    cfg = _debate_cfg()
+    model = StageAwareModel(replies=[])
+    graph = build_workflow_graph(cfg, model=model,
+                                 checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
+    config = run_config("t-dossier-resume")
+    # 只跑到 validate_input 即断：此刻 state 有 input/running 但无 dossier
+    await graph.ainvoke(
+        {"input": {"code": "600519"}, "variant": "standard"},
+        config=config,
+        interrupt_after=["validate_input"],
+    )
+    snapshot = await graph.aget_state(config)
+    assert snapshot.values.get("dossier") is None
+
+    result = await graph.ainvoke({"resume": True}, config=config)
+    assert result["dossier"] is not None and len(result["dossier"].sections) > 0
+    assert result["stages"]["bull"].status == "completed"
+    assert result["workflow_status"] == "completed"
+    # 底稿确实进入了模型上下文（系统提示含底稿摘要块）
+    assert any("底稿" in _system_text(inv) for inv in model.invocations)
+
+
+@pytest.mark.asyncio
 async def test_start_node_commits_running_before_model_node():
     cfg = _debate_cfg()
     checkpointer = InMemorySaver()

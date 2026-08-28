@@ -332,6 +332,13 @@ derive to `interrupted`, new runs work).
 - Pages use `hooks/useWorkflowRun` (thread bookkeeping + status derivation) on top of
   `hooks/useWorkflowStream` (`useStream` v2: values = authoritative state per superstep,
   messages = stage text streamed then merged by id, custom = dossier progress only).
+- **custom events are currently dead on the wire**: langgraph 1.2.11's
+  `astream_events(version="v3")` — the path langgraph-api 0.12.6 forces for all v2
+  protocol runs — does NOT forward `get_stream_writer()` events (verified 2026-08-28:
+  13 emitted / 0 delivered; classic `astream(stream_mode=["custom"])` delivers all).
+  Keep `emit_dossier_progress` + the frontend custom-channel wiring (contract-correct,
+  lights up when the runtime forwards them); the Debate page carries a static
+  dossier-phase status line as the interim UX. Re-test on any langgraph upgrade.
 - Retry submits `{resume: true}` on a dedicated top-level state channel — never nest it
   in `input` (it must survive across retries). The backend `auto_resume` node owns the
   config_version gate and rejects by **writing a failed terminal state** (`errors` +
