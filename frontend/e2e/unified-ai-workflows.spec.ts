@@ -456,17 +456,27 @@ test("LangGraph 重启后历史仍在、丢态行派生为已中断、新 run �
       expect(resp.ok).toBe(true);
     }).toPass({ timeout: 60_000 });
 
-    // 历史列表仍在（元数据落盘）；丢态行派生为已中断，绝不永久「生成中」
+    // 历史列表仍在（元数据落盘）；丢态行派生为已中断，绝不永久「生成中」。
+    // 冷启动的服务器要同步反序列化 ops/checkpoint pickle，高负载开发机上首个
+    // threads/search 可能远慢于 /docs 就绪——45s 预算只针对这条断言。
     await page.goto("/daily-review");
-    await expect(page.getByText("E2E 重启前复盘")).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText("E2E 重启前复盘")).toBeVisible({ timeout: 45_000 });
     await expect(page.getByText("生成中").first()).toHaveCount(0);
 
     // 重启后可继续发起新 run（迁移链路健康）
     await page.getByRole("button", { name: /重新复盘|让 AI 复盘今天/ }).click();
     await expect(page.getByText(/复盘脚本结论/)).toBeVisible({ timeout: 30_000 });
   } finally {
-    // 无论断言成败都清掉本测试拉起的 detached 进程，避免残留端口拖垮后续运行
-    spawnSync("bash", ["-c", `fuser -k -TERM ${LANGGRAPH_PORT}/tcp || true`], { stdio: "ignore" });
+    // 无论断言成败都清掉本测试拉起的 detached 进程，避免残留端口拖垮后续运行。
+    // detached 子进程在 finally 执行时可能尚未完成 bind（一次 fuser 会漏杀），
+    // 轮询直到端口真正释放。
+    for (let i = 0; i < 10; i++) {
+      spawnSync("bash", ["-c", `fuser -k -TERM ${LANGGRAPH_PORT}/tcp || true`], { stdio: "ignore" });
+      const portFree = await fetch(`${LG}/docs`, { signal: AbortSignal.timeout(500) })
+        .then(() => false, () => true);
+      if (portFree) break;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
   }
 });
 
