@@ -78,10 +78,8 @@ class CyclingScriptedModel(ScriptedChatModel):
 class StageAwareDebateModel(CyclingScriptedModel):
     """辩论阶段感知：按系统提示中的角色标记输出，顺序无关、重试稳定。
 
-    每个阶段流式前 sleep，保证浏览器有窗口点「中止」。延迟必须显著大于 v2
-    SSE 的首事件/心跳窗口（~5s）：新线程上 SDK 的 values 订阅要等首个可 flush
-    事件/心跳才能就绪——run 若短于该窗口，中间态只能 run 结束后整段回放，
-    「生成中/中止」场景将永远抓不到运行中 UI。
+    每个阶段流式前 sleep（经 _astream 桥接在 executor 线程里执行，实测有效），
+    拉长运行中窗口让浏览器能稳定点「中止」、看到「生成中」标记。
     """
 
     stage_delay_seconds: float = 4.0

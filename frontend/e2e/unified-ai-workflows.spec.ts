@@ -225,8 +225,8 @@ test("辩论可中止并经 resume 从失败阶段继续，已完成阶段不重
   await page.goto("/debate");
   await page.getByPlaceholder("6 位代码，如 600519").fill("600519");
   await page.getByRole("button", { name: "开始辩论" }).click();
-  // 阶段模型带 1.5s 延迟；等首阶段开始（生成中标记 = validate_input 已落 checkpoint，
-  // 过早取消会留下无可恢复状态的空线程）再中止
+  // 每个阶段模型流式前 sleep 4s（cross/standard 同源）；等首阶段开始（生成中标记 =
+  // validate_input 已落 checkpoint，过早取消会留下无可恢复状态的空线程）再中止
   await expect(page.getByText("生成中…").first()).toBeVisible({ timeout: 30_000 });
   await page.getByRole("button", { name: "中止" }).click();
   // stop() 内部会轮询到线程脱离 busy 才返回（≤10s），页面 finally 里的 historyKey
