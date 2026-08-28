@@ -9,6 +9,8 @@ VibeResearch-专业化建议.md
 **/.cache/
 my-watchlist.json
 portfolio.json
+sector-stocks.json
+sector-picks.json
 public/user-data/
 
 # ── 密钥 / 环境（绝不进仓库） ──────────────────────────────────────
@@ -28,6 +30,8 @@ public/user-data/
 dist/
 build/
 frontend/tsconfig.tsbuildinfo
+.vr-dev/
+.superpowers/
 
 # ── 编辑器 / 系统 / 工具 ──────────────────────────────────────────
 **/.claude/

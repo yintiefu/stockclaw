@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { TrendingUp, FileText, Newspaper, Rss, RefreshCw, Loader2, ExternalLink, AlertCircle, Sparkles, Lightbulb, Star } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -16,11 +16,12 @@ import { cn } from "@/lib/utils";
 
 const EMPTY_STATE: WorkflowState = { workflow_status: "pending", stages: {} };
 
+// 顺序即侧栏子栏目顺序（Layout 的 INTEL_LINKS 与此一致）
 const TABS = [
-  { key: "events", label: "事件概率", icon: TrendingUp, integrated: false, desc: "全球宏观预期概率（公开数据、免登录只读），后续接入" },
-  { key: "filings", label: "A股公告", icon: FileText, integrated: false, desc: "汇总关注列表里各个股的近期公告（东财公开披露）" },
-  { key: "news", label: "公开新闻", icon: Newspaper, integrated: false, desc: "汇总关注列表里各个股的近期新闻（公开源）" },
   { key: "investment-news", label: "Investment News", icon: Rss, integrated: true, desc: "12 赛道全球公开 RSS 资讯（集成自 investment-news 仓库）" },
+  { key: "news", label: "公开新闻", icon: Newspaper, integrated: false, desc: "汇总关注列表里各个股的近期新闻（公开源）" },
+  { key: "filings", label: "A股公告", icon: FileText, integrated: false, desc: "汇总关注列表里各个股的近期公告（东财公开披露）" },
+  { key: "events", label: "事件概率", icon: TrendingUp, integrated: false, desc: "全球宏观预期概率（公开数据、免登录只读），后续接入" },
 ];
 
 interface Digest { text?: string; err?: string }
@@ -92,7 +93,7 @@ function InvestmentNewsPanel() {
     <div>
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <span className="text-xs text-muted-foreground">
-          {hasData ? `${data!.stats.total_sources} 个公开源 · 近 ${data!.recent_days} 天 · 更新于 ${data!.generated_at}` : "12 赛道 · 108 个公开源"}
+          {hasData ? `${data!.stats.total_sources} 个公开源 · 近 ${data!.recent_days} 天 · 更新于 ${data!.generated_at}` : "12 赛道 · 106 个公开源"}
         </span>
         <div className="flex items-center gap-2">
           {hasData && (
@@ -337,7 +338,10 @@ function WatchlistFeed({ kind }: { kind: "filings" | "news" }) {
 }
 
 export function Intel() {
-  const [tab, setTab] = useState("investment-news");
+  // 当前 Tab 由路由驱动（/intel/:tab），与侧栏子栏目联动；不认识的参数回落到第一个
+  const { tab: tabParam } = useParams();
+  const navigate = useNavigate();
+  const tab = TABS.some((t) => t.key === tabParam) ? tabParam! : TABS[0].key;
   const cur = TABS.find((t) => t.key === tab)!;
 
   return (
@@ -346,7 +350,7 @@ export function Intel() {
 
       <div className="mb-4 flex flex-wrap gap-2">
         {TABS.map(({ key, label, icon: Icon, integrated }) => (
-          <button key={key} onClick={() => setTab(key)}
+          <button key={key} onClick={() => navigate(`/intel/${key}`)}
             className={cn("inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm transition-colors",
               tab === key ? "bg-primary/15 font-medium text-primary shadow-glow" : "text-muted-foreground hover:bg-muted/50")}>
             <Icon className="h-4 w-4" /> {label}

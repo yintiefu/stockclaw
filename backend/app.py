@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +23,8 @@ import newsradar
 import portfolio as pf
 import market
 import myreports as mr
+import signals
+import sectorstocks
 
 
 from version import read_version
@@ -219,6 +222,24 @@ def radar_refresh():
         return {"data": newsradar.fetch_radar()}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"资讯雷达刷新失败：{e}") from e
+
+
+@app.get("/api/signals/gpu-rent")
+def signals_gpu_rent():
+    """GPU 租金信号（算力温度计）：读缓存，无缓存返回结构骨架。"""
+    try:
+        return {"data": signals.get_gpu_rent(force=False)}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"GPU 租金信号异常：{e}") from e
+
+
+@app.post("/api/signals/gpu-rent/refresh")
+def signals_gpu_rent_refresh():
+    """强制重抓 Vast 现货 + Kalshi 远期（约 10-20s：远期逐档串行限流），更新缓存。"""
+    try:
+        return {"data": signals.fetch_gpu_rent()}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"GPU 租金信号刷新失败：{e}") from e
 
 
 @app.get("/api/market/overview")
@@ -586,3 +607,111 @@ def industry(top: int = Query(20, ge=5, le=50)):
         return {"data": data}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"行业排名异常：{e}") from e
+
+
+# ---------------------------------------------------------------------------
+# 板块成分股（本地：base + hidden + mine）。写入经 sectorstocks 线程锁+文件锁。
+# 所有接口返回 {meta, leaves}。
+# ---------------------------------------------------------------------------
+
+_ALLOWED_STOCK_PREFIXES = ("SH.", "SZ.", "HK.", "US.")
+_KEY_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
+_MAX_KEY_LEN = 64
+_MAX_NAME_LEN = 64
+_MAX_CODE_LEN = 32
+_MAX_IMPORT_LEAVES = 200
+_MAX_STOCKS_PER_LEAF = 200  # 与富途单页上限 + 脚本 --limit 上限对齐（审评 #2）
+
+
+def _validate_key_or_leaf(value: str, field: str) -> str:
+    v = (value or "").strip()
+    if not v or len(v) > _MAX_KEY_LEN or not _KEY_RE.match(v):
+        raise HTTPException(400, f"{field} 非法（非空、≤{_MAX_KEY_LEN}、字母数字_-）")
+    return v
+
+
+def _validate_stock_code(code: str) -> str:
+    code = (code or "").strip().upper()
+    if len(code) > _MAX_CODE_LEN or "." not in code or not code.startswith(_ALLOWED_STOCK_PREFIXES):
+        raise HTTPException(400, "code 必须以 SH./SZ./HK./US. 开头且长度合法")
+    return code
+
+
+def _validate_name(name: str) -> str:
+    name = name or ""
+    if len(name) > _MAX_NAME_LEN:
+        raise HTTPException(400, f"name 最长 {_MAX_NAME_LEN}")
+    return name
+
+
+class SectorStockIn(BaseModel):
+    key: str
+    leaf: str
+    code: str
+    name: str = ""
+
+
+class SectorImportIn(BaseModel):
+    key: str
+    base: dict
+    meta: dict = {}
+
+
+@app.exception_handler(sectorstocks.CorruptStoreError)
+def _sector_corrupt_handler(_req: Request, _exc: sectorstocks.CorruptStoreError):
+    """写接口遇到本地成分股文件损坏（已自动备份、移除损坏文件）→ 清晰 500，重试即自愈。
+    读接口 get_sector 内部已吞该异常并降级返回空，不会走到这里。"""
+    return JSONResponse(status_code=500, content={"detail": "本地成分股数据损坏，已自动备份；请重试该操作"})
+
+
+@app.get("/api/sectors/stocks")
+def sector_stocks_get(key: str = Query(...)):
+    key = _validate_key_or_leaf(key, "key")
+    return {"data": sectorstocks.get_sector(key)}
+
+
+@app.post("/api/sectors/stocks/import")
+def sector_stocks_import(req: SectorImportIn):
+    key = _validate_key_or_leaf(req.key, "key")
+    if not isinstance(req.base, dict) or len(req.base) > _MAX_IMPORT_LEAVES:
+        raise HTTPException(400, f"base 须为对象且叶子数 ≤ {_MAX_IMPORT_LEAVES}")
+    clean: dict = {}
+    for leaf_id, stocks in req.base.items():
+        lid = _validate_key_or_leaf(str(leaf_id), "leaf")
+        if not isinstance(stocks, list) or len(stocks) > _MAX_STOCKS_PER_LEAF:
+            raise HTTPException(400, f"叶子 {lid} 成分股须为数组且 ≤ {_MAX_STOCKS_PER_LEAF}")
+        row = []
+        for s in stocks:
+            if not isinstance(s, dict):
+                raise HTTPException(400, "stock 须为对象")
+            c = _validate_stock_code(s.get("code", ""))
+            n = _validate_name(str(s.get("name", "")))
+            row.append({"code": c, "name": n})
+        clean[lid] = row
+    meta = req.meta if isinstance(req.meta, dict) else {}
+    return {"data": sectorstocks.import_base(key, clean, meta)}
+
+
+@app.post("/api/sectors/stocks/mine")
+def sector_stocks_add_mine(req: SectorStockIn):
+    key = _validate_key_or_leaf(req.key, "key")
+    leaf = _validate_key_or_leaf(req.leaf, "leaf")
+    code = _validate_stock_code(req.code)
+    name = _validate_name(req.name)
+    return {"data": sectorstocks.add_mine(key, leaf, code, name)}
+
+
+@app.delete("/api/sectors/stocks/mine")
+def sector_stocks_remove_mine(key: str = Query(...), leaf: str = Query(...), code: str = Query(...)):
+    key = _validate_key_or_leaf(key, "key")
+    leaf = _validate_key_or_leaf(leaf, "leaf")
+    code = _validate_stock_code(code)
+    return {"data": sectorstocks.remove_mine(key, leaf, code)}
+
+
+@app.post("/api/sectors/stocks/delete")
+def sector_stocks_delete(req: SectorStockIn):
+    key = _validate_key_or_leaf(req.key, "key")
+    leaf = _validate_key_or_leaf(req.leaf, "leaf")
+    code = _validate_stock_code(req.code)
+    return {"data": sectorstocks.delete_stock(key, leaf, code)}
