@@ -1,39 +1,39 @@
-// 页面工作流运行控制器：只持有 thread / run / 权威 state / 阶段临时文本与错误，
-// 协议行为（序号校验、断线重连、checkpoint 对账、取消回写）全部委托给
-// lib/agent/workflow-client 与 workflow-stream，不在此重复 SDK 调用。
-//
-// 关键语义：
-// - start 每次 new thread（重新发起 = 新 thread，旧结果保留在历史里）；
-// - retry 复用当前 thread，从 checkpoint 恢复而不重放已完成阶段；
-// - stop 走 cancel(wait=true) + 取消回写；
-// - restore 优先按本地 cursor 重连仍在跑的 run，否则一次 effective detail 读取；
-// - remove 只删除用户明确选择的当前 thread。
+// 页面工作流运行控制器（v2 流版）：
+// - start：建线程（带 metadata）→ submit 显式携带 {threadId} + onError（controller
+//   未重绑时 SDK 会自铸线程，AskAiButton 已踩过该坑）；submit 从不 reject，失败
+//   判定靠 submit resolve 后读目标线程的权威 checkpoint——**只接受明确终态，
+//   否则 fail closed**（绝不返回 {state:null, error:null} 让 Intel 把空结果当成功）；
+// - retry：提交 {resume: true} 并**始终**显式携带 {threadId}（restore 刚换绑、
+//   controller 异步 hydrate 未完成时，SDK 会在 submit 内自行 await hydrate——
+//   submit-coordinator.js L204-205）；threadId 取同步 ref，不取 React state 闭包；
+//   与 start 同源做错误派生（transport 正常完成 ≠ 恢复成功）；
+// - stop：stream.stop() 只发出 fire-and-forget 的 runs.cancel（吞错、立即复位本地
+//   loading，controller.js 证实），随后轮询线程状态直到脱离 busy（≤10s）并以最终
+//   线程状态收敛 restoredStatus（查询失败/超时报错，绝不静默当成功）；
+// - restore：setThreadId 换绑，v2 hydrate 装载历史；restoredStatus 只在此处从
+//   服务端读取一次，且写入前校验线程未再切换（过期详情丢弃）；
+// - remove：删除线程。
 import { useCallback, useRef, useState } from "react";
+import { useWorkflowStream } from "@/hooks/useWorkflowStream";
 import {
-  cancelWorkflowRun,
   createWorkflowThread,
   deleteWorkflowThread,
   getEffectiveWorkflowDetail,
   getWorkflowState,
-  reconnectWorkflowRun,
-  retryWorkflowRun,
-  startWorkflowRun,
-  type WorkflowClientEvent,
-  type WorkflowThreadMetadata,
 } from "@/lib/agent/workflow-client";
-import type { WorkflowStreamState } from "@/lib/agent/workflow-stream";
 import {
   effectiveWorkflowStatus,
-  WORKFLOW_CONFIG_VERSIONS,
+  type DossierProgressEvent,
   type WorkflowState,
   type WorkflowStatus,
 } from "@/lib/agent/workflow-types";
-import { loadWorkflowStreamCursor } from "@/lib/storage";
+import type { WorkflowThreadMetadata } from "@/lib/agent/workflow-client";
+
+type ThreadStatus = "idle" | "busy" | "interrupted" | "error";
 
 export interface UseWorkflowRunOptions {
   assistantId: string;
-  /** 页面专属事件回调（底稿进度、阶段标签等 UI 只在此处理）。 */
-  onEvent?: (event: WorkflowClientEvent) => void;
+  onDossierProgress?: (event: DossierProgressEvent) => void;
 }
 
 export interface WorkflowStartParams {
@@ -42,18 +42,15 @@ export interface WorkflowStartParams {
   metadata?: WorkflowThreadMetadata;
 }
 
+/** 与旧版同形：页面（Intel/DailyReview/Notes）读取 outcome.state / outcome.error。 */
 export interface WorkflowRunOutcome {
-  /** 流结束后的权威 checkpoint（失败时可能是刷新到的失败终态或 null）。 */
   state: WorkflowState | null;
   error: string | null;
 }
 
 export interface UseWorkflowRunResult {
   threadId: string | null;
-  runId: string | null;
-  /** 权威 checkpoint 状态；流式 delta 只进 transient。 */
   state: WorkflowState | null;
-  /** 阶段临时文本（stage_id → 已拼接 delta），完成后由 checkpoint 内容取代。 */
   transient: Record<string, string>;
   running: boolean;
   status: WorkflowStatus;
@@ -65,163 +62,214 @@ export interface UseWorkflowRunResult {
   remove: () => Promise<void>;
 }
 
+const errorText = (error: unknown): string | null =>
+  error == null ? null : error instanceof Error ? error.message : String(error);
+
+// values 里可能出现的终态（interrupted/cancelled 是展示层派生值，不会写进 values）。
+const TERMINAL_WORKFLOW_STATUSES = new Set(["completed", "partial", "failed", "cancelled"]);
+const isTerminal = (state: WorkflowState | null | undefined): boolean =>
+  state != null && TERMINAL_WORKFLOW_STATUSES.has(state.workflow_status);
+
+/** submit 在 run 终局后 resolve；读目标线程的权威 checkpoint。
+ * 一次重试容忍 dev runtime 的落盘延迟。只认明确终态，不认中间态。 */
+async function readTerminalState(threadId: string): Promise<WorkflowState | null> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const state = await getWorkflowState(threadId).catch(() => null);
+    if (isTerminal(state)) return state;
+    if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return null;
+}
+
+/** retry 专用终态读取：只认「本次 run 新写入」的终态。
+ * resume 的目标线程在 dispatch 前就可能是终态（历史失败/被篡改的 checkpoint），
+ * readTerminalState 会对其立即短路；而本次 run 的拒绝写入（auto_resume 门控）或
+ * 收尾 checkpoint 可能晚于 submit resolve 落盘。以 dispatch 前快照的 completed_at
+ * 为界轮询，超时回退到旧终态读取（不劣于直接短路）。 */
+async function readUpdatedTerminalState(
+  threadId: string,
+  before: WorkflowState | null,
+): Promise<WorkflowState | null> {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const state = await getWorkflowState(threadId).catch(() => null);
+    if (state != null && isTerminal(state)
+      && (before == null || state.completed_at !== before.completed_at)) {
+      return state;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  return await readTerminalState(threadId);
+}
+
+function deriveRunError(state: WorkflowState | null, dispatchError: string | null): string | null {
+  if (dispatchError) return dispatchError;
+  if (state?.workflow_status === "failed") {
+    return state.errors?.map((e) => e.message).filter(Boolean).join("；") || "工作流执行失败";
+  }
+  return null;
+}
+
 export function useWorkflowRun(options: UseWorkflowRunOptions): UseWorkflowRunResult {
   const { assistantId } = options;
-  const eventRef = useRef(options.onEvent);
-  eventRef.current = options.onEvent;
-
   const [threadId, setThreadId] = useState<string | null>(null);
-  const [runId, setRunId] = useState<string | null>(null);
-  const [state, setState] = useState<WorkflowState | null>(null);
-  const [transient, setTransient] = useState<Record<string, string>>({});
-  const [running, setRunning] = useState(false);
+  // 同步镜像：restore 后立即 retry 时 React state 闭包还是旧值，submit 必须拿
+  // 最新 threadId。start/restore/remove 同步更新 ref。
+  const threadIdRef = useRef<string | null>(null);
+  // 仅由 restore 写入（服务端视角的线程状态）；start/retry 一律清空——运行期由
+  // running 表达，终态由 values.workflow_status 表达，杜绝「busy 永久挂起」。
+  const [restoredStatus, setRestoredStatus] = useState<ThreadStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [threadStatus, setThreadStatus] = useState<"idle" | "busy" | "interrupted" | "error">("idle");
 
-  const applyStream = useCallback((stream: WorkflowStreamState) => {
-    if (stream.runId) setRunId(stream.runId);
-    setTransient({ ...stream.transient });
-    if (stream.checkpoint) setState(stream.checkpoint);
-  }, []);
+  const stream = useWorkflowStream(assistantId, threadId, options.onDossierProgress);
+  const running = stream.running;
 
-  const refreshState = useCallback(async (id: string) => {
-    const next = await getWorkflowState(id);
-    setState(next);
-    return next;
+  const bindThread = useCallback((id: string | null) => {
+    threadIdRef.current = id;
+    setThreadId(id);
   }, []);
 
   const start = useCallback(async (params: WorkflowStartParams): Promise<WorkflowRunOutcome> => {
     setError(null);
-    setTransient({});
-    setState(null);
-    setRunning(true);
-    setThreadStatus("busy");
-    const id = await createWorkflowThread(assistantId, {
-      ...params.metadata,
-      config_version: WORKFLOW_CONFIG_VERSIONS[assistantId] ?? params.metadata?.config_version,
-    });
-    setThreadId(id);
+    setRestoredStatus(null);
     try {
-      const result = await startWorkflowRun({
-        threadId: id,
-        assistantId,
-        input: {
+      const id = await createWorkflowThread(assistantId, params.metadata ?? {});
+      bindThread(id);
+      let dispatchError: string | null = null;
+      await stream.submit(
+        {
           input: params.input,
           ...(params.variant ? { variant: params.variant } : {}),
         },
-        // 绑定 run_id 要趁早：长任务一开始就可能被用户中止。
-        onRunCreated: (created) => setRunId(created),
-        onEvent: (event) => eventRef.current?.(event),
-        onState: applyStream,
-      });
-      applyStream(result.stream);
-      setRunning(false);
-      setThreadStatus("idle");
-      return { state: result.stream.checkpoint, error: null };
-    } catch (e) {
-      setRunning(false);
-      setThreadStatus("idle");
-      // 失败也要以 checkpoint 为准展示阶段终态，避免「生成中」永久挂着。
-      let failedState: WorkflowState | null = null;
-      try {
-        failedState = await refreshState(id);
-      } catch {
-        /* 状态读取失败时保留本地 error 展示 */
+        {
+          threadId: id,
+          onError: (e) => { dispatchError = errorText(e) ?? "工作流启动失败"; },
+        },
+      );
+      // submit() 失败也不 reject（错误只进 onError/stream.error）；且节点内捕获的
+      // 模型异常以 failed checkpoint 正常终局（run 本身 completed、stream.error 为空）
+      // ——失败判定唯一可靠来源是目标线程的权威 checkpoint。
+      // 注意不做任何「换线程前的旧 values」兜底（跨线程污染）；读不到终态即 fail closed。
+      const finalState = await readTerminalState(id);
+      let runError = deriveRunError(finalState, dispatchError);
+      if (!runError && !isTerminal(finalState)) {
+        runError = "工作流未能完成：未读取到终态，请在历史记录中确认";
       }
-      const message = e instanceof Error ? e.message : String(e);
+      if (runError) setError(runError);
+      return { state: finalState, error: runError };
+    } catch (e) {
+      // 建线程/网络层失败：同样不抛，落回 {state:null, error}。
+      const message = errorText(e) ?? "工作流启动失败";
       setError(message);
-      return { state: failedState, error: message };
+      return { state: null, error: message };
     }
-  }, [assistantId, applyStream, refreshState]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [assistantId, stream.submit, bindThread]);
 
   const stop = useCallback(async () => {
-    if (!threadId || !runId) return;
+    // 提前捕获：await stream.stop() 期间用户可能 restore 了别的线程，
+    // 事后取 ref 会轮询/收敛到错误的线程。
+    const id = threadIdRef.current;
     try {
-      await cancelWorkflowRun(threadId, runId);
-      await refreshState(threadId);
-      setError(null);
+      await stream.stop();  // 发出 runs.cancel（fire-and-forget、吞错）并复位本地 loading
+      if (id == null) return;
+      // 服务端取消是异步的：轮询直到脱离 busy（500ms×20 ≤10s）。查询失败不当作
+      // 完成——只有拿到非 busy 详情才收敛；持续失败与超时都必须报错。
+      let lastStatus: ThreadStatus | null = null;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const detail = await getEffectiveWorkflowDetail(id).catch(() => null);
+        if (detail) {
+          lastStatus = detail.threadStatus;
+          if (detail.threadStatus !== "busy") break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      if (threadIdRef.current !== id) return;  // 期间换线程：不写状态
+      if (lastStatus == null) {
+        setError("已请求取消，但无法确认服务端状态：请稍后在历史记录中查看");
+      } else if (lastStatus === "busy") {
+        setError("取消超时：服务端仍在收尾，请稍后刷新历史");
+      } else {
+        // 用最终线程状态收敛 restoredStatus——restore 写入的 busy 若不更新，
+        // 残留 running 的 checkpoint 会让 status 永久钉在 running（中止按钮不消失）。
+        setRestoredStatus(lastStatus);
+        setError(null);
+      }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRunning(false);
-      setThreadStatus("idle");
+      setError(errorText(e) ?? "取消失败");
     }
-  }, [threadId, runId, refreshState]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stream.stop]);
 
   const retry = useCallback(async () => {
-    if (!threadId) return;
+    const id = threadIdRef.current;
+    if (!id) return;
     setError(null);
-    setTransient({});
-    setRunning(true);
-    setThreadStatus("busy");
+    setRestoredStatus(null);
+    let dispatchError: string | null = null;
+    // dispatch 前终态快照：retry 的失败判定必须能区分「本来就是终态」与「本次
+    // run 写入的终态」（拒绝文案只存在于新写入的 checkpoint 里）。
+    const before = await getWorkflowState(id).catch(() => null);
     try {
-      const result = await retryWorkflowRun(threadId, assistantId, {
-        onRunCreated: (created) => setRunId(created),
-        onEvent: (event) => eventRef.current?.(event),
-        onState: applyStream,
+      // 输入驱动 resume：版本门控与目标阶段路由全部在后端 auto_resume。
+      // 始终显式携带 threadId——restore 后 controller 的异步 hydrate 可能未完成，
+      // 显式传参时 SDK 会在 submit 内自行 await hydrate。
+      await stream.submit({ resume: true }, {
+        threadId: id,
+        onError: (e) => { dispatchError = errorText(e) ?? "恢复失败"; },
       });
-      applyStream(result.stream);
-      setRunning(false);
-      setThreadStatus("idle");
     } catch (e) {
-      setRunning(false);
-      setThreadStatus("idle");
-      try {
-        await refreshState(threadId);
-      } catch {
-        /* 同 start：优先展示 checkpoint 终态 */
-      }
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e) ?? "恢复失败");
+      return;
     }
-  }, [threadId, assistantId, applyStream, refreshState]);
+    // 与 start 同源：submit 正常 resolve ≠ 恢复成功，失败终态只在 checkpoint 里。
+    const state = await readUpdatedTerminalState(id, before);
+    const runError = deriveRunError(state, dispatchError)
+      ?? (isTerminal(state) ? null : "恢复未完成：请稍后重试");
+    if (runError) setError(runError);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stream.submit]);
 
   const restore = useCallback(async (id: string) => {
     setError(null);
-    setTransient({});
-    const cursor = loadWorkflowStreamCursor(id);
-    if (cursor?.runId) {
-      try {
-        const result = await reconnectWorkflowRun(id, {
-          runId: cursor.runId,
-          onEvent: (event) => eventRef.current?.(event),
-          onState: applyStream,
-        });
-        setThreadId(id);
-        applyStream(result.stream);
-        const terminal = result.stream.checkpoint?.workflow_status;
-        setRunning(result.stream.checkpoint != null
-          && (terminal === "running" || terminal === "pending"));
-        setThreadStatus("idle");
-        return;
-      } catch {
-        // 流缓冲不存在 / Server 已重启：回落到一次性权威读取。
-      }
+    bindThread(id);  // v2 hydrate 装载历史
+    try {
+      const detail = await getEffectiveWorkflowDetail(id);
+      if (threadIdRef.current !== id) return;  // 已切到别的线程：丢弃过期详情
+      setRestoredStatus(detail.threadStatus === "busy" ? "busy"
+        : detail.threadStatus === "interrupted" ? "interrupted"
+        : detail.threadStatus === "error" ? "error" : "idle");
+    } catch {
+      if (threadIdRef.current !== id) return;
+      setRestoredStatus("idle");
     }
-    const detail = await getEffectiveWorkflowDetail(id);
-    setThreadId(id);
-    setState(detail.state);
-    setRunId(cursor?.runId ?? null);
-    setThreadStatus(detail.threadStatus);
-    setRunning(detail.status === "running");
-  }, [applyStream]);
+  }, [bindThread]);
 
   const remove = useCallback(async () => {
-    if (!threadId) return;
-    await deleteWorkflowThread(threadId);
-    setThreadId(null);
-    setRunId(null);
-    setState(null);
-    setTransient({});
+    const id = threadIdRef.current;
+    if (!id) return;
+    await deleteWorkflowThread(id);
+    bindThread(null);
+    setRestoredStatus(null);
     setError(null);
-    setRunning(false);
-  }, [threadId]);
+  }, [bindThread]);
 
+  const boundThreadId = stream.threadId ?? threadId;
+  const workflowStatus: WorkflowStatus = stream.state.workflow_status ?? "pending";
   const status: WorkflowStatus = running
     ? "running"
-    : effectiveWorkflowStatus(threadStatus, state?.workflow_status ?? "pending");
+    // 首屏（无线程）必须是 pending——不进 effectiveWorkflowStatus（idle+pending 会被
+    // 派生成 interrupted）。
+    : boundThreadId == null
+      ? "pending"
+      : effectiveWorkflowStatus(restoredStatus ?? "idle", workflowStatus);
 
   return {
-    threadId, runId, state, transient, running, status, error,
+    threadId: boundThreadId,
+    state: Object.keys(stream.state).length ? stream.state : null,
+    transient: stream.transient,
+    running,
+    status,
+    error: error ?? errorText(stream.error),
     start, stop, retry, restore, remove,
   };
 }

@@ -583,24 +583,29 @@ def test_malformed_builtin_skill_frontmatter_blocks_workflow_loading(
         validate_workflow_config(doc, workflow_id="bad_skill", builtin_skills_root=tmp_path)
 
 
+# debate 底稿固定契约：13 项 (section_id, tool, args, empty_policy, 执行策略)。
+# 加载器运行时只做通用 schema 校验，不比对契约；防回归不变量由下面的契约测试兜底。
+DEBATE_DOSSIER_CONTRACT = [
+    ("quote", "query_quote", {"codes": ["${input.code}"]}, "gap_if_empty", "parallel_safe"),
+    ("valuation", "query_valuation", {"code": "${input.code}"}, "gap_if_empty", "eastmoney_serial"),
+    ("valuation_percentile", "query_valuation_percentile", {"code": "${input.code}"}, "gap_if_empty", "parallel_safe"),
+    ("financials", "query_financials", {"code": "${input.code}"}, "gap_if_empty", "parallel_safe"),
+    ("kline", "query_kline", {"code": "${input.code}", "count": 60}, "gap_if_empty", "parallel_safe"),
+    ("fund_flow", "query_fund_flow", {"code": "${input.code}", "days": 5}, "gap_if_empty", "eastmoney_serial"),
+    ("margin", "query_margin", {"code": "${input.code}"}, "allow_no_record", "eastmoney_serial"),
+    ("holders", "query_holders", {"code": "${input.code}"}, "allow_no_record", "eastmoney_serial"),
+    ("announcements", "query_announcements", {"code": "${input.code}"}, "allow_no_record", "parallel_safe"),
+    ("lockup", "query_lockup", {"code": "${input.code}"}, "allow_no_record", "eastmoney_serial"),
+    ("concepts", "query_concepts", {"code": "${input.code}"}, "gap_if_empty", "eastmoney_serial"),
+    ("reports", "query_reports", {"code": "${input.code}"}, "allow_no_record", "parallel_safe"),
+    ("news", "query_news", {"code": "${input.code}"}, "allow_no_record", "parallel_safe"),
+]
+
+
 def test_debate_tool_contract_matches_executor_policies_and_yaml_arguments() -> None:
     debate = load_all_production_workflows(PRODUCTION_WORKFLOWS_DIR, BUILTIN_SKILLS_DIR)["debate"]
     assert isinstance(debate, StagedResearchConfig)
-    expected = [
-        ("quote", "query_quote", {"codes": ["${input.code}"]}, "gap_if_empty", "parallel_safe"),
-        ("valuation", "query_valuation", {"code": "${input.code}"}, "gap_if_empty", "eastmoney_serial"),
-        ("valuation_percentile", "query_valuation_percentile", {"code": "${input.code}"}, "gap_if_empty", "parallel_safe"),
-        ("financials", "query_financials", {"code": "${input.code}"}, "gap_if_empty", "parallel_safe"),
-        ("kline", "query_kline", {"code": "${input.code}", "count": 60}, "gap_if_empty", "parallel_safe"),
-        ("fund_flow", "query_fund_flow", {"code": "${input.code}", "days": 5}, "gap_if_empty", "eastmoney_serial"),
-        ("margin", "query_margin", {"code": "${input.code}"}, "allow_no_record", "eastmoney_serial"),
-        ("holders", "query_holders", {"code": "${input.code}"}, "allow_no_record", "eastmoney_serial"),
-        ("announcements", "query_announcements", {"code": "${input.code}"}, "allow_no_record", "parallel_safe"),
-        ("lockup", "query_lockup", {"code": "${input.code}"}, "allow_no_record", "eastmoney_serial"),
-        ("concepts", "query_concepts", {"code": "${input.code}"}, "gap_if_empty", "eastmoney_serial"),
-        ("reports", "query_reports", {"code": "${input.code}"}, "allow_no_record", "parallel_safe"),
-        ("news", "query_news", {"code": "${input.code}"}, "allow_no_record", "parallel_safe"),
-    ]
+    expected = DEBATE_DOSSIER_CONTRACT
     actual = [
         (section.id, section.tool, section.args, section.empty_policy, tool_policy(section.tool).value)
         for section in debate.dossier.sections
@@ -621,7 +626,7 @@ def test_debate_tool_contract_matches_executor_policies_and_yaml_arguments() -> 
         (6, "empty_policy", "gap_if_empty"),
     ],
 )
-def test_debate_loader_rejects_dossier_contract_drift(
+def test_debate_dossier_contract_detects_drift(
     section_index: int,
     field: str,
     value: object,
@@ -629,8 +634,15 @@ def test_debate_loader_rejects_dossier_contract_drift(
     doc = yaml.safe_load((PRODUCTION_WORKFLOWS_DIR / "debate.yaml").read_text(encoding="utf-8"))
     doc["dossier"]["sections"][section_index][field] = value
 
-    with pytest.raises(WorkflowConfigError, match="dossier.sections"):
-        validate_workflow_config(doc, workflow_id="debate")
+    # 通用 schema 校验不再拦截契约漂移（加载应成功）；漂移必须能被
+    # 上面的契约比对发现，否则防回归就失去了兜底。
+    cfg = validate_workflow_config(doc, workflow_id="debate")
+    assert isinstance(cfg, StagedResearchConfig)
+    actual = [
+        (section.id, section.tool, section.args, section.empty_policy, tool_policy(section.tool).value)
+        for section in cfg.dossier.sections
+    ]
+    assert actual != DEBATE_DOSSIER_CONTRACT
 
 
 @pytest.mark.parametrize("invalid_value", [True, "1000"])

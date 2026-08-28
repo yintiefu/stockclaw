@@ -1,5 +1,5 @@
 schema_version: 1
-config_version: 1
+config_version: 2
 id: daily_review
 kind: single_pass
 skill: builtin/market-review

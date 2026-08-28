@@ -1,26 +1,57 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  createWorkflowThread,
-  getEffectiveWorkflowDetail,
-  searchWorkflowHistory,
-  startWorkflowRun,
-  type WorkflowStartOptions,
-} from "@/lib/agent/workflow-client";
-import type { WorkflowState } from "@/lib/agent/workflow-types";
+import { searchWorkflowHistory } from "@/lib/agent/workflow-client";
+import type { WorkflowState, WorkflowStatus } from "@/lib/agent/workflow-types";
 import { DailyReview } from "./DailyReview";
+
+// 页面唯一的消费面是 useWorkflowRun：替身直接驱动渲染。
+const runMock = vi.hoisted(() => {
+  const fields: {
+    threadId: string | null;
+    state: WorkflowState | null;
+    transient: Record<string, string>;
+    running: boolean;
+    status: WorkflowStatus;
+    error: string | null;
+  } = { threadId: null, state: null, transient: {}, running: false, status: "pending", error: null };
+  const listeners = new Set<() => void>();
+  const set = (patch: Partial<typeof fields>) => {
+    Object.assign(fields, patch);
+    for (const l of [...listeners]) l();
+  };
+  const reset = () => {
+    Object.assign(fields, { threadId: null, state: null, transient: {}, running: false, status: "pending", error: null });
+  };
+  const start = vi.fn(async () => ({ state: fields.state, error: fields.error }));
+  const stop = vi.fn(async () => {});
+  const retry = vi.fn(async () => {});
+  const restore = vi.fn(async () => {});
+  const remove = vi.fn(async () => {});
+  return { fields, listeners, set, reset, start, stop, retry, restore, remove };
+});
+
+vi.mock("@/hooks/useWorkflowRun", async () => {
+  const { useEffect, useState } = await import("react");
+  return {
+    useWorkflowRun: vi.fn(() => {
+      const [, bump] = useState(0);
+      useEffect(() => {
+        const l = () => bump((v) => v + 1);
+        runMock.listeners.add(l);
+        return () => { runMock.listeners.delete(l); };
+      }, []);
+      return { ...runMock.fields, start: runMock.start, stop: runMock.stop, retry: runMock.retry, restore: runMock.restore, remove: runMock.remove };
+    }),
+  };
+});
 
 vi.mock("@/lib/agent/workflow-client", () => ({
   createWorkflowThread: vi.fn(),
-  startWorkflowRun: vi.fn(),
-  cancelWorkflowRun: vi.fn(),
-  retryWorkflowRun: vi.fn(),
-  getEffectiveWorkflowDetail: vi.fn(),
-  getWorkflowState: vi.fn(),
-  reconnectWorkflowRun: vi.fn(),
   deleteWorkflowThread: vi.fn(),
+  getWorkflowState: vi.fn(),
+  getEffectiveWorkflowDetail: vi.fn(),
   searchWorkflowHistory: vi.fn(),
 }));
 
@@ -40,40 +71,17 @@ vi.mock("@/lib/api", () => ({
 
 import { api } from "@/lib/api";
 
-const mocked = {
-  createWorkflowThread: vi.mocked(createWorkflowThread),
-  startWorkflowRun: vi.mocked(startWorkflowRun),
-  searchWorkflowHistory: vi.mocked(searchWorkflowHistory),
-  getEffectiveWorkflowDetail: vi.mocked(getEffectiveWorkflowDetail),
-};
+const mocked = { searchWorkflowHistory: vi.mocked(searchWorkflowHistory) };
 
 const reviewText = "## 复盘\n\n- 缩量整理，成交下降";
 
-function mockReviewRun() {
-  mocked.startWorkflowRun.mockImplementation(async (options: WorkflowStartOptions) => {
-    options.onRunCreated?.("run-d");
-    const checkpoint: WorkflowState = {
-      workflow_id: "daily_review",
-      workflow_status: "completed",
-      stages: { daily_review: { id: "daily_review", status: "completed", content: reviewText } },
-      result: reviewText,
-      result_summary: "复盘完成",
-    };
-    options.onState?.({
-      runId: "run-d",
-      lastSeq: 1,
-      currentStage: null,
-      transient: {},
-      dirtyStages: [],
-      dirtyRuns: [],
-      pendingCheckpointStages: [],
-      checkpoint,
-      checkpointRequired: false,
-      recoverableError: null,
-    });
-    return { threadId: options.threadId, runId: "run-d", stream: { checkpoint } as never };
-  });
-}
+const reviewState = (): WorkflowState => ({
+  workflow_id: "daily_review",
+  workflow_status: "completed",
+  stages: { daily_review: { id: "daily_review", status: "completed", message_id: "m-d" } },
+  messages: [{ id: "m-d", content: reviewText }],
+  result_summary: "复盘完成",
+});
 
 afterEach(() => {
   cleanup();
@@ -82,6 +90,7 @@ afterEach(() => {
 });
 
 beforeEach(() => {
+  runMock.reset();
   vi.mocked(api.indices).mockResolvedValue([
     { name: "上证指数", price: "3000", change_pct: 1.2 },
     { name: "深证成指", price: "9000", change_pct: -0.5 },
@@ -91,65 +100,55 @@ beforeEach(() => {
   vi.mocked(api.emotion).mockResolvedValue(null);
   vi.mocked(api.turnoverTop).mockResolvedValue(null);
   vi.mocked(api.quote).mockResolvedValue({});
-  mocked.createWorkflowThread.mockResolvedValue("thread-d");
   mocked.searchWorkflowHistory.mockResolvedValue([]);
-  mockReviewRun();
 });
+
+function renderPage() {
+  return render(
+    <MemoryRouter>
+      <DailyReview />
+    </MemoryRouter>,
+  );
+}
 
 describe("DailyReview workflow", () => {
   it("sends the already-rendered market snapshot; the graph never refetches it", async () => {
-    render(
-      <MemoryRouter>
-        <DailyReview />
-      </MemoryRouter>,
-    );
+    renderPage();
     await waitFor(() => expect(screen.getByText("上证指数")).toBeInTheDocument());
 
     await userEvent.click(screen.getByRole("button", { name: "让 AI 复盘今天" }));
 
-    await waitFor(() => expect(mocked.startWorkflowRun).toHaveBeenCalled());
-    expect(mocked.createWorkflowThread).toHaveBeenCalledWith("daily_review", {
-      title: expect.stringContaining("每日复盘"),
-      subject: expect.any(String),
-      config_version: 1,
-    });
-    const call = mocked.startWorkflowRun.mock.calls[0]?.[0];
-    const snapshot = (call.input as { input: { market_snapshot?: string } }).input.market_snapshot;
-    expect(snapshot).toContain("上证指数 3000（+1.2%）");
-    expect(snapshot).toContain("深证成指 9000（-0.5%）");
+    await waitFor(() => expect(runMock.start).toHaveBeenCalled());
+    const params = runMock.start.mock.calls[0]?.[0];
+    expect(params?.metadata?.title).toContain("每日复盘");
+    expect(typeof params?.metadata?.subject).toBe("string");
+    expect(params?.input.market_snapshot).toContain("上证指数 3000（+1.2%）");
+    expect(params?.input.market_snapshot).toContain("深证成指 9000（-0.5%）");
   });
 
   it("renders the completed review markdown and keeps save-note", async () => {
-    render(
-      <MemoryRouter>
-        <DailyReview />
-      </MemoryRouter>,
-    );
+    renderPage();
     await userEvent.click(screen.getByRole("button", { name: "让 AI 复盘今天" }));
+    act(() => {
+      runMock.set({ threadId: "thread-d", state: reviewState(), status: "completed" });
+    });
 
     expect(await screen.findByText("缩量整理，成交下降")).toBeInTheDocument();
     expect(await screen.findByRole("button", { name: /存入沉淀|保存/ })).toBeInTheDocument();
   });
 
   it("shows a terminal error state on failure", async () => {
-    mocked.startWorkflowRun.mockRejectedValueOnce(new Error("复盘失败"));
-    mocked.getWorkflowState = mocked.getWorkflowState;
-    render(
-      <MemoryRouter>
-        <DailyReview />
-      </MemoryRouter>,
-    );
+    renderPage();
     await userEvent.click(screen.getByRole("button", { name: "让 AI 复盘今天" }));
+    act(() => {
+      runMock.set({ threadId: "thread-d", running: false, status: "failed", error: "复盘失败" });
+    });
 
     expect(await screen.findByText(/复盘失败/)).toBeInTheDocument();
   });
 
   it("renders its own daily review history without other workflow types", async () => {
-    render(
-      <MemoryRouter>
-        <DailyReview />
-      </MemoryRouter>,
-    );
+    renderPage();
     await waitFor(() => expect(mocked.searchWorkflowHistory).toHaveBeenCalledWith("daily_review", undefined));
   });
 
@@ -168,28 +167,15 @@ describe("DailyReview workflow", () => {
         resultSummary: "缩量整理",
       },
     ]);
-    mocked.getEffectiveWorkflowDetail.mockResolvedValue({
-      state: {
-        workflow_id: "daily_review",
-        workflow_status: "completed",
-        stages: { daily_review: { id: "daily_review", status: "completed", content: reviewText } },
-        result: reviewText,
-        result_summary: "复盘完成",
-      } as WorkflowState,
-      threadStatus: "idle",
-      workflowStatus: "completed",
-      status: "completed",
-    });
 
-    render(
-      <MemoryRouter>
-        <DailyReview />
-      </MemoryRouter>,
-    );
+    renderPage();
 
     await userEvent.click(await screen.findByRole("button", { name: "查看" }));
 
-    expect(mocked.getEffectiveWorkflowDetail).toHaveBeenCalledWith("thread-h");
+    await waitFor(() => expect(runMock.restore).toHaveBeenCalledWith("thread-h"));
+    act(() => {
+      runMock.set({ threadId: "thread-h", state: reviewState(), status: "completed" });
+    });
     expect(await screen.findByText("缩量整理，成交下降")).toBeInTheDocument();
   });
 
@@ -209,26 +195,13 @@ describe("DailyReview workflow", () => {
         resultSummary: "缩量整理",
       },
     ]);
-    mocked.getEffectiveWorkflowDetail.mockResolvedValue({
-      state: {
-        workflow_id: "daily_review",
-        workflow_status: "completed",
-        stages: {},
-        result: reviewText,
-        result_summary: "复盘完成",
-      } as WorkflowState,
-      threadStatus: "idle",
-      workflowStatus: "completed",
-      status: "completed",
-    });
 
-    render(
-      <MemoryRouter>
-        <DailyReview />
-      </MemoryRouter>,
-    );
+    renderPage();
 
     await userEvent.click(await screen.findByRole("button", { name: "查看" }));
+    act(() => {
+      runMock.set({ threadId: "thread-h", state: reviewState(), status: "completed" });
+    });
     await screen.findByText("缩量整理，成交下降");
     await userEvent.click(screen.getByRole("button", { name: /存入沉淀/ }));
 

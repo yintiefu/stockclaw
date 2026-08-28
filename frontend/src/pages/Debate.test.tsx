@@ -1,45 +1,72 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  cancelWorkflowRun,
-  createWorkflowThread,
-  getWorkflowState,
-  searchWorkflowHistory,
-  startWorkflowRun,
-  type WorkflowStartOptions,
-} from "@/lib/agent/workflow-client";
-import type { WorkflowState } from "@/lib/agent/workflow-types";
+import { searchWorkflowHistory } from "@/lib/agent/workflow-client";
+import type { WorkflowState, WorkflowStatus } from "@/lib/agent/workflow-types";
 import { Debate } from "./Debate";
+
+// 页面唯一的消费面是 useWorkflowRun：替身直接驱动渲染（values/transient/status/error），
+// 不再触及 workflow-client 内部函数（client 只剩 WorkflowHistory 用的 search）。
+const runMock = vi.hoisted(() => {
+  const fields: {
+    threadId: string | null;
+    state: WorkflowState | null;
+    transient: Record<string, string>;
+    running: boolean;
+    status: WorkflowStatus;
+    error: string | null;
+  } = {
+    threadId: null,
+    state: null,
+    transient: {},
+    running: false,
+    status: "pending",
+    error: null,
+  };
+  const listeners = new Set<() => void>();
+  const listeners2 = new Set<(event: { section_id: string; section_status: string; completed: number; total: number }) => void>();
+  const set = (patch: Partial<typeof fields>) => {
+    Object.assign(fields, patch);
+    for (const l of [...listeners]) l();
+  };
+  const reset = () => {
+    Object.assign(fields, { threadId: null, state: null, transient: {}, running: false, status: "pending", error: null });
+  };
+  const start = vi.fn(async () => ({ state: fields.state, error: null }));
+  const stop = vi.fn(async () => {});
+  const retry = vi.fn(async () => {});
+  const restore = vi.fn(async () => {});
+  const remove = vi.fn(async () => {});
+  return { fields, listeners, listeners2, set, reset, start, stop, retry, restore, remove };
+});
+
+vi.mock("@/hooks/useWorkflowRun", async () => {
+  const { useEffect, useState } = await import("react");
+  return {
+    useWorkflowRun: vi.fn((options: { onDossierProgress?: (e: never) => void }) => {
+      const [, bump] = useState(0);
+      useEffect(() => {
+        const l = () => bump((v) => v + 1);
+        runMock.listeners.add(l);
+        const l2 = (e: never) => options.onDossierProgress?.(e);
+        runMock.listeners2.add(l2);
+        return () => { runMock.listeners.delete(l); runMock.listeners2.delete(l2); };
+      }, [options]);
+      return { ...runMock.fields, start: runMock.start, stop: runMock.stop, retry: runMock.retry, restore: runMock.restore, remove: runMock.remove };
+    }),
+  };
+});
 
 vi.mock("@/lib/agent/workflow-client", () => ({
   createWorkflowThread: vi.fn(),
-  startWorkflowRun: vi.fn(),
-  cancelWorkflowRun: vi.fn(),
-  retryWorkflowRun: vi.fn(),
-  getEffectiveWorkflowDetail: vi.fn(),
-  getWorkflowState: vi.fn(),
-  reconnectWorkflowRun: vi.fn(),
   deleteWorkflowThread: vi.fn(),
+  getWorkflowState: vi.fn(),
+  getEffectiveWorkflowDetail: vi.fn(),
   searchWorkflowHistory: vi.fn(),
 }));
 
-const mocked = {
-  createWorkflowThread: vi.mocked(createWorkflowThread),
-  startWorkflowRun: vi.mocked(startWorkflowRun),
-  cancelWorkflowRun: vi.mocked(cancelWorkflowRun),
-  getWorkflowState: vi.mocked(getWorkflowState),
-  searchWorkflowHistory: vi.mocked(searchWorkflowHistory),
-};
-
-const base = {
-  workflow_id: "debate",
-  workflow_id_seq: undefined,
-  run_id: "run-1",
-  seq: 1,
-  emitted_at: "2026-08-25T12:00:00Z",
-};
+const mocked = { searchWorkflowHistory: vi.mocked(searchWorkflowHistory) };
 
 const completedState = (): WorkflowState => ({
   workflow_id: "debate",
@@ -55,57 +82,17 @@ const completedState = (): WorkflowState => ({
     has_substantive_data: true,
   },
   stages: {
-    bull: { id: "bull", status: "completed", content: "多方观点" },
-    bear: { id: "bear", status: "completed", content: "空方观点" },
-    referee: { id: "referee", status: "completed", content: "归纳分歧与验证清单" },
+    bull: { id: "bull", status: "completed", message_id: "m-bull" },
+    bear: { id: "bear", status: "completed", message_id: "m-bear" },
+    referee: { id: "referee", status: "completed", message_id: "m-referee" },
   },
-  result: "归纳分歧与验证清单",
+  messages: [
+    { id: "m-bull", content: "多方观点" },
+    { id: "m-bear", content: "空方观点" },
+    { id: "m-referee", content: "归纳分歧与验证清单" },
+  ],
   result_summary: "已完成 3 阶段",
 });
-
-/** 与真实客户端一致：先 onRunCreated，再派发事件与流状态，最后返回。 */
-function mockRun(
-  events: Parameters<NonNullable<WorkflowStartOptions["onEvent"]>>[0][],
-  checkpoint: WorkflowState | null,
-  transient: Record<string, string> = {},
-) {
-  mocked.startWorkflowRun.mockImplementation(async (options) => {
-    options.onRunCreated?.("run-1");
-    let seq = 0;
-    for (const event of events) {
-      seq += 1;
-      options.onEvent?.({ ...event, run_id: "run-1", seq, emitted_at: "2026-08-25T12:00:00Z" } as never);
-    }
-    options.onState?.({
-      runId: "run-1",
-      lastSeq: seq,
-      currentStage: checkpoint?.current_stage ?? null,
-      transient,
-      dirtyStages: [],
-      dirtyRuns: [],
-      pendingCheckpointStages: [],
-      checkpoint,
-      checkpointRequired: false,
-      recoverableError: null,
-    });
-    return {
-      threadId: options.threadId,
-      runId: "run-1",
-      stream: {
-        runId: "run-1",
-        lastSeq: seq,
-        currentStage: checkpoint?.current_stage ?? null,
-        transient,
-        dirtyStages: [],
-        dirtyRuns: [],
-        pendingCheckpointStages: [],
-        checkpoint,
-        checkpointRequired: false,
-        recoverableError: null,
-      },
-    };
-  });
-}
 
 function renderPage() {
   return render(
@@ -127,9 +114,8 @@ afterEach(() => {
 });
 
 beforeEach(() => {
-  mocked.createWorkflowThread.mockResolvedValue("thread-1");
+  runMock.reset();
   mocked.searchWorkflowHistory.mockResolvedValue([]);
-  mockRun([], completedState());
 });
 
 describe("Debate variant mapping", () => {
@@ -137,16 +123,12 @@ describe("Debate variant mapping", () => {
     renderPage();
     await startDebate();
 
-    await waitFor(() => expect(mocked.startWorkflowRun).toHaveBeenCalled());
-    expect(mocked.createWorkflowThread).toHaveBeenCalledWith("debate", {
-      title: "多空辩论 · 600519",
-      subject: "600519",
-      config_version: 1,
+    await waitFor(() => expect(runMock.start).toHaveBeenCalled());
+    expect(runMock.start).toHaveBeenCalledWith({
+      input: { code: "600519" },
+      variant: "standard",
+      metadata: { title: "多空辩论 · 600519", subject: "600519" },
     });
-    expect(mocked.startWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({
-      assistantId: "debate",
-      input: { input: { code: "600519" }, variant: "standard" },
-    }));
   });
 
   it("maps two rounds to the cross_exam variant", async () => {
@@ -155,10 +137,9 @@ describe("Debate variant mapping", () => {
     await userEvent.selectOptions(screen.getByDisplayValue("一轮 · 各自陈述"), "2");
     await userEvent.click(screen.getByRole("button", { name: "开始辩论" }));
 
-    await waitFor(() => expect(mocked.startWorkflowRun).toHaveBeenCalled());
-    expect(mocked.startWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({
-      input: { input: { code: "600519" }, variant: "cross_exam" },
-    }));
+    await waitFor(() => expect(runMock.start).toHaveBeenCalledWith(expect.objectContaining({
+      variant: "cross_exam",
+    })));
   });
 
   it("rejects an invalid code before any workflow call", async () => {
@@ -167,34 +148,86 @@ describe("Debate variant mapping", () => {
     await userEvent.click(screen.getByRole("button", { name: "开始辩论" }));
 
     expect(await screen.findByText("请输入 6 位 A 股代码")).toBeInTheDocument();
-    expect(mocked.createWorkflowThread).not.toHaveBeenCalled();
+    expect(runMock.start).not.toHaveBeenCalled();
   });
 });
 
 describe("Debate streaming display", () => {
-  it("shows dossier progress, missing sections, stage labels, and streamed stage text", async () => {
-    mockRun([
-      { type: "dossier.progress", section_id: "quote", section_status: "completed", completed: 1, total: 13, workflow_id: "debate", ...base },
-      { type: "dossier.progress", section_id: "margin", section_status: "no_record", completed: 2, total: 13, workflow_id: "debate", ...base },
-      { type: "dossier.progress", section_id: "concepts", section_status: "gap", completed: 3, total: 13, workflow_id: "debate", ...base },
-      { type: "dossier.ready", completed: 12, missing: ["板块与概念归属"], has_substantive_data: true, workflow_id: "debate", ...base },
-      { type: "stage.started", stage_id: "bull", label: "多方研究员", workflow_id: "debate", ...base },
-      { type: "stage.delta", stage_id: "bull", delta: "多方正在立论", workflow_id: "debate", ...base },
-    ] as never, null, { bull: "多方正在立论" });
+  it("shows dossier progress ticks from custom events and missing sections from values", async () => {
     renderPage();
     await startDebate();
+
+    act(() => {
+      for (const l of [...runMock.listeners2]) {
+        l({ section_id: "quote", section_status: "completed", completed: 1, total: 13 });
+        l({ section_id: "margin", section_status: "no_record", completed: 2, total: 13 });
+      }
+    });
+    act(() => {
+      runMock.set({
+        threadId: "thread-1",
+        running: true,
+        status: "running",
+        transient: { bull: "多方正在立论" },
+        state: {
+          workflow_status: "running",
+          current_stage: "bull",
+          stages: { bull: { id: "bull", status: "running" } },
+        },
+      });
+    });
 
     expect(await screen.findByText("实时行情")).toBeInTheDocument();
     expect(screen.getByText("融资融券")).toBeInTheDocument();
-    expect(screen.getByText(/未取到：板块与概念归属/)).toBeInTheDocument();
     expect(screen.getByText("多方研究员")).toBeInTheDocument();
     expect(screen.getByText("多方正在立论")).toBeInTheDocument();
+    expect(screen.getByText(/正在拉取客观事实底稿/)).toBeInTheDocument();
+
+    // 底稿落进 checkpoint 后：缺口由 values 派生（dossier.ready 事件已消亡）
+    act(() => {
+      runMock.set({
+        state: {
+          workflow_status: "running",
+          current_stage: "bull",
+          dossier: {
+            sections: [
+              { id: "quote", tool: "query_quote", title: "实时行情", empty_policy: "gap_if_empty", status: "completed", summary: "", body: "" },
+              { id: "concepts", tool: "query_concepts", title: "板块与概念归属", empty_policy: "gap_if_empty", status: "gap", summary: "", body: "" },
+            ],
+            summary: "",
+            missing: ["板块与概念归属"],
+            has_substantive_data: true,
+          },
+          stages: { bull: { id: "bull", status: "running" } },
+        },
+      });
+    });
+    expect(await screen.findByText(/未取到：板块与概念归属/)).toBeInTheDocument();
   });
 
-  it("replaces transient text with authoritative checkpoint stage content", async () => {
-    mockRun([], completedState());
+  it("falls back to a static dossier-phase status when custom events never arrive (v2 runtime drops them)", async () => {
     renderPage();
     await startDebate();
+    // 运行中但既无 dossier 快照也无 custom 事件（langgraph v3 流路径实测不转发）——
+    // 页面仍必须有可感知的进度反馈，不能静默 35 秒。
+    act(() => {
+      runMock.set({
+        threadId: "thread-1",
+        running: true,
+        status: "running",
+        state: { workflow_status: "running", stages: {} },
+      });
+    });
+
+    expect(await screen.findByText(/正在拉取客观事实底稿/)).toBeInTheDocument();
+  });
+
+  it("replaces transient text with authoritative message-pointer stage content", async () => {
+    renderPage();
+    await startDebate();
+    act(() => {
+      runMock.set({ threadId: "thread-1", state: completedState(), status: "completed" });
+    });
 
     expect(await screen.findByText("多方观点")).toBeInTheDocument();
     expect(screen.getByText("空方观点")).toBeInTheDocument();
@@ -202,70 +235,56 @@ describe("Debate streaming display", () => {
   });
 
   it("never labels a winner — referee stays a neutral host", async () => {
-    mockRun([
-      { type: "stage.started", stage_id: "referee", label: "中立主持", workflow_id: "debate", ...base },
-    ] as never, completedState());
     renderPage();
     await startDebate();
+    act(() => {
+      runMock.set({ threadId: "thread-1", state: completedState(), status: "completed" });
+    });
 
     await waitFor(() => expect(screen.getByText("中立主持")).toBeInTheDocument());
     for (const banned of [/胜[者负]/, /赢家/, /获胜/]) {
       expect(screen.queryByText(banned)).not.toBeInTheDocument();
     }
   });
-
-  it("restores stage display from history state including the dossier", async () => {
-    mockRun([], null);
-    renderPage();
-    await startDebate();
-    await waitFor(() => expect(mocked.startWorkflowRun).toHaveBeenCalled());
-
-    // 恢复历史：直接用完成的 state 渲染（WorkflowHistory 打开路径）
-    mockRun([], completedState());
-    await userEvent.click(screen.getByRole("button", { name: "开始辩论" }));
-
-    expect(await screen.findByText("归纳分歧与验证清单")).toBeInTheDocument();
-  });
 });
 
 describe("Debate stop, failure, and history", () => {
-  it("stops the server run through cancellation", async () => {
-    mocked.cancelWorkflowRun.mockResolvedValue(undefined);
-    mocked.getWorkflowState.mockResolvedValue({
-      ...completedState(),
-      workflow_status: "cancelled",
-      stages: { bull: { id: "bull", status: "cancelled", content: null } },
-    });
-    // 真实辩论要跑几分钟：先绑定 run_id，再用一个不落地的 Promise 保持 running 状态。
-    mocked.startWorkflowRun.mockImplementation((options) => {
-      options.onRunCreated?.("run-1");
-      return new Promise(() => {});
-    });
+  it("stops through the run controller when aborted", async () => {
     renderPage();
     await startDebate();
+    act(() => {
+      runMock.set({ threadId: "thread-1", running: true, status: "running" });
+    });
 
     await waitFor(() => expect(screen.getByRole("button", { name: "中止" })).toBeInTheDocument());
     await userEvent.click(screen.getByRole("button", { name: "中止" }));
 
-    await waitFor(() => expect(mocked.cancelWorkflowRun).toHaveBeenCalledWith("thread-1", "run-1"));
+    await waitFor(() => expect(runMock.stop).toHaveBeenCalled());
   });
 
-  it("shows a terminal failure instead of a permanent spinner", async () => {
-    mocked.startWorkflowRun.mockRejectedValueOnce(Object.assign(new Error("模型连接失败"), { code: "MODEL_ERROR" }));
-    mocked.getWorkflowState.mockResolvedValue({
-      ...completedState(),
-      workflow_status: "failed",
-      stages: { bull: { id: "bull", status: "failed", content: null } },
-    });
+  it("shows a terminal failure with a retry action instead of a permanent spinner", async () => {
     renderPage();
     await startDebate();
+    act(() => {
+      runMock.set({
+        threadId: "thread-1",
+        running: false,
+        status: "failed",
+        error: "模型推理执行异常",
+        state: {
+          workflow_status: "failed",
+          stages: { bull: { id: "bull", status: "failed" } },
+        },
+      });
+    });
 
-    expect(await screen.findByText(/模型连接失败/)).toBeInTheDocument();
+    expect(await screen.findByText(/模型推理执行异常/)).toBeInTheDocument();
     expect(screen.queryByText("生成中…")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "从失败阶段重试" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "开始辩论" })).toBeInTheDocument();
   });
 
-  it("renders isolated debate history and re-runs on a new thread", async () => {
+  it("renders isolated debate history rows", async () => {
     mocked.searchWorkflowHistory.mockResolvedValue([{
       threadId: "wf-old",
       title: "多空辩论 · 000001",
@@ -285,9 +304,11 @@ describe("Debate stop, failure, and history", () => {
   });
 
   it("keeps the save-note action working on completed stages", async () => {
-    mockRun([], completedState());
     renderPage();
     await startDebate();
+    act(() => {
+      runMock.set({ threadId: "thread-1", state: completedState(), status: "completed" });
+    });
 
     const save = await screen.findByRole("button", { name: "存入沉淀" });
     await userEvent.click(save);

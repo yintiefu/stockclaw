@@ -1,338 +1,346 @@
-import { act, renderHook, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ThreadStatus } from "@langchain/langgraph-sdk";
+// useWorkflowRun v2 控制器测试：mock useWorkflowStream（消费面）+ workflow-client。
+// 覆盖 R3-R5 评审回归：C1 fail-closed、I3 跨线程污染、I4 retry 显式 threadId、
+// I5 建线程失败、I6 首屏 pending、I7 restore 竞态、I1/I8 stop 收敛三分支、C2 终态优先。
+import { act, renderHook } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  cancelWorkflowRun,
   createWorkflowThread,
   deleteWorkflowThread,
   getEffectiveWorkflowDetail,
   getWorkflowState,
-  reconnectWorkflowRun,
-  retryWorkflowRun,
-  startWorkflowRun,
-  type WorkflowClientEvent,
-  type WorkflowStartOptions,
-  type WorkflowStreamResult,
 } from "@/lib/agent/workflow-client";
-import type { WorkflowStreamState } from "@/lib/agent/workflow-stream";
 import type { WorkflowState } from "@/lib/agent/workflow-types";
-import { saveWorkflowStreamCursor } from "@/lib/storage";
-import { useWorkflowRun, type WorkflowStartParams } from "./useWorkflowRun";
+import { useWorkflowRun } from "./useWorkflowRun";
+
+const streamMock = vi.hoisted(() => {
+  type Snap = {
+    values: Record<string, unknown>;
+    messages: unknown[];
+    threadId: string | null;
+    isLoading: boolean;
+    error: unknown;
+    transient: Record<string, string>;
+  };
+  const initial = (): Snap => ({ values: {}, messages: [], threadId: null, isLoading: false, error: undefined, transient: {} });
+  const listeners = new Set<() => void>();
+  const state = initial();
+  const bump = () => { for (const l of [...listeners]) l(); };
+  const update = (patch: Partial<Snap>) => { Object.assign(state, patch); bump(); };
+  const reset = () => { Object.assign(state, initial()); };
+  const submit = vi.fn(async () => {});
+  const stop = vi.fn(async () => {});
+  return { state, listeners, submit, stop, update, reset };
+});
+
+vi.mock("@/hooks/useWorkflowStream", async () => {
+  const { useEffect, useState } = await import("react");
+  return {
+    useWorkflowStream: vi.fn(() => {
+      const [snap, setSnap] = useState({ ...streamMock.state });
+      useEffect(() => {
+        const l = () => setSnap({ ...streamMock.state });
+        streamMock.listeners.add(l);
+        return () => { streamMock.listeners.delete(l); };
+      }, []);
+      return {
+        state: snap.values,
+        running: snap.isLoading,
+        threadId: snap.threadId,
+        error: snap.error,
+        transient: snap.transient,
+        submit: streamMock.submit,
+        stop: streamMock.stop,
+      };
+    }),
+  };
+});
 
 vi.mock("@/lib/agent/workflow-client", () => ({
   createWorkflowThread: vi.fn(),
-  startWorkflowRun: vi.fn(),
-  cancelWorkflowRun: vi.fn(),
-  retryWorkflowRun: vi.fn(),
-  getEffectiveWorkflowDetail: vi.fn(),
-  getWorkflowState: vi.fn(),
-  reconnectWorkflowRun: vi.fn(),
   deleteWorkflowThread: vi.fn(),
+  getWorkflowState: vi.fn(),
+  getEffectiveWorkflowDetail: vi.fn(),
   searchWorkflowHistory: vi.fn(),
 }));
 
-const mocked = {
-  createWorkflowThread: vi.mocked(createWorkflowThread),
-  startWorkflowRun: vi.mocked(startWorkflowRun),
-  cancelWorkflowRun: vi.mocked(cancelWorkflowRun),
-  retryWorkflowRun: vi.mocked(retryWorkflowRun),
-  getEffectiveWorkflowDetail: vi.mocked(getEffectiveWorkflowDetail),
-  getWorkflowState: vi.mocked(getWorkflowState),
-  reconnectWorkflowRun: vi.mocked(reconnectWorkflowRun),
-  deleteWorkflowThread: vi.mocked(deleteWorkflowThread),
-};
-
-const finishedState: WorkflowState = {
-  workflow_id: "debate",
-  workflow_status: "completed",
-  stages: {
-    bull: { id: "bull", status: "completed", content: "多方观点" },
-    referee: { id: "referee", status: "completed", content: "归纳分歧" },
-  },
-  result: "归纳分歧",
-  result_summary: "已完成 3 阶段",
-};
-
-const streamOf = (
-  checkpoint: WorkflowState | null,
-  transient: Record<string, string> = {},
-  runId = "run-1",
-): WorkflowStreamState => ({
-  runId,
-  lastSeq: 4,
-  currentStage: checkpoint?.current_stage ?? null,
-  transient,
-  dirtyStages: [],
-  dirtyRuns: [],
-  pendingCheckpointStages: [],
-  checkpoint,
-  checkpointRequired: false,
-  recoverableError: null,
+const mkState = (workflow_status: WorkflowState["workflow_status"], extra: Partial<WorkflowState> = {}): WorkflowState => ({
+  workflow_status,
+  stages: {},
+  ...extra,
 });
 
-/** 让 startWorkflowRun 在流内同步派发事件/状态后再返回，模拟真实流的回调时序。 */
-function mockStart(
-  checkpoint: WorkflowState | null,
-  events: WorkflowClientEvent[] = [],
-  transient: Record<string, string> = {},
-) {
-  mocked.startWorkflowRun.mockImplementation(async (options: WorkflowStartOptions) => {
-    options.onRunCreated?.("run-1");
-    for (const event of events) options.onEvent?.(event);
-    const stream = streamOf(checkpoint, transient);
-    options.onState?.(stream);
-    const result: WorkflowStreamResult = {
-      threadId: options.threadId, runId: "run-1", stream,
-    };
-    return result;
+const detail = (threadStatus: "idle" | "busy" | "interrupted" | "error", state: WorkflowState) => ({
+  state,
+  threadStatus,
+  workflowStatus: state.workflow_status,
+  status: state.workflow_status,
+});
+
+describe("useWorkflowRun (v2)", () => {
+  beforeEach(() => {
+    streamMock.reset();
+    vi.clearAllMocks();
+    streamMock.submit.mockImplementation(async () => {});
+    vi.mocked(createWorkflowThread).mockResolvedValue("t1");
+    vi.mocked(getWorkflowState).mockResolvedValue(mkState("completed"));
+    vi.mocked(getEffectiveWorkflowDetail).mockResolvedValue(detail("idle", mkState("completed")));
+    vi.mocked(deleteWorkflowThread).mockResolvedValue(undefined);
   });
-}
+  afterEach(() => { vi.useRealTimers(); });
 
-const deltaEvent = (stageId: string, delta: string): WorkflowClientEvent => ({
-  type: "stage.delta",
-  stage_id: stageId,
-  delta,
-  workflow_id: "debate",
-  run_id: "run-1",
-  seq: 3,
-  emitted_at: "2026-08-25T12:00:00Z",
-});
-
-beforeEach(() => {
-  vi.clearAllMocks();
-  localStorage.clear();
-  mocked.createWorkflowThread.mockResolvedValue("thread-1");
-  mockStart(finishedState, [deltaEvent("bull", "多方")], { bull: "多方" });
-});
-
-const debateParams: WorkflowStartParams = {
-  input: { code: "600519" },
-  variant: "cross_exam",
-  metadata: { title: "多空辩论 · 600519", subject: "600519" },
-};
-
-describe("useWorkflowRun start", () => {
-  it("creates a workflow thread with channel metadata and starts the graph run", async () => {
-    const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
-
-    await act(() => result.current.start(debateParams));
-
-    expect(mocked.createWorkflowThread).toHaveBeenCalledWith("debate", {
-      title: "多空辩论 · 600519",
-      subject: "600519",
-      config_version: 1,
-    });
-    expect(mocked.startWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({
-      threadId: "thread-1",
-      assistantId: "debate",
-      input: { input: { code: "600519" }, variant: "cross_exam" },
+  it("① start：建线程（metadata 透传）→ submit({input},{threadId,onError})；failed checkpoint 派生错误且不抛（C1）", async () => {
+    vi.mocked(getWorkflowState).mockResolvedValue(mkState("failed", {
+      errors: [{ code: "MODEL_ERROR", message: "模型推理执行异常", retryable: true }],
     }));
-    expect(result.current.threadId).toBe("thread-1");
-    expect(result.current.runId).toBe("run-1");
-    expect(result.current.running).toBe(false);
-  });
-
-  it("exposes authoritative checkpoint state and transient per-stage text during the run", async () => {
     const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
 
-    await act(() => result.current.start(debateParams));
+    let outcome: { state: WorkflowState | null; error: string | null } | undefined;
+    await act(async () => {
+      outcome = await result.current.start({
+        input: { code: "600519" },
+        variant: "standard",
+        metadata: { title: "多空辩论 · 600519", subject: "600519" },
+      });
+    });
 
-    expect(result.current.state).toEqual(finishedState);
-    expect(result.current.transient).toEqual({ bull: "多方" });
-    expect(result.current.status).toBe("completed");
+    expect(vi.mocked(createWorkflowThread)).toHaveBeenCalledWith("debate", {
+      title: "多空辩论 · 600519", subject: "600519",
+    });
+    expect(streamMock.submit).toHaveBeenCalledWith(
+      { input: { code: "600519" }, variant: "standard" },
+      { threadId: "t1", onError: expect.any(Function) },
+    );
+    expect(outcome!.state?.workflow_status).toBe("failed");
+    expect(outcome!.error).toContain("模型推理执行异常");
+    expect(result.current.error).toContain("模型推理执行异常");
   });
 
-  it("forwards typed events to the page handler", async () => {
-    const onEvent = vi.fn();
-    const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate", onEvent }));
-
-    await act(() => result.current.start(debateParams));
-
-    expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({
-      type: "stage.delta", stage_id: "bull", delta: "多方",
-    }));
-  });
-
-  it("restarting always creates a new thread so the old result is preserved", async () => {
-    mocked.createWorkflowThread.mockResolvedValueOnce("thread-a").mockResolvedValueOnce("thread-b");
+  it("② fail closed：submit 正常 resolve 但读不到终态 → {state:null,error}，绝不双空（I3）", async () => {
+    vi.mocked(getWorkflowState).mockResolvedValue(mkState("running"));
     const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
 
-    await act(() => result.current.start(debateParams));
-    await act(() => result.current.start(debateParams));
+    let outcome: { state: WorkflowState | null; error: string | null } | undefined;
+    await act(async () => {
+      outcome = await result.current.start({ input: { code: "600519" } });
+    });
+    expect(outcome).toEqual({ state: null, error: "工作流未能完成：未读取到终态，请在历史记录中确认" });
 
-    expect(mocked.createWorkflowThread).toHaveBeenCalledTimes(2);
-    expect(result.current.threadId).toBe("thread-b");
+    // getState 持续 reject 同样 fail closed
+    vi.mocked(getWorkflowState).mockRejectedValue(new Error("boom"));
+    await act(async () => {
+      outcome = await result.current.start({ input: { code: "600519" } });
+    });
+    expect(outcome!.state).toBeNull();
+    expect(outcome!.error).toBeTruthy();
   });
 
-  it("surfaces a terminal error and refreshes checkpoint state on failure", async () => {
-    mocked.startWorkflowRun.mockRejectedValueOnce(Object.assign(new Error("模型不可用"), { code: "MODEL_ERROR" }));
-    mocked.getWorkflowState.mockResolvedValue({
-      ...finishedState,
-      workflow_status: "failed",
-      stages: {
-        bull: { id: "bull", status: "failed", content: null, error: { code: "MODEL_ERROR", message: "模型不可用", retryable: true } },
-      },
+  it("③ 跨线程不污染：A 线程 values 在场时 start B 失败，outcome.state 不得是 A 的状态（I3）", async () => {
+    act(() => {
+      streamMock.update({
+        values: { workflow_status: "completed", stages: { bull: { id: "bull", status: "completed", message_id: "m1" } } },
+        messages: [{ id: "m1", content: "A 线程正文" }],
+        threadId: "tA",
+      });
+    });
+    vi.mocked(getWorkflowState).mockRejectedValue(new Error("unreachable"));
+    const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
+
+    let outcome: { state: WorkflowState | null; error: string | null } | undefined;
+    await act(async () => {
+      outcome = await result.current.start({ input: { code: "600519" } });
+    });
+    expect(outcome!.state).toBeNull();
+    expect(outcome!.error).toBeTruthy();
+  });
+
+  it("④ createWorkflowThread reject → start 返回 {state:null,error} 且不抛（I5）", async () => {
+    vi.mocked(createWorkflowThread).mockRejectedValue(new Error("网络不可达"));
+    const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
+
+    let outcome: { state: WorkflowState | null; error: string | null } | undefined;
+    await act(async () => {
+      outcome = await result.current.start({ input: { code: "600519" } });
+    });
+    expect(outcome!.state).toBeNull();
+    expect(outcome!.error).toBe("网络不可达");
+    expect(result.current.error).toBe("网络不可达");
+  });
+
+  it("⑤ retry 始终 submit({resume:true},{threadId})：restore 后立即 retry 也提交到新线程；恢复失败有横幅（I4）", async () => {
+    vi.mocked(createWorkflowThread).mockResolvedValue("t2");
+    let resolveDetail!: (v: unknown) => void;
+    vi.mocked(getEffectiveWorkflowDetail).mockImplementation(
+      () => new Promise((resolve) => { resolveDetail = resolve; }),  // 详情悬挂：检验同步 threadIdRef
+    );
+    // dispatch 前是旧终态（无错误消息）；本次 run 的写入带新 completed_at + 错误
+    let readCount = 0;
+    vi.mocked(getWorkflowState).mockImplementation(async () => {
+      readCount += 1;
+      return readCount === 1
+        ? mkState("failed", { completed_at: "T0" })
+        : mkState("failed", {
+            completed_at: "T1",
+            errors: [{ code: "MODEL_ERROR", message: "模型推理执行异常", retryable: true }],
+          });
     });
     const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
 
-    await act(() => result.current.start(debateParams));
-
-    expect(result.current.error).toContain("模型不可用");
-    expect(result.current.running).toBe(false);
-    expect(result.current.state?.workflow_status).toBe("failed");
-    expect(mocked.getWorkflowState).toHaveBeenCalledWith("thread-1");
-  });
-});
-
-describe("useWorkflowRun stop and retry", () => {
-  it("stops by cancelling the server run and refreshing the cancelled checkpoint", async () => {
-    mocked.cancelWorkflowRun.mockResolvedValue(undefined);
-    mocked.getWorkflowState.mockResolvedValue({
-      ...finishedState,
-      workflow_status: "cancelled",
-      stages: {
-        bull: { id: "bull", status: "cancelled", content: null },
-      },
+    await act(async () => {
+      const restoring = result.current.restore("t2");
+      await result.current.retry();  // 详情未决时立即 retry
+      resolveDetail(detail("idle", mkState("failed")));
+      await restoring;
     });
-    const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
-    await act(() => result.current.start(debateParams));
 
-    await act(() => result.current.stop());
-
-    expect(mocked.cancelWorkflowRun).toHaveBeenCalledWith("thread-1", "run-1");
-    expect(result.current.state?.workflow_status).toBe("cancelled");
-    expect(result.current.running).toBe(false);
+    expect(streamMock.submit).toHaveBeenCalledWith(
+      { resume: true },
+      { threadId: "t2", onError: expect.any(Function) },
+    );
+    // transport 正常完成 + checkpoint failed → 横幅非空
+    expect(result.current.error).toContain("模型推理执行异常");
   });
 
-  it("retries the same thread via the workflow client without a new thread", async () => {
-    mocked.retryWorkflowRun.mockImplementation(async (threadId, _assistantId, options) => {
-      options?.onRunCreated?.("run-2");
-      options?.onState?.(streamOf({ ...finishedState, workflow_status: "running" }, { bear: "空方" }, "run-2"));
-      return { threadId, runId: "run-2", stream: streamOf(finishedState, {}, "run-2") };
-    });
-    const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
-    await act(() => result.current.start(debateParams));
-
-    await act(() => result.current.retry());
-
-    expect(mocked.retryWorkflowRun).toHaveBeenCalledWith("thread-1", "debate", expect.objectContaining({
-      onEvent: expect.any(Function),
-      onState: expect.any(Function),
-    }));
-    expect(mocked.createWorkflowThread).toHaveBeenCalledTimes(1);
-    expect(result.current.runId).toBe("run-2");
-  });
-});
-
-describe("useWorkflowRun restore and remove", () => {
-  it("restores history detail once through the effective projection", async () => {
-    mocked.getEffectiveWorkflowDetail.mockResolvedValue({
-      state: finishedState,
-      threadStatus: "idle" as ThreadStatus,
-      workflowStatus: "completed",
-      status: "completed",
+  it("⑨ retry 拒绝收敛：旧终态（篡改 checkpoint）不得短路失败判定——轮询到本次 run 写入的拒绝文案", async () => {
+    vi.mocked(createWorkflowThread).mockResolvedValue("t3");
+    // 前两次读到旧终态（completed_at 不变、无错误消息——模拟拒绝写入落盘延迟），
+    // 第三次起才是本次 run 写入的拒绝终态。
+    let readCount = 0;
+    vi.mocked(getWorkflowState).mockImplementation(async () => {
+      readCount += 1;
+      if (readCount <= 2) return mkState("failed", { completed_at: "T0", config_version: 999 });
+      return mkState("failed", {
+        completed_at: "T1",
+        config_version: 999,
+        errors: [{ code: "RESUME_CONFIG_VERSION", message: "配置版本不兼容：请查看已有状态或重新发起工作流", retryable: false }],
+      });
     });
     const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
 
-    await act(() => result.current.restore("thread-9"));
+    await act(async () => {
+      await result.current.restore("t3");
+      await result.current.retry();
+    });
 
-    expect(mocked.getEffectiveWorkflowDetail).toHaveBeenCalledTimes(1);
-    expect(mocked.getEffectiveWorkflowDetail).toHaveBeenCalledWith("thread-9");
-    expect(result.current.threadId).toBe("thread-9");
-    expect(result.current.state).toEqual(finishedState);
-    expect(result.current.status).toBe("completed");
+    expect(result.current.error).toContain("配置版本不兼容");
   });
 
-  it("derives an orphan running checkpoint as interrupted, never permanent running", async () => {
-    mocked.getEffectiveWorkflowDetail.mockResolvedValue({
-      state: { ...finishedState, workflow_status: "running" },
-      threadStatus: "idle" as ThreadStatus,
-      workflowStatus: "running",
-      status: "interrupted",
-    });
+  it("⑥ restore 竞态：a 详情晚到不覆盖 b 的 restoredStatus（I7）", async () => {
+    let resolveA!: (v: ReturnType<typeof detail>) => void;
+    const pendingA = new Promise((resolve) => { resolveA = resolve; });
+    vi.mocked(getEffectiveWorkflowDetail)
+      .mockImplementationOnce(() => pendingA as never)
+      .mockResolvedValueOnce(detail("idle", mkState("pending")));
     const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
 
-    await act(() => result.current.restore("thread-9"));
+    await act(async () => {
+      const pa = result.current.restore("a");
+      await result.current.restore("b");
+      resolveA(detail("busy", mkState("running")));
+      await pa;
+    });
 
+    expect(result.current.threadId).toBe("b");
+    // b 的 idle + pending → interrupted；若 a 的 busy 晚到覆盖则错误地变成 running
     expect(result.current.status).toBe("interrupted");
   });
 
-  it("reconnects a still-running run from the saved cursor on restore", async () => {
-    saveWorkflowStreamCursor("thread-9", { runId: "run-9", eventId: "5", lastSeq: 5 });
-    mocked.reconnectWorkflowRun.mockResolvedValue({
-      threadId: "thread-9",
-      runId: "run-9",
-      stream: streamOf(finishedState, {}, "run-9"),
+  it("⑦ 首屏 pending；成功后 completed；restore busy 线程 values 推到 completed 仍 completed（I6/C2）", async () => {
+    const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
+    expect(result.current.status).toBe("pending");
+
+    vi.mocked(getWorkflowState).mockResolvedValue(mkState("completed", {
+      stages: { bull: { id: "bull", status: "completed", message_id: "m1" } },
+    }));
+    await act(async () => {
+      await result.current.start({ input: { code: "600519" } });
     });
-    const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
-
-    await act(() => result.current.restore("thread-9"));
-
-    expect(mocked.reconnectWorkflowRun).toHaveBeenCalledWith("thread-9", expect.objectContaining({
-      runId: "run-9",
-      onEvent: expect.any(Function),
-      onState: expect.any(Function),
-    }));
-    expect(mocked.getEffectiveWorkflowDetail).not.toHaveBeenCalled();
-    expect(result.current.runId).toBe("run-9");
-  });
-
-  it("falls back to the effective detail when reconnection fails", async () => {
-    saveWorkflowStreamCursor("thread-9", { runId: "run-9", eventId: "5", lastSeq: 5 });
-    mocked.reconnectWorkflowRun.mockRejectedValue(new Error("流缓冲不存在"));
-    mocked.getEffectiveWorkflowDetail.mockResolvedValue({
-      state: finishedState,
-      threadStatus: "idle" as ThreadStatus,
-      workflowStatus: "completed",
-      status: "completed",
+    act(() => {
+      streamMock.update({
+        values: { workflow_status: "completed", stages: { bull: { id: "bull", status: "completed", message_id: "m1" } } },
+        threadId: "t1",
+        isLoading: false,
+      });
     });
-    const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
+    expect(result.current.status).toBe("completed");
 
-    await act(() => result.current.restore("thread-9"));
-
-    expect(mocked.getEffectiveWorkflowDetail).toHaveBeenCalledWith("thread-9");
-    expect(result.current.state).toEqual(finishedState);
+    // restore 一个 busy 线程（服务端 attach 的 run 已完成）：values 推到 completed 后不得停在 running
+    vi.mocked(getEffectiveWorkflowDetail).mockResolvedValue(detail("busy", mkState("running")));
+    await act(async () => { await result.current.restore("t2"); });
+    act(() => {
+      streamMock.update({ values: { workflow_status: "running", stages: {} }, threadId: "t2" });
+    });
+    expect(result.current.status).toBe("running");  // busy + running，正常
+    act(() => {
+      streamMock.update({
+        values: { workflow_status: "completed", stages: {} },
+        threadId: "t2",
+      });
+    });
+    expect(result.current.status).toBe("completed");  // C2：终态压过陈旧 busy
   });
 
-  it("removes the selected workflow thread", async () => {
-    mocked.deleteWorkflowThread.mockResolvedValue(undefined);
-    const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
-    await act(() => result.current.start(debateParams));
-
-    await act(() => result.current.remove());
-
-    expect(mocked.deleteWorkflowThread).toHaveBeenCalledWith("thread-1");
-    expect(result.current.threadId).toBeNull();
-    expect(result.current.state).toBeNull();
-  });
-
-  it("ignores stop/retry/remove when no run is active", async () => {
+  it("⑧a stop：轮询到非 busy 后以最终线程状态收敛 restoredStatus，无错误（I1/I8）", async () => {
+    vi.useFakeTimers();
+    vi.mocked(getEffectiveWorkflowDetail)
+      .mockResolvedValueOnce(detail("busy", mkState("running")))
+      .mockResolvedValueOnce(detail("busy", mkState("running")))
+      .mockResolvedValueOnce(detail("interrupted", mkState("running")));
+    vi.mocked(createWorkflowThread).mockResolvedValue("t1");
     const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
 
-    await act(() => result.current.stop());
-    await act(() => result.current.retry());
-    await act(() => result.current.remove());
+    await act(async () => { await result.current.restore("t1"); });
+    expect(result.current.status).toBe("running");
 
-    expect(mocked.cancelWorkflowRun).not.toHaveBeenCalled();
-    expect(mocked.retryWorkflowRun).not.toHaveBeenCalled();
-    expect(mocked.deleteWorkflowThread).not.toHaveBeenCalled();
+    await act(async () => {
+      const p = result.current.stop();
+      await vi.advanceTimersByTimeAsync(1_600);
+      await p;
+    });
+
+    expect(streamMock.stop).toHaveBeenCalled();
+    expect(result.current.error).toBeNull();
+    expect(result.current.status).toBe("interrupted");
   });
-});
 
-describe("useWorkflowRun variant handling", () => {
-  it("omits the variant key for single-pass workflows", async () => {
-    mocked.createWorkflowThread.mockResolvedValue("thread-r");
-    const { result } = renderHook(() => useWorkflowRun({ assistantId: "reflection" }));
+  it("⑧b stop：详情持续失败 → 报错，不得静默当成功（I8）", async () => {
+    vi.useFakeTimers();
+    vi.mocked(getEffectiveWorkflowDetail)
+      .mockResolvedValueOnce(detail("busy", mkState("running")))  // restore("t1")
+      .mockRejectedValue(new Error("查询失败"));                    // stop 轮询全部失败
+    const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
+    await act(async () => { await result.current.restore("t1"); });
 
-    await act(() => result.current.start({
-      input: { source: "一段已有分析" },
-      metadata: { title: "反思 · 记录", subject: "note-1" },
-    }));
+    await act(async () => {
+      const p = result.current.stop();
+      await vi.advanceTimersByTimeAsync(11_000);
+      await p;
+    });
 
-    expect(mocked.startWorkflowRun).toHaveBeenCalledWith(expect.objectContaining({
-      assistantId: "reflection",
-      input: { input: { source: "一段已有分析" } },
-    }));
-    await waitFor(() => expect(result.current.running).toBe(false));
+    expect(result.current.error).toContain("无法确认服务端状态");
+  });
+
+  it("⑧c stop：await 期间换线程 → 不写任何状态（轮询旧 id、写入前校验）（I1）", async () => {
+    vi.useFakeTimers();
+    vi.mocked(getEffectiveWorkflowDetail)
+      .mockResolvedValueOnce(detail("busy", mkState("running")))         // restore("t1")
+      .mockResolvedValueOnce(detail("interrupted", mkState("running")))  // t1 的 stop 轮询收敛详情（若泄漏会写成 interrupted）
+      .mockResolvedValue(detail("idle", mkState("completed")));          // restore("t2")
+    const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
+    await act(async () => { await result.current.restore("t1"); });
+
+    await act(async () => {
+      const stopping = result.current.stop();
+      await result.current.restore("t2");  // stream.stop() 期间换了线程
+      await vi.advanceTimersByTimeAsync(600);
+      await stopping;
+    });
+    act(() => {
+      streamMock.update({ values: { workflow_status: "completed", stages: {} }, threadId: "t2" });
+    });
+
+    expect(result.current.threadId).toBe("t2");
+    // t1 的 interrupted 不得写到 t2 头上：t2 是 idle + completed
+    expect(result.current.status).toBe("completed");
+    expect(result.current.error).toBeNull();
   });
 });

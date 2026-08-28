@@ -39,8 +39,8 @@ const row = (overrides: Partial<WorkflowThreadProjection> = {}): WorkflowThreadP
 const state = (status: WorkflowState["workflow_status"]): WorkflowState => ({
   workflow_id: "debate",
   workflow_status: status,
-  stages: { bull: { id: "bull", status: "completed", content: "多方观点" } },
-  result: "归纳分歧",
+  stages: { bull: { id: "bull", status: "completed", message_id: "m-bull" } },
+  messages: [{ id: "m-bull", content: "多方观点" }],
   result_summary: "已完成 3 阶段",
 });
 

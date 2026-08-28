@@ -1,5 +1,5 @@
 schema_version: 1
-config_version: 1
+config_version: 2
 id: reflection
 kind: single_pass
 skill: builtin/reflection-audit

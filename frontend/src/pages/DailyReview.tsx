@@ -8,10 +8,13 @@ import { AskAiButton } from "@/components/ui/AskAiButton";
 import { Disclaimer } from "@/components/ui/Disclaimer";
 import { WorkflowHistory } from "@/components/workflow/WorkflowHistory";
 import { useWorkflowRun } from "@/hooks/useWorkflowRun";
+import { stageContent, type WorkflowState } from "@/lib/agent/workflow-types";
 import { api, type IndexQuote, type Quote, type MarketOverview, type ShortTermEmotion, type TurnoverTop, type GlobalIndex } from "@/lib/api";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
 import { loadWatch, saveWatch, addCodes } from "@/lib/watchlist";
 import { cn } from "@/lib/utils";
+
+const EMPTY_STATE: WorkflowState = { workflow_status: "pending", stages: {} };
 
 // A股红涨绿跌。全球市场（美股/港股指数）**也沿用红涨**——与整个看板及东财等中国平台一致，
 // 对中国用户最不易看错（Simon 2026-07-05 确认；非国际绿涨惯例，是有意选择，勿改）。
@@ -88,7 +91,7 @@ export function DailyReview() {
     ? indices.map((i) => `${i.name} ${i.price}（${i.change_pct > 0 ? "+" : ""}${i.change_pct}%）`).join("；")
     : "（指数数据未取到）";
 
-  const review = reviewRun.state?.result ?? reviewRun.transient.daily_review ?? "";
+  const review = stageContent(reviewRun.state ?? EMPTY_STATE, "daily_review") ?? reviewRun.transient.daily_review ?? "";
   const reviewLoading = reviewRun.running;
   const reviewErr = reviewRun.error;
 
