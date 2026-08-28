@@ -3,10 +3,9 @@
 负责：
 - 确定性投研底稿抓取（并行/串行分区调度、空值判决、缺口标记、固定顺序还原）；
 - 确定性底稿摘要生成；
-- 上下文预算控制与阶段未产出哨兵替换；
-- 模型流式调用与阶段增量事件发射；
-- 敏感信息脱敏与稳定错误模型生成；
-- 终态与确定性摘要归纳（<= 80 字符）。
+- 上下文预算控制与阶段未产出哨兵替换（正文经 message_id 指针解析）；
+- 模型流式调用（config 传播进 messages 通道）与流式消息 id 捕获；
+- 敏感信息脱敏与稳定错误模型生成。
 """
 from __future__ import annotations
 
@@ -18,20 +17,18 @@ from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessageChunk, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 
 from agent.policy import fixed_system_policy
 from agent.tool_executor import execute_tool, tool_policy
-from agent.workflow_events import WorkflowEventEmitter, utc_now
+from agent.workflow_events import emit_dossier_progress
 from agent.workflow_loader import DossierConfig, DossierSectionConfig, StageConfig
 from agent.workflow_state import (
     DossierResult,
     DossierSection,
     StageResult,
     WorkflowError,
-    WorkflowStatus,
-    coerce_stage_map,
     format_stage_context,
-    stage_unproduced_sentinel,
 )
 
 _META_KEYS = frozenset({"period", "unit", "note", "code", "generated_at", "tracks", "total_cached"})
@@ -153,9 +150,8 @@ def _resolve_args(args: dict[str, Any], input_dict: dict[str, Any]) -> dict[str,
 async def collect_dossier_sections(
     code: str,
     config: DossierConfig,
-    emitter: WorkflowEventEmitter | None = None,
 ) -> tuple[list[DossierSection], list[str]]:
-    """确定性执行底稿抓取并上报进度。"""
+    """确定性执行底稿抓取并直发进度事件（custom 通道，可丢弃）。"""
     input_dict = {"code": code}
     all_sections: list[DossierSection] = []
     total_count = len(config.sections)
@@ -216,14 +212,12 @@ async def collect_dossier_sections(
             error=err_msg,
         )
         loaded_count += 1
-        if emitter:
-            await emitter.emit(
-                "dossier.progress",
-                section_id=sec_cfg.id,
-                section_status=status,
-                completed=loaded_count,
-                total=total_count,
-            )
+        emit_dossier_progress(
+            sec_cfg.id,
+            status,
+            loaded_count,
+            total_count,
+        )
         return section
 
     # 并行执行 non-throttled sections
@@ -243,13 +237,6 @@ async def collect_dossier_sections(
     missing = [s.title for s in all_sections if s.status == "gap"]
     missing.extend(s.title for s in all_sections if s.status == "failed")
     has_substantive_data = any(section.status == "completed" for section in all_sections)
-    if emitter:
-        await emitter.emit(
-            "dossier.ready",
-            completed=len(all_sections),
-            missing=missing,
-            has_substantive_data=has_substantive_data,
-        )
 
     return all_sections, missing
 
@@ -286,14 +273,14 @@ def format_full_dossier_text(
 def serialize_stage_context(
     stages: dict[str, StageResult],
     stage_ids: list[str],
+    messages: list | None = None,
     max_chars: int = 24000,
 ) -> tuple[str, bool]:
-    """序列化前序各阶段的输出为上下文文本。"""
-    stages = coerce_stage_map(stages)
+    """序列化前序各阶段的输出为上下文文本（按 message_id 指针取权威正文）。"""
     blocks = []
     for sid in stage_ids:
         st = stages.get(sid)
-        text = format_stage_context(sid, st)
+        text = format_stage_context(sid, st, messages)
         blocks.append(f"### 【阶段：{sid}】\n{text}")
 
     full = "\n\n".join(blocks)
@@ -305,6 +292,7 @@ def _context_candidates(
     dossier: DossierResult | None,
     stages: dict[str, StageResult],
     preceding_stage_ids: list[str],
+    messages: list | None = None,
 ) -> list[tuple[str, str]]:
     """按固定优先级生成可裁剪上下文块。"""
     candidates: list[tuple[str, str]] = []
@@ -319,7 +307,7 @@ def _context_candidates(
     for stage_id in selected_stage_ids:
         candidates.append((
             f"stage.{stage_id}",
-            f"【前序阶段 {stage_id}】\n{format_stage_context(stage_id, stages.get(stage_id))}",
+            f"【前序阶段 {stage_id}】\n{format_stage_context(stage_id, stages.get(stage_id), messages)}",
         ))
 
     if dossier is not None and "dossier.summary" in stage.context:
@@ -355,6 +343,7 @@ def build_stage_messages(
     dossier: DossierResult | None,
     stages: dict[str, StageResult],
     preceding_stage_ids: list[str],
+    messages: list | None = None,
 ) -> tuple[list[BaseMessage], bool]:
     """在最终 System + Human 序列化文本上执行硬预算。"""
     # 阶段模型不绑定工具：用无工具版策略，避免模型输出「要先调工具」的叙述。
@@ -365,7 +354,7 @@ def build_stage_messages(
         raise WorkflowContextOverflow()
 
     system_text = base_system
-    candidates = _context_candidates(stage, dossier, stages, preceding_stage_ids)
+    candidates = _context_candidates(stage, dossier, stages, preceding_stage_ids, messages)
     additions = [(context_id, f"\n\n{context_text}") for context_id, context_text in candidates]
     available = max_chars - len(base_system) - len(user_text)
     total_context_chars = sum(len(addition) for _, addition in additions)
@@ -425,17 +414,23 @@ async def run_stage(
     model: BaseChatModel,
     messages: list[BaseMessage | dict[str, Any]],
     max_chars: int = 1200,
-    emitter: WorkflowEventEmitter | None = None,
     stage_id: str = "",
-) -> tuple[str, bool]:
-    """流式执行单个阶段模型推理并向 emitter 发送增量事件（硬上限控制与连接生命周期管理）。"""
+    config: RunnableConfig | None = None,
+) -> tuple[str, bool, str | None]:
+    """流式执行单个阶段模型推理（硬上限控制与连接生命周期管理）。
+
+    必须传入节点 config：token 增量才能进入 LangGraph 的 messages 通道，由
+    useStream 原生消费（打字机 + 权威归并）。捕获流式消息 id（常规路径下由
+    BaseChatModel 自动生成的 lc-run id），供完成后写权威 AIMessage 时对齐同一
+    id——增量与终态按 id 无缝合并。返回 (正文, 是否截断, 流式消息 id)。
+    """
     max_chars = max(0, max_chars)
     captured = ""
-    emitted_len = 0
     truncated = False
+    message_id: str | None = None
     suffix = _TRUNCATION_MARKER
 
-    stream = model.astream(messages)
+    stream = model.astream(messages, config=config) if config is not None else model.astream(messages)
     try:
         async for chunk in stream:
             piece = (
@@ -445,23 +440,14 @@ async def run_stage(
             )
             if not piece:
                 continue
-
+            if message_id is None and isinstance(chunk, BaseMessage) and chunk.id:
+                message_id = chunk.id
             remaining_probe = max_chars + 1 - len(captured)
             if remaining_probe > 0:
                 captured += piece[:remaining_probe]
             if len(captured) > max_chars:
                 truncated = True
                 break
-
-            # 暂留截断标记等长的尾部；若后续越界，已发 delta 仍与终态前缀一致。
-            safe_end = max(0, len(captured) - len(suffix))
-            if emitter and stage_id and safe_end > emitted_len:
-                await emitter.emit(
-                    "stage.delta",
-                    stage_id=stage_id,
-                    delta=captured[emitted_len:safe_end],
-                )
-                emitted_len = safe_end
     finally:
         if hasattr(stream, "aclose"):
             try:
@@ -475,38 +461,4 @@ async def run_stage(
         full_output = captured[:body_chars] + marker
     else:
         full_output = captured
-
-    if emitter and stage_id and len(full_output) > emitted_len:
-        await emitter.emit(
-            "stage.delta",
-            stage_id=stage_id,
-            delta=full_output[emitted_len:],
-        )
-
-    return full_output, truncated
-
-
-def finalize_workflow(
-    status: WorkflowStatus,
-    stage_results: dict[str, StageResult],
-    missing: list[str],
-    workflow_type: str = "workflow",
-) -> tuple[WorkflowStatus, str]:
-    """计算工作流终态与不超过 80 字符的确定性摘要。"""
-    stage_results = coerce_stage_map(stage_results)
-    completed_count = sum(1 for s in stage_results.values() if s.status == "completed")
-    total_stages = len(stage_results)
-    missing_count = len(missing)
-
-    if status == "completed":
-        summary = f"{workflow_type} 完成：{completed_count}/{total_stages} 阶段完成，{missing_count} 项缺口"
-    elif status == "failed":
-        summary = f"{workflow_type} 失败：已完成 {completed_count}/{total_stages} 阶段"
-    elif status == "cancelled":
-        summary = f"{workflow_type} 已取消：停留在 {completed_count}/{total_stages} 阶段"
-    else:
-        summary = f"{workflow_type} 状态：{status} ({completed_count}/{total_stages})"
-
-    if len(summary) > 80:
-        summary = summary[:77] + "..."
-    return status, summary
+    return full_output, truncated, message_id

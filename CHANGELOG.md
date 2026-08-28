@@ -3,6 +3,48 @@
 本项目的版本号唯一来源是 `frontend/package.json`；后端 HTTP API、`/api/health`、
 前端界面与 MCP `serverInfo` 全部从它读取（见 `backend/version.py`）。
 
+## 未发布 — 2026-08-28：工作流 AI 层迁移 v2 流（破坏性重构）
+
+- 阶段正文从 `StageResult.content` 迁到 `messages` 通道（`add_messages` 按 id 归并），
+  `StageResult` 退化为状态机 + `message_id` 指针；`result` 状态键删除。
+- `run_stage` 传播节点 config：token 增量原生进入 messages 通道；每 token 一个
+  custom 事件的旧机制与 seq/cursor/轮询对账协议整体删除。
+- 重试改为独立 `resume` 控制通道（`{resume: true}`，绝不覆写 `input`）+ 后端
+  `auto_resume` 版本门控（写入式拒绝：拒绝原因落 checkpoint `errors`，run 正常收尾
+  ——节点 raise 在 inmem 上既无 lifecycle failed 事件也无 run.error 文本，前端只能靠
+  checkpoint 感知）；取消不再客户端回写状态。
+- 已知上游缺口：langgraph 1.2.11 的 v3 流路径不转发 `get_stream_writer` custom 事件
+  （实测 13 发 0 收），底稿收集期进度 UI 降级为静态状态行；custom 通道接线保留，
+  升级 langgraph 后需复测。
+- **config_version 升至 2（状态 schema 破坏性变更）**：迁移前需对**仍在运行旧代码的
+  Agent** 执行一次定向清理：
+
+  ```bash
+  node scripts/prune-workflow-threads.mjs   # 删除 channel=workflow 线程
+  ```
+
+  dev pickle 为六个图共用（`$VR_AGENT_WORK_DIR/.langgraph_api/`）——**禁止直接删
+  .pckl 文件**，否则 workspace/embedded 历史一并丢失；`scripts/dev` 的
+  pickle-backups 仅能整体回滚。
+
+## 未发布 — 2026-08-27：精简 Agent 自定义面（重构迭代第一轮）
+
+- 删除遗留死代码 `agent/client.py`（自研 SSE 客户端）及其测试：旧 FastAPI AI 路由
+  （`/api/chat` 等）下线后已无任何生产调用方，前端直连 LangGraph Server。
+- debate 底稿 13 项固定契约（工具、参数、空值策略、执行策略）从 `workflow_loader`
+  的运行时校验外移为 pytest 契约测试：加载器只做通用 schema 校验，防回归不变量由
+  `tests/agent/test_workflow_loader.py` 的契约比对在 CI 兜底；同时解除 loader 对
+  `tool_executor` 的反向依赖。
+- 页面级「问 AI」抽屉的传输层从手写 SSE 消费切换为 `@langchain/react` 的
+  `useStream`（v2 流协议，已对本地 langgraph-api 0.12.6 冒烟验证：token 级流式、
+  `page_context` 注入、断开后 Server run 继续跑完均通过）：
+  - `embedded-client.ts` 只保留域逻辑（scope 线程搜索/创建/删除、submit 输入构造、
+    流式消息 → 抽屉消息映射），删除「流结束后再拉一次 getState」的双读与
+    AbortController 手工管理；
+  - `AskAiButton.tsx` 直接消费 hook 合并后的消息（乐观上屏 + 权威 checkpoint 自动
+    归并），关抽屉/换 scope/卸载只断开本地订阅，语义与之前一致（从不取消 Server run）；
+  - 六图 Playwright 验收（含嵌入式问答 scope 持久化/快照版本/恢复/隔离/删除）全过。
+
 ## 未发布 — 2026-08-24：Agent 思考过程展示（thinking 开关）
 
 - `settings.json` 的 `model.thinking`（默认 `false`）：开启后请求带上游思考参数，模型

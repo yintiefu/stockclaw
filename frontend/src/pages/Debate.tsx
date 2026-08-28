@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Swords, Play, Square, Save, CheckCircle2, Circle, AlertTriangle, RotateCcw } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -7,8 +7,10 @@ import { GlassCard } from "@/components/ui/GlassCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
 import { WorkflowHistory } from "@/components/workflow/WorkflowHistory";
 import { useWorkflowRun } from "@/hooks/useWorkflowRun";
-import type { WorkflowClientEvent } from "@/lib/agent/workflow-client";
+import { stageContent, type WorkflowState } from "@/lib/agent/workflow-types";
 import { addNote } from "@/lib/notes";
+
+const EMPTY_STATE: WorkflowState = { workflow_status: "pending", stages: {} };
 
 type DebateStage = "bull" | "bear" | "bull_rebut" | "bear_rebut" | "referee";
 
@@ -63,60 +65,58 @@ export function Debate() {
   const [rounds, setRounds] = useState(1);
   const [status, setStatus] = useState("");
   const [progress, setProgress] = useState<{ id: string; title: string; ok: boolean }[]>([]);
-  const [missing, setMissing] = useState<string[]>([]);
   const [saved, setSaved] = useState(false);
   const [historyKey, setHistoryKey] = useState(0);
   const [pageError, setPageError] = useState("");
 
   const run = useWorkflowRun({
     assistantId: "debate",
-    onEvent: (event: WorkflowClientEvent) => {
-      switch (event.type) {
-        case "dossier.progress":
-          setStatus(`正在拉取客观事实底稿… ${event.completed}/${event.total}`);
-          setProgress((p) => [
-            ...p.filter((t) => t.id !== event.section_id),
-            {
-              id: event.section_id,
-              title: SECTION_TITLE[event.section_id] ?? event.section_id,
-              ok: event.section_status === "completed" || event.section_status === "no_record",
-            },
-          ]);
-          break;
-        case "dossier.ready":
-          setMissing(event.missing);
-          setStatus("底稿就绪，辩论开始");
-          break;
-        case "stage.started":
-          setStatus(`${event.label} 正在生成…`);
-          break;
-        case "stage.failed":
-          setStatus(`${event.stage_id} 阶段失败`);
-          break;
-        case "workflow.failed":
-          setStatus("");
-          break;
-      }
+    onDossierProgress: (event) => {
+      setStatus(`正在拉取客观事实底稿… ${event.completed}/${event.total}`);
+      setProgress((p) => [
+        ...p.filter((t) => t.id !== event.section_id),
+        {
+          id: event.section_id,
+          title: SECTION_TITLE[event.section_id] ?? event.section_id,
+          ok: event.section_status === "completed" || event.section_status === "no_record",
+        },
+      ]);
     },
   });
 
   const running = run.running || run.status === "running";
   const stageState = run.state?.stages ?? {};
+  const missing = run.state?.dossier?.missing ?? [];
   // 底稿展示优先用权威 checkpoint（历史恢复也完整），运行中回落到事件累积的进度。
   const dossierTicks = run.state?.dossier?.sections.map((s) => ({
     id: s.id,
     title: s.title,
     ok: s.status === "completed" || s.status === "no_record",
   })) ?? progress;
-  const missingShown = run.state?.dossier?.missing ?? missing;
   const stageBoxes: StageBox[] = STAGE_ORDER
     .filter((id) => stageState[id] || run.transient[id] !== undefined)
     .map((id) => ({
       stage: id,
       label: STAGE_LABEL[id],
-      content: stageState[id]?.content ?? run.transient[id] ?? "",
+      content: stageContent(run.state ?? EMPTY_STATE, id) ?? run.transient[id] ?? "",
       done: stageState[id] != null && stageState[id].status !== "pending" && stageState[id].status !== "running",
     }));
+
+  // 阶段状态文本由 values 快照派生（dossier.ready/stage.started 等事件已随 v1 协议消亡）
+  const currentStage = run.state?.current_stage ?? null;
+  useEffect(() => {
+    if (!run.running) return;
+    if (run.state?.workflow_status === "failed") { setStatus(""); return; }
+    if (run.state?.dossier) {
+      setStatus(currentStage
+        ? `${(STAGE_LABEL as Record<string, string>)[currentStage] ?? currentStage} 正在生成…`
+        : "辩论进行中");
+    } else {
+      // 底稿收集期 custom 进度事件经 langgraph v3 流路径被上游丢弃（实测
+      // astream_events(version="v3") 0 条转发），此窗口只能给静态状态行。
+      setStatus("正在拉取客观事实底稿…（约 35 秒，走公开数据接口，不消耗 token）");
+    }
+  }, [run.running, currentStage, run.state?.dossier, run.state?.workflow_status]);
 
   const finished = stageBoxes.length > 0
     && stageBoxes.every((s) => s.done)
@@ -125,7 +125,6 @@ export function Debate() {
   const startDebate = (c: string, variant: "standard" | "cross_exam") => {
     setStatus("");
     setProgress([]);
-    setMissing([]);
     setSaved(false);
     void run.start({
       input: { code: c },
@@ -244,9 +243,9 @@ export function Debate() {
                 </span>
               ))}
             </div>
-            {missingShown.length > 0 && (
+            {missing.length > 0 && (
               <p className="mt-2 text-[11px] text-warning">
-                未取到：{missingShown.join("、")}（双方立论时不得臆测这部分）
+                未取到：{missing.join("、")}（双方立论时不得臆测这部分）
               </p>
             )}
           </div>
@@ -288,7 +287,6 @@ export function Debate() {
             if (historicCode) setCode(historicCode);
             setStatus("");
             setProgress([]);
-            setMissing([]);
             setSaved(false);
             void run.restore(thread.threadId).finally(() => setHistoryKey((k) => k + 1));
           }}

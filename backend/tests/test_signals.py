@@ -534,16 +534,16 @@ def test_tools_query_gpu_rent(monkeypatch):
 
 
 def test_tools_query_gpu_rent_fits_chat_cap(monkeypatch):
-    """工具输出必须裁剪：chat 层单次工具结果上限 6000 字符，全量缓存（40KB 历史点）
-    直接返回会被截成非法 JSON。裁剪版不含逐点序列且留有余量。"""
-    import chat
+    """工具输出必须裁剪：全量缓存（40KB 历史点）直接返回会撑爆模型上下文。
+    裁剪版不含逐点序列且留有余量。（上限原为 chat 层 _TOOL_RESULT_CAP=6000，
+    chat.py 已随 v2 迁移删除，预算以字面量固化在此。）"""
     import tools
     monkeypatch.setattr(signals, "_get_json", _ok_get_json())
     signals.fetch_gpu_rent()
 
     out = tools.exec_tool("query_gpu_rent", {})
     blob = json.dumps(out, ensure_ascii=False)
-    assert len(blob) < chat._TOOL_RESULT_CAP * 0.8   # 留 20% 余量防真实数据略胖
+    assert len(blob) < 6000 * 0.8                     # 留 20% 余量防真实数据略胖
     assert '"points"' not in blob                     # 逐点序列不进工具输出
     assert out["history_summary"][0]["latest"]["usd_per_gpu_hr"] == 6.0
     assert out["forward"]["months"][0]["implied_median"] is not None

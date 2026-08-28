@@ -78,10 +78,11 @@ class CyclingScriptedModel(ScriptedChatModel):
 class StageAwareDebateModel(CyclingScriptedModel):
     """辩论阶段感知：按系统提示中的角色标记输出，顺序无关、重试稳定。
 
-    每个阶段流式前 sleep，保证浏览器有窗口点「中止」。
+    每个阶段流式前 sleep（经 _astream 桥接在 executor 线程里执行，实测有效），
+    拉长运行中窗口让浏览器能稳定点「中止」、看到「生成中」标记。
     """
 
-    stage_delay_seconds: float = 1.5
+    stage_delay_seconds: float = 4.0
 
     def _pick_reply(self, messages: list) -> AIMessage:
         system_text = "".join(
