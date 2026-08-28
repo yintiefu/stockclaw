@@ -172,9 +172,17 @@ describe("useWorkflowRun (v2)", () => {
     vi.mocked(getEffectiveWorkflowDetail).mockImplementation(
       () => new Promise((resolve) => { resolveDetail = resolve; }),  // 详情悬挂：检验同步 threadIdRef
     );
-    vi.mocked(getWorkflowState).mockResolvedValue(mkState("failed", {
-      errors: [{ code: "MODEL_ERROR", message: "模型推理执行异常", retryable: true }],
-    }));
+    // dispatch 前是旧终态（无错误消息）；本次 run 的写入带新 completed_at + 错误
+    let readCount = 0;
+    vi.mocked(getWorkflowState).mockImplementation(async () => {
+      readCount += 1;
+      return readCount === 1
+        ? mkState("failed", { completed_at: "T0" })
+        : mkState("failed", {
+            completed_at: "T1",
+            errors: [{ code: "MODEL_ERROR", message: "模型推理执行异常", retryable: true }],
+          });
+    });
     const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
 
     await act(async () => {
@@ -190,6 +198,30 @@ describe("useWorkflowRun (v2)", () => {
     );
     // transport 正常完成 + checkpoint failed → 横幅非空
     expect(result.current.error).toContain("模型推理执行异常");
+  });
+
+  it("⑨ retry 拒绝收敛：旧终态（篡改 checkpoint）不得短路失败判定——轮询到本次 run 写入的拒绝文案", async () => {
+    vi.mocked(createWorkflowThread).mockResolvedValue("t3");
+    // 前两次读到旧终态（completed_at 不变、无错误消息——模拟拒绝写入落盘延迟），
+    // 第三次起才是本次 run 写入的拒绝终态。
+    let readCount = 0;
+    vi.mocked(getWorkflowState).mockImplementation(async () => {
+      readCount += 1;
+      if (readCount <= 2) return mkState("failed", { completed_at: "T0", config_version: 999 });
+      return mkState("failed", {
+        completed_at: "T1",
+        config_version: 999,
+        errors: [{ code: "RESUME_CONFIG_VERSION", message: "配置版本不兼容：请查看已有状态或重新发起工作流", retryable: false }],
+      });
+    });
+    const { result } = renderHook(() => useWorkflowRun({ assistantId: "debate" }));
+
+    await act(async () => {
+      await result.current.restore("t3");
+      await result.current.retry();
+    });
+
+    expect(result.current.error).toContain("配置版本不兼容");
   });
 
   it("⑥ restore 竞态：a 详情晚到不覆盖 b 的 restoredStatus（I7）", async () => {

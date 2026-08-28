@@ -81,6 +81,26 @@ async function readTerminalState(threadId: string): Promise<WorkflowState | null
   return null;
 }
 
+/** retry 专用终态读取：只认「本次 run 新写入」的终态。
+ * resume 的目标线程在 dispatch 前就可能是终态（历史失败/被篡改的 checkpoint），
+ * readTerminalState 会对其立即短路；而本次 run 的拒绝写入（auto_resume 门控）或
+ * 收尾 checkpoint 可能晚于 submit resolve 落盘。以 dispatch 前快照的 completed_at
+ * 为界轮询，超时回退到旧终态读取（不劣于直接短路）。 */
+async function readUpdatedTerminalState(
+  threadId: string,
+  before: WorkflowState | null,
+): Promise<WorkflowState | null> {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const state = await getWorkflowState(threadId).catch(() => null);
+    if (state != null && isTerminal(state)
+      && (before == null || state.completed_at !== before.completed_at)) {
+      return state;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  return await readTerminalState(threadId);
+}
+
 function deriveRunError(state: WorkflowState | null, dispatchError: string | null): string | null {
   if (dispatchError) return dispatchError;
   if (state?.workflow_status === "failed") {
@@ -186,6 +206,9 @@ export function useWorkflowRun(options: UseWorkflowRunOptions): UseWorkflowRunRe
     setError(null);
     setRestoredStatus(null);
     let dispatchError: string | null = null;
+    // dispatch 前终态快照：retry 的失败判定必须能区分「本来就是终态」与「本次
+    // run 写入的终态」（拒绝文案只存在于新写入的 checkpoint 里）。
+    const before = await getWorkflowState(id).catch(() => null);
     try {
       // 输入驱动 resume：版本门控与目标阶段路由全部在后端 auto_resume。
       // 始终显式携带 threadId——restore 后 controller 的异步 hydrate 可能未完成，
@@ -199,7 +222,7 @@ export function useWorkflowRun(options: UseWorkflowRunOptions): UseWorkflowRunRe
       return;
     }
     // 与 start 同源：submit 正常 resolve ≠ 恢复成功，失败终态只在 checkpoint 里。
-    const state = await readTerminalState(id);
+    const state = await readUpdatedTerminalState(id, before);
     const runError = deriveRunError(state, dispatchError)
       ?? (isTerminal(state) ? null : "恢复未完成：请稍后重试");
     if (runError) setError(runError);

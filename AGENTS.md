@@ -333,8 +333,11 @@ derive to `interrupted`, new runs work).
   `hooks/useWorkflowStream` (`useStream` v2: values = authoritative state per superstep,
   messages = stage text streamed then merged by id, custom = dossier progress only).
 - Retry submits `{resume: true}` on a dedicated top-level state channel — never nest it
-  in `input` (it must survive across retries). The backend `entry` node owns the
-  config_version gate; `auto_resume` routes to the first non-terminal stage. Never
+  in `input` (it must survive across retries). The backend `auto_resume` node owns the
+  config_version gate and rejects by **writing a failed terminal state** (`errors` +
+  `RESUME_*` codes) then routing to END — never raise in a node: an inmem node raise
+  leaves no lifecycle failed event and no run.error text, so the UI (whose only reliable
+  source is the checkpoint) could not show the reason. Never
   mirror workflow config versions in the frontend.
 - Stage content lives ONLY in the `messages` channel; `StageResult.message_id` is the
   pointer (chunks normally carry auto `lc-<run_id>` ids; `stage-<sid>` is a defensive

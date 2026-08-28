@@ -10,7 +10,9 @@
 - `run_stage` 传播节点 config：token 增量原生进入 messages 通道；每 token 一个
   custom 事件的旧机制与 seq/cursor/轮询对账协议整体删除。
 - 重试改为独立 `resume` 控制通道（`{resume: true}`，绝不覆写 `input`）+ 后端
-  `entry` 版本门控与 `auto_resume` 路由；取消不再客户端回写状态。
+  `auto_resume` 版本门控（写入式拒绝：拒绝原因落 checkpoint `errors`，run 正常收尾
+  ——节点 raise 在 inmem 上既无 lifecycle failed 事件也无 run.error 文本，前端只能靠
+  checkpoint 感知）；取消不再客户端回写状态。
 - **config_version 升至 2（状态 schema 破坏性变更）**：迁移前需对**仍在运行旧代码的
   Agent** 执行一次定向清理：
 

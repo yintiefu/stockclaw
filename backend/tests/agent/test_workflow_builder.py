@@ -6,7 +6,8 @@
 - start_node 在调用模型前将 stage.status=running 写入 checkpoint；
 - on_error=continue 容错跳过与未产出占位符；on_error=fail 直接路由至 finalize；
 - resume（{resume: true}）：input 原样保留、只补跑非终态阶段、已完成后续阶段不重放；
-- 配置版本门控：config_version 不匹配的 resume 被 entry 拒绝；
+- 配置版本门控：config_version 不匹配 / 空线程的 resume 被写入式拒绝（failed 终态
+  + errors 消息，run 正常收尾）；
 - reflection 单步图编译与执行。
 """
 from __future__ import annotations
@@ -166,16 +167,32 @@ async def test_resume_skips_later_completed_stages():
 
 
 @pytest.mark.asyncio
-async def test_resume_rejected_on_version_mismatch():
+async def test_resume_rejected_on_version_mismatch_writes_failed_state():
+    """版本不匹配的 resume 是「写入式拒绝」：不抛异常，拒绝原因落 checkpoint 终态。
+
+    实测（inmem + v2 协议）：entry 抛 ValueError 只留下 status=error 的 run 记录——
+    无 lifecycle failed 事件、run.error 无文本，前端无从感知原因；而页面失败判定的
+    唯一可靠来源是 checkpoint（useWorkflowRun.readTerminalState）。所以拒绝必须与
+    abort_no_data 同构：写 failed + errors，run 正常收尾。
+    """
     cfg = _debate_cfg()
     graph = build_workflow_graph(cfg, model=StageAwareModel(replies=[]),
                                  checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
-    await graph.ainvoke({"input": {"code": "600519"}, "variant": "standard"}, config=_thread("t3"))
+    first = await graph.ainvoke({"input": {"code": "600519"}, "variant": "standard"}, config=_thread("t3"))
+    assert first["workflow_status"] == "completed"
     # 公开 API 直写值（config_version 是 LastValue 通道）制造版本不匹配；
     # checkpointer.put 需要完整 Checkpoint 对象，不是测试接口。
     await graph.aupdate_state(_thread("t3"), {"config_version": 999})
-    with pytest.raises(ValueError, match="配置版本不兼容"):
-        await graph.ainvoke({"resume": True}, config=_thread("t3"))
+
+    result = await graph.ainvoke({"resume": True}, config=_thread("t3"))
+    assert result["workflow_status"] == "failed"
+    assert result["errors"][0].message == "配置版本不兼容：请查看已有状态或重新发起工作流"
+    assert result["errors"][0].code == "RESUME_CONFIG_VERSION"
+    assert result["completed_at"] is not None
+    # 已完成阶段不被触碰、正文不重放
+    assert result["stages"]["bull"].status == "completed"
+    texts = [message_text(m) for m in result["messages"]]
+    assert texts.count("多方脚本观点") == 1
 
 
 @pytest.mark.asyncio
@@ -598,10 +615,12 @@ async def test_model_failure_terminal_state_does_not_leak_secret():
 
 @pytest.mark.asyncio
 async def test_resume_rejected_on_empty_checkpoint():
-    """run 在首个 checkpoint 落盘前被取消（空线程）：resume 必须被拒且文案可理解。"""
+    """run 在首个 checkpoint 落盘前被取消（空线程）：resume 被写入式拒绝（终态 + 文案）。"""
     cfg = _debate_cfg()
     graph = build_workflow_graph(cfg, model=StageAwareModel(replies=[]),
                                  checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
     # 只建线程不运行：state 为空（config_version 与 input 均缺失）
-    with pytest.raises(ValueError, match="没有可恢复的状态"):
-        await graph.ainvoke({"resume": True}, config=_thread("t-empty"))
+    result = await graph.ainvoke({"resume": True}, config=_thread("t-empty"))
+    assert result["workflow_status"] == "failed"
+    assert result["errors"][0].message == "该工作流没有可恢复的状态：请重新发起工作流"
+    assert result["errors"][0].code == "RESUME_NO_STATE"

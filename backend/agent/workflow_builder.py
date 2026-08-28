@@ -65,6 +65,30 @@ def _is_resume(state: WorkflowState) -> bool:
     return state.get("resume") is True
 
 
+def _resume_rejection(state: WorkflowState, expected_version: int) -> WorkflowError | None:
+    """resume 门控：无可恢复状态 / 版本不兼容时返回拒绝错误（写入式拒绝）。
+
+    拒绝必须写进 checkpoint 而不是在节点里 raise：实测 inmem + v2 协议下节点抛错
+    只留下 status=error 的 run 记录——没有 lifecycle failed 事件、run.error 也没有
+    文本，前端（唯一可靠来源是 checkpoint）无从感知拒绝原因。
+    """
+    stored = state.get("config_version")
+    if stored is None and "input" not in state:
+        # run 在首个 checkpoint 落盘前被取消：没有任何可恢复状态
+        return WorkflowError(
+            code="RESUME_NO_STATE",
+            message="该工作流没有可恢复的状态：请重新发起工作流",
+            stage_id=None,
+        )
+    if stored != expected_version:
+        return WorkflowError(
+            code="RESUME_CONFIG_VERSION",
+            message="配置版本不兼容：请查看已有状态或重新发起工作流",
+            stage_id=None,
+        )
+    return None
+
+
 def _build_staged_graph(
     cfg: StagedResearchConfig,
     model: BaseChatModel,
@@ -75,18 +99,14 @@ def _build_staged_graph(
 
     # 0. 统一入口与 resume 路由（v2 run.start 无 goto，重试 = 新 run + 控制位）
     async def entry(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
-        """resume 先过版本门控；普通运行直通校验。"""
-        if _is_resume(state):
-            stored = state.get("config_version")
-            if stored is None and "input" not in state:
-                # run 在首个 checkpoint 落盘前被取消：没有任何可恢复状态
-                raise ValueError("该工作流没有可恢复的状态：请重新发起工作流")
-            if stored != cfg.config_version:
-                raise ValueError("配置版本不兼容：请查看已有状态或重新发起工作流")
+        """入口直通；resume 门控在 auto_resume 里做（写入式拒绝，见 _resume_rejection）。"""
         return {}
 
     def _resume_target(state: WorkflowState) -> str:
-        """按变体顺序找第一个非终态阶段；全部完成则收尾（幂等）。"""
+        """被门控拒绝（failed 终态已写入）直接收尾；否则按变体顺序找第一个
+        非终态阶段；全部完成则收尾（幂等）。"""
+        if state.get("workflow_status") == "failed":
+            return END
         variant = state.get("variant") or list(cfg.variants.keys())[0]
         stages = state.get("stages", {})
         for sid in cfg.variants.get(variant, []):
@@ -96,11 +116,20 @@ def _build_staged_graph(
         return "finalize"
 
     async def auto_resume(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
-        """resume 模式：只清控制位并置运行态。普通值直写（bool），不需要 Overwrite。"""
+        """resume 模式：先过门控；通过则只清控制位并置运行态（普通值直写，不需要 Overwrite）。"""
+        rejection = _resume_rejection(state, cfg.config_version)
+        if rejection is not None:
+            return {
+                "workflow_status": "failed",
+                "completed_at": utc_now(),
+                "result_summary": rejection.message,
+                "errors": [rejection],
+            }
         return {"workflow_status": "running", "resume": False}
 
     start_targets_with_finalize = {f"start_{s.id}": f"start_{s.id}" for s in cfg.stages}
     start_targets_with_finalize["finalize"] = "finalize"
+    start_targets_with_finalize[END] = END
 
     builder.add_node("entry", entry)
     builder.set_entry_point("entry")
@@ -355,16 +384,25 @@ def _build_single_pass_graph(
     builder = StateGraph(WorkflowState)
     instruction_text = _load_instruction_text(cfg.skill, cfg.instruction, builtin_skills_root)
 
-    # 0. 统一入口与 resume 路由（单阶段：目标恒 start_stage，已完成则幂等收尾）
+    # 0. 统一入口与 resume 路由（单阶段：目标恒 start_stage，已完成则幂等收尾；
+    # 门控与 staged 同构——写入式拒绝，见 _resume_rejection）
     async def entry(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
-        if _is_resume(state) and state.get("config_version") != cfg.config_version:
-            raise ValueError("配置版本不兼容：请查看已有状态或重新发起工作流")
         return {}
 
     async def auto_resume(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
+        rejection = _resume_rejection(state, cfg.config_version)
+        if rejection is not None:
+            return {
+                "workflow_status": "failed",
+                "completed_at": utc_now(),
+                "result_summary": rejection.message,
+                "errors": [rejection],
+            }
         return {"workflow_status": "running", "resume": False}
 
     def _resume_target(state: WorkflowState) -> str:
+        if state.get("workflow_status") == "failed":
+            return END
         st = state.get("stages", {}).get(cfg.id)
         if st is not None and st.status in ("completed", "skipped"):
             return "finalize"
@@ -379,7 +417,7 @@ def _build_single_pass_graph(
     )
     builder.add_node("auto_resume", auto_resume)
     builder.add_conditional_edges(
-        "auto_resume", _resume_target, {"start_stage": "start_stage", "finalize": "finalize"},
+        "auto_resume", _resume_target, {"start_stage": "start_stage", "finalize": "finalize", END: END},
     )
 
     # 1. 校验与初始化节点
