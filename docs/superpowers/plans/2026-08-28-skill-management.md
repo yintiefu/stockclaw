@@ -135,6 +135,10 @@ def test_parse_skill_document_returns_public_metadata() -> None:
     assert parsed.metadata["path"] == "/user/sample-skill/SKILL.md"
     assert parsed.instructions == VALID
 
+def test_parse_skill_document_allows_staged_import_without_directory_name() -> None:
+    parsed = parse_skill_document(VALID, None, "/user/import/SKILL.md")
+    assert parsed.metadata["name"] == "sample-skill"
+
 @pytest.mark.parametrize("document", [
     "---\nname: other\ndescription: x\n---\n",
     "---\nname: Sample\ndescription: x\n---\n",
@@ -146,7 +150,7 @@ def test_parse_skill_document_rejects_mismatch_tags_and_aliases(document: str) -
         parse_skill_document(document, "sample-skill", "/user/sample-skill/SKILL.md")
 ```
 
-Add explicit tests for 64/1024/500 character limits, `metadata: dict[str, str]`, `allowed-tools` string/list, missing delimiters, non-mapping YAML, invalid UTF-8 at file boundary, and 10 MiB maximum.
+Add explicit tests for CRLF frontmatter, 64/1024/500 character limits, `metadata: dict[str, str]`, `allowed-tools` string/list, missing delimiters, non-mapping YAML, invalid UTF-8 at file boundary, and 10 MiB maximum. Passing `directory_name=None` skips only the directory-equality check: malformed names must still fail, while every filesystem-backed caller continues to pass the actual parent directory name.
 
 - [ ] **Step 2: Run parser tests and confirm RED**
 
@@ -180,20 +184,20 @@ class ParsedSkill:
     metadata: SkillMetadata
     instructions: str
 
-def _skill_name_valid(name: str, directory_name: str) -> bool:
+def _skill_name_valid(name: str, directory_name: str | None) -> bool:
     return (
         0 < len(name) <= MAX_SKILL_NAME_LENGTH
-        and name == directory_name
+        and (directory_name is None or name == directory_name)
         and not name.startswith("-")
         and not name.endswith("-")
         and "--" not in name
         and all(char == "-" or char.isdigit() or (char.isalpha() and char.islower()) for char in name)
     )
 
-def parse_skill_document(content: str, directory_name: str, virtual_path: str) -> ParsedSkill:
+def parse_skill_document(content: str, directory_name: str | None, virtual_path: str) -> ParsedSkill:
     if len(content.encode("utf-8")) > MAX_SKILL_FILE_SIZE:
         raise SkillValidationError("SKILL.md 超过 10 MiB")
-    match = re.match(r"^---[ \t]*\n(.*?)\n---[ \t]*(?:\n|$)", content, re.DOTALL)
+    match = re.match(r"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|$)", content, re.DOTALL)
     if match is None:
         raise SkillValidationError("SKILL.md 缺少合法 YAML frontmatter")
     try:
@@ -253,7 +257,7 @@ def parse_skill_file(path: Path, virtual_path: str) -> ParsedSkill:
     return parse_skill_document(content, path.parent.name, virtual_path)
 ```
 
-Do not coerce metadata fields with `str()`. Parenthesize the optional license expression in production code so formatter/type-checker interpretation is unambiguous.
+Do not coerce metadata fields with `str()`. Parenthesize the optional license expression in production code so formatter/type-checker interpretation is unambiguous. Keep the UTF-8 `encode()` size check in this public string parser: `len(content)` counts code points rather than bytes and would weaken the 10 MiB byte limit for multibyte text. `parse_skill_file` may perform the same byte check before decoding so oversized files are rejected without allocating a decoded string.
 
 - [ ] **Step 4: Lock settings path creation and root rejection with tests**
 
@@ -342,7 +346,12 @@ def test_filtered_backend_hides_invalid_and_excluded_skills(tmp_path: Path) -> N
     backend = FilteredSkillBackend(tmp_path, excluded_names={"conflict"})
     assert [entry["path"] for entry in backend.ls("/").entries or []] == ["/valid/"]
     assert backend.read("/blocked/SKILL.md").error is not None
-    assert backend.download_files(["/blocked/SKILL.md"])[0].error == FILE_NOT_FOUND
+    assert backend.download_files(["/blocked/SKILL.md"])[0].error == "file_not_found"
+
+def test_valid_skill_names_skips_invalid_directories(tmp_path: Path) -> None:
+    write_skill(tmp_path / "valid", "valid")
+    write_skill(tmp_path / "blocked", "other")
+    assert valid_skill_names(tmp_path) == frozenset({"valid"})
 
 @pytest.mark.asyncio
 async def test_filtered_backend_async_contract_matches_sync(tmp_path: Path) -> None:
@@ -401,12 +410,26 @@ class FilteredSkillBackend(BackendProtocol):
         return [
             self._delegate.download_files([path])[0]
             if self._authorized(path)
-            else FileDownloadResponse(path=path, content=None, error=FILE_NOT_FOUND)
+            else FileDownloadResponse(path=path, content=None, error="file_not_found")
             for path in paths
         ]
+
+def valid_skill_names(root: Path) -> frozenset[str]:
+    if not root.is_dir():
+        return frozenset()
+    names: set[str] = set()
+    for child in root.iterdir():
+        if not child.is_dir() or child.is_symlink() or not (child / "SKILL.md").is_file():
+            continue
+        try:
+            parsed = parse_skill_file(child / "SKILL.md", f"/builtin/{child.name}/SKILL.md")
+        except (OSError, SkillValidationError):
+            continue
+        names.add(parsed.metadata["name"])
+    return frozenset(names)
 ```
 
-Keep inherited `als`/`aread`/`adownload_files`, which dispatch through these guarded sync methods. Normalize root listing correctly for both `"/"` and empty route-stripped paths; tests must lock the actual `CompositeBackend` behavior.
+Keep inherited `als`/`aread`/`adownload_files`, which dispatch through these guarded sync methods. In pinned DeepAgents 0.7.7, `CompositeBackend` delegates through the module-level `_route_for_path` helper and strips the matched route prefix first: `/user/sample/SKILL.md` reaches the child backend as `/sample/SKILL.md`. Therefore `normalized.parts[1]` is the skill name; do not strip `/user/` or `/builtin/` again. Normalize root listing correctly for both `"/"` and empty route-stripped paths; tests must lock this behavior without importing the private helper.
 
 - [ ] **Step 4: Build strict composite backends and prompt**
 
@@ -655,7 +678,7 @@ git commit -m "feat: add local skill manager"
 
 - [ ] **Step 1: Add failing import matrix**
 
-Add exact fixtures for root `SKILL.md`, one wrapper directory, multiple roots, 256/257 files, 25 MiB boundary, pure/data-URI base64, backslash paths, traversal, duplicate normalized paths, `__MACOSX`, `.DS_Store`, symlink/encrypted/corrupt/unsupported ZIP, high-compression streamed overflow, and cleanup after failure.
+Add exact fixtures for root `SKILL.md`, one wrapper directory, multiple roots, 256/257 files, 25 MiB boundary, pure/data-URI base64 (including `data:text/markdown;charset=utf-8;base64,...` and rejection of an empty MIME), backslash paths, traversal, duplicate normalized paths, `__MACOSX`, `.DS_Store`, symlink/encrypted/corrupt/unsupported ZIP, a regular ZIP member with Unix mode `0o100644`, high-compression streamed overflow, and cleanup after failure.
 
 ```python
 def test_import_folder_preserves_bytes_and_defaults_disabled(manager: SkillManager) -> None:
@@ -679,6 +702,12 @@ Expected: FAIL because import methods are absent.
 Add constants and helpers:
 
 ```python
+import base64
+import binascii
+import stat
+import tempfile
+import zipfile
+
 MAX_BODY_BYTES = 36 * 1024 * 1024
 MAX_EXTRACTED_BYTES = 25 * 1024 * 1024
 MAX_FILES = 256
@@ -687,7 +716,7 @@ def decode_base64(value: str) -> bytes:
     encoded = value
     if value.startswith("data:"):
         header, separator, encoded = value.partition(",")
-        if not separator or not re.fullmatch(r"data:[^;,]+;base64", header):
+        if not separator or not re.fullmatch(r"data:[^,;]+(?:;[^,;=]+=[^,;]*)*;base64", header):
             raise SkillManagerError("bad_request", "data URI 必须包含非空 MIME 与 base64 标记")
     try:
         return base64.b64decode(encoded, validate=True)
@@ -712,11 +741,11 @@ def identify_skill_root(paths: set[PurePosixPath]) -> PurePosixPath:
     return candidates[0]
 ```
 
-The caller maintains a `seen_paths` set and rejects duplicate normalized paths before staging. It also verifies `(temp_root / path).resolve().is_relative_to(temp_root.resolve())` before the first write. The staging function performs these operations in order: create `tempfile.mkdtemp(dir=disabled.parent)`, determine the unique root from the complete normalized name set, stream each file in 64 KiB chunks, count bytes before deciding whether to discard macOS noise, parse the staged root `SKILL.md`, check all three collision sets under the manager lock, then `os.replace(staged_skill_root, disabled/name)`. Its `finally` removes the remaining temporary wrapper and logs only a fixed warning if cleanup fails.
+The caller maintains a `seen_paths` set and rejects duplicate normalized paths before staging. It also verifies `(temp_root / path).resolve().is_relative_to(temp_root.resolve())` before the first write. The staging function performs these operations in order: create `tempfile.mkdtemp(dir=disabled.parent)`, determine the unique root from the complete normalized name set, stream each file in 64 KiB chunks, and count bytes before deciding whether to discard macOS noise. Read the staged root `SKILL.md` with the same byte-limit and UTF-8 checks as `parse_skill_file`, then call `parse_skill_document(content, None, "/user/import/SKILL.md")` to obtain the validated frontmatter `name` without comparing it to the random temporary or optional wrapper directory. The `None` form is only for this staging step; enumeration and Agent filesystem access must continue through strict `parse_skill_file`. Under the manager lock, check all three collision sets using that name, set the destination to `disabled / name`, then `os.replace(staged_skill_root, destination)`. Return a freshly generated summary for the final destination, never the staged parser's placeholder virtual path. The `root SKILL.md` and one-wrapper-directory fixtures must both import successfully and be strictly parseable from `disabled / name / "SKILL.md"` afterward. The `finally` block removes the remaining temporary wrapper and logs only a fixed warning if cleanup fails.
 
 - [ ] **Step 4: Implement ZIP streaming without `extractall`**
 
-For each `ZipInfo`, reject encryption (`flag_bits & 0x1`), symlink mode (`external_attr >> 16`), and unsupported compression. Open each member and copy in 64 KiB chunks while incrementing the actual global byte count; never trust `file_size`. Convert `BadZipFile`, CRC and decompression errors into `bad_request`, always remove the temp tree in `finally`, and never execute staged scripts.
+For each `zipfile.ZipInfo`, reject encryption (`flag_bits & 0x1`), symbolic links with `stat.S_ISLNK(info.external_attr >> 16)`, and unsupported compression. Do not treat a nonzero Unix mode as a symlink: the `0o100644` fixture must import successfully. Open each member and copy in 64 KiB chunks while incrementing the actual global byte count; never trust `file_size`. Convert `zipfile.BadZipFile`, CRC and decompression errors into `bad_request`, always remove the temp tree in `finally`, and never execute staged scripts.
 
 - [ ] **Step 5: Run import tests and commit**
 
