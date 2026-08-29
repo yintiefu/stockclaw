@@ -148,7 +148,7 @@ describe("Layout 导航选中态", () => {
   });
 });
 
-describe("Layout 技能管理导航", () => {
+describe("Layout 设置中心导航", () => {
   function renderAt(path: string) {
     return render(
       <MemoryRouter initialEntries={[path]}>
@@ -165,20 +165,18 @@ describe("Layout 技能管理导航", () => {
     return Array.from(screen.getByRole("navigation").querySelectorAll(":scope > a, :scope > div > a"));
   }
 
-  it("/skills 子路由高亮技能管理且不串扰其他一级菜单", () => {
-    renderAt("/skills/user/sample");
-    const skills = screen.getByRole("link", { name: "技能管理" });
-    expect(skills).toHaveClass("bg-primary/15");
+  it("/settings 子路由高亮设置且不串扰其他一级菜单", () => {
+    renderAt("/settings/skills/user/sample");
+    expect(screen.getByRole("link", { name: "设置" })).toHaveClass("bg-primary/15");
     expect(screen.getByRole("link", { name: "α-mind" })).not.toHaveClass("bg-primary/15");
-    expect(screen.getByRole("link", { name: "设置" })).not.toHaveClass("bg-primary/15");
+    expect(screen.queryByRole("link", { name: "技能管理" })).toBeNull();
   });
 
-  it("技能管理入口在 DOM 顺序上紧跟 α-mind", () => {
-    renderAt("/skills");
+  it("技能管理已移入设置中心,不再占据顶级导航", () => {
+    renderAt("/settings");
     const links = navLinks().map((node) => node.textContent);
-    const alphaIndex = links.findIndex((text) => text?.includes("α-mind"));
-    const skillsIndex = links.findIndex((text) => text?.includes("技能管理"));
-    expect(alphaIndex).toBeGreaterThanOrEqual(0);
-    expect(skillsIndex).toBe(alphaIndex + 1);
+    expect(links.some((text) => text?.includes("技能管理"))).toBe(false);
+    expect(links.some((text) => text?.includes("α-mind"))).toBe(true);
+    expect(links.some((text) => text?.includes("设置"))).toBe(true);
   });
 });

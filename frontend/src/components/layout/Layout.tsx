@@ -4,7 +4,7 @@ import {
   Activity, Radar, LayoutGrid, Wallet, Settings, Search, NotebookPen,
   Moon, Sun, ChevronsLeft, ChevronsRight, ChevronDown, LineChart, Github, UserRound,
   Cog, Cpu, Database, Cable, Rocket, FlaskConical, Star, FileText, Swords, Bot, Thermometer, Gauge,
-  Rss, Newspaper, TrendingUp, Sparkles,
+  Rss, Newspaper, TrendingUp,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useDarkMode } from "@/hooks/useDarkMode";
@@ -22,7 +22,6 @@ const MAIL_URL = "mailto:simonlin0423@gmail.com";
 
 const NAV = [
   { to: "/agent", icon: Bot, label: "α-mind" },
-  { to: "/skills", icon: Sparkles, label: "技能管理" },
   { to: "/daily-review", icon: Activity, label: "每日复盘" },
   { to: "/intel", icon: Radar, label: "资讯雷达" },
   { to: "/signals", icon: Thermometer, label: "产业信号" },
