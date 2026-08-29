@@ -61,7 +61,7 @@
 **Files:**
 - Rewrite: `frontend/src/components/agent/AgentSlashSkills.test.tsx`(替换 R1 草稿)
 
-- [ ] **Step 1: 重写测试(fixture 含真 `reload-skills` 冲突技能;textarea 泛型;fireEvent.select)**
+- [x] **Step 1: 重写测试(fixture 含真 `reload-skills` 冲突技能;textarea 泛型;fireEvent.select)**
 
 ```tsx
 /** 斜杠技能命令：纯函数契约 + Composer 全链路（触发/过滤/选中/键盘/caret/降级）。 */
@@ -343,7 +343,7 @@ describe("AgentThread 斜杠技能弹层", () => {
 
 caret 断言规则(与实现对齐):`target = 原caret − (query.length + 1) + directive.length + 1`——末尾场景原caret = 1+query.length(query 在文本头),target = directive.length + 1;中间场景 target = `"前文 ".length + directive.length + 1`。若实测有出入,先重读 `triggerSelectionResource.js` 的 `insertDirective` 再修,不得盲改。
 
-- [ ] **Step 2: 确认失败**
+- [x] **Step 2: 确认失败**
 
 Run: `cd frontend && npx vitest run src/components/agent/AgentSlashSkills.test.tsx` → FAIL(模块不存在)
 
@@ -355,7 +355,7 @@ Run: `cd frontend && npx vitest run src/components/agent/AgentSlashSkills.test.t
 - Create: `frontend/src/components/agent/AgentSlashSkills.tsx`
 - Modify: `frontend/src/components/agent/AgentThread.tsx`
 
-- [ ] **Step 1: 新建 `AgentSlashSkills.tsx`**
+- [x] **Step 1: 新建 `AgentSlashSkills.tsx`**
 
 ```tsx
 /** Composer 斜杠技能命令：/ 唤出技能列表，选中后原位注入模型可读的指令文本。
@@ -545,7 +545,7 @@ export function ComposerSlashPopover({
 }
 ```
 
-- [ ] **Step 2: 改 `AgentThread.tsx` 的 `WorkspaceComposer`**
+- [x] **Step 2: 改 `AgentThread.tsx` 的 `WorkspaceComposer`**
 
 外层包 `Unstable_TriggerPopoverRoot`,`ComposerPrimitive.Root` 内(shell 之后)挂弹层。输入禁用(运行中/待审批)时 textarea 不可输入,弹层自然无法触发:
 
@@ -567,13 +567,13 @@ function WorkspaceComposer({ approvalPending }: { approvalPending: boolean }) {
 }
 ```
 
-- [ ] **Step 3: 确认 Task 1 测试通过**
+- [x] **Step 3: 确认 Task 1 测试通过**
 
 Run: `cd frontend && npx vitest run src/components/agent/AgentSlashSkills.test.tsx src/components/agent/AgentThread.test.tsx` → PASS
 
 行为断言若与框架细节有出入,先重读 `triggerSelectionResource.js` 的 `insertDirective` 再修断言,不得盲改;零匹配 `{Enter}` 单次调用若偶发吞键,升级为同步失效方案并记录。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add frontend/src/components/agent/AgentSlashSkills.tsx \
@@ -586,7 +586,7 @@ git commit -m "feat(agent): composer slash command picker for skills"
 
 ## Task 3: 测试类型检查 + 回归
 
-- [ ] **Step 1:** 新建 `frontend/tsconfig.test.json`:
+- [x] **Step 1:** 新建 `frontend/tsconfig.test.json`:
 
 ```json
 {
@@ -598,12 +598,12 @@ git commit -m "feat(agent): composer slash command picker for skills"
 
 `package.json` scripts 加 `"typecheck:test": "tsc -p tsconfig.test.json --noEmit"`。include 刻意收窄:全量纳入会暴露既有测试类型错误 6 文件数十处,属独立任务。
 
-- [ ] **Step 2:** `cd frontend && npm run typecheck:test` → PASS
-- [ ] **Step 3:** `npm run test:unit` → 全 PASS(既有测试不受影响)
-- [ ] **Step 4:** `npm test`(node 契约测试)→ PASS
-- [ ] **Step 5:** `npm run build`(tsc strict + vite)→ PASS
-- [ ] **Step 6:** 后端零改动;如不放心跑 `cd backend && .venv/bin/pytest -m "not live" -q`
-- [ ] **Step 7:** 提交测试类型检查配置(不留未跟踪文件):
+- [x] **Step 2:** `cd frontend && npm run typecheck:test` → PASS
+- [x] **Step 3:** `npm run test:unit` → 全 PASS(既有测试不受影响)
+- [x] **Step 4:** `npm test`(node 契约测试)→ PASS
+- [x] **Step 5:** `npm run build`(tsc strict + vite)→ PASS
+- [x] **Step 6:** 后端零改动;如不放心跑 `cd backend && .venv/bin/pytest -m "not live" -q`
+- [x] **Step 7:** 提交测试类型检查配置(不留未跟踪文件):
 
 ```bash
 git add frontend/tsconfig.test.json frontend/package.json
@@ -614,15 +614,15 @@ git commit -m "test(frontend): 窄范围测试 typecheck 配置（AgentSlashSkil
 
 ## Task 4: 浏览器人工验证(UI-only,不碰真实模型/线程)
 
-- [ ] **Step 1:** 确认 dev 栈在跑(`curl 127.0.0.1:8900/api/health`、`curl 127.0.0.1:5899/src/index.css` 返回 CSS;stale 则自起备用端口,见 AGENTS.md)。
-- [ ] **Step 2:** 探测 CDP `curl -m 3 127.0.0.1:16002/json/version`,按 AGENTS.md 优先 CDP、退 headless chromium;打开 `/agent`,**只做 UI 交互、绝不发送**:
+- [x] **Step 1:** 确认 dev 栈在跑(`curl 127.0.0.1:8900/api/health`、`curl 127.0.0.1:5899/src/index.css` 返回 CSS;stale 则自起备用端口,见 AGENTS.md)。
+- [x] **Step 2:** 探测 CDP `curl -m 3 127.0.0.1:16002/json/version`,按 AGENTS.md 优先 CDP、退 headless chromium;打开 `/agent`,**只做 UI 交互、绝不发送**:
   - **纪律(R5-I2):弹层关闭状态下对裸文本按 Enter = 真实发送(无拦截窗口)。Enter 只在弹层开着且有高亮项时按(被 preventDefault,只插入不发送);清空输入框一律 Ctrl+A + Backspace。Enter 回退路径由内存 runtime 测试覆盖,不在真实栈验证。**
   - 输入 `/`:弹层浮于输入框上方、glass 风格、技能名 + 描述;
   - `/stock` 过滤;**↑ 与 ↓ 高亮随动**;Enter 选中 → 指令原位替换(随后 Ctrl+A + Backspace 清空,不发送);
   - **鼠标点选后直接继续打字(不失焦、caret 在指令后)**,再清空;
   - 中间光标:`前文 /stock 后文`(caret 移到 /stock 后)选中 → `前文 指令 后文`,再清空;
   - `/zzz` 零匹配、`/reload-skills` 裸命令:断言**无弹层**(不按 Enter),Ctrl+A + Backspace 清空收尾。
-- [ ] **Step 3:** 截图存 `/tmp`,结论写进收尾汇报。模型侧端到端(read_file 技能、回复质量)归确定性 e2e fixture 世界,列为后续任务;真实模型验证需单独授权。
+- [x] **Step 3:** 截图存 `/tmp`,结论写进收尾汇报。模型侧端到端(read_file 技能、回复质量)归确定性 e2e fixture 世界,列为后续任务;真实模型验证需单独授权。
 
 ---
 
