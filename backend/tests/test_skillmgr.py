@@ -83,6 +83,21 @@ class TestEnumeration:
         assert item["effective"] is False
         assert item["error"] is not None
 
+    def test_list_reports_frontmatter_disabled_in_active_root(self, manager: SkillManager) -> None:
+        write_skill(manager.active_root / "stopped", "stopped")
+        skill_md = manager.active_root / "stopped/SKILL.md"
+        skill_md.write_text(
+            skill_md.read_text(encoding="utf-8").replace(
+                "---\n", "---\nenabled: false\n", 1),
+            encoding="utf-8",
+        )
+        result = manager.list_skills()
+        item = next(item for item in result["user"] if item["name"] == "stopped")
+        assert item["enabled"] is False
+        assert item["valid"] is True
+        assert item["effective"] is False
+        assert item["error"] is None
+
     def test_list_marks_active_builtin_collision_blocked(self, manager: SkillManager) -> None:
         write_skill(manager.active_root / "stock-analysis", "stock-analysis")
         result = manager.list_skills()
@@ -154,16 +169,54 @@ class TestDetail:
 
 
 class TestToggle:
-    def test_set_enabled_moves_between_roots(self, manager: SkillManager) -> None:
-        write_skill(manager.disabled_root / "sample", "sample")
-        first = manager.set_enabled("sample", True)
+    def test_set_enabled_rewrites_frontmatter_in_place(self, manager: SkillManager) -> None:
+        write_skill(manager.active_root / "sample", "sample")
+        first = manager.set_enabled("sample", False)
+        # 目录留在活动根，启停只改写 frontmatter
         assert (manager.active_root / "sample").is_dir()
         assert not (manager.disabled_root / "sample").exists()
-        assert first["enabled"] is True
-        second = manager.set_enabled("sample", False)
-        assert (manager.disabled_root / "sample").is_dir()
-        assert not (manager.active_root / "sample").exists()
-        assert second["enabled"] is False
+        assert first["enabled"] is False
+        assert first["effective"] is False
+        text = (manager.active_root / "sample/SKILL.md").read_text(encoding="utf-8")
+        assert "enabled: false" in text
+        second = manager.set_enabled("sample", True)
+        assert second["enabled"] is True
+        assert second["effective"] is True
+        assert "enabled: true" in (manager.active_root / "sample/SKILL.md").read_text(encoding="utf-8")
+
+    def test_set_enabled_rewrites_only_enabled_line(self, manager: SkillManager) -> None:
+        original = "---\nname: sample\ndescription: 用于结构化研究。\n---\n\n# 指令\n\n正文保持不变。\n"
+        directory = manager.active_root / "sample"
+        directory.mkdir()
+        (directory / "SKILL.md").write_text(original, encoding="utf-8")
+        manager.set_enabled("sample", False)
+        rewritten = (directory / "SKILL.md").read_text(encoding="utf-8")
+        # 其余内容逐字节保留，仅在 frontmatter 注入一行
+        expected = original.replace(
+            "---\nname: sample", "---\nenabled: false\nname: sample", 1)
+        assert rewritten == expected
+
+    def test_set_enabled_migrates_legacy_disabled_root(self, manager: SkillManager) -> None:
+        write_skill(manager.disabled_root / "legacy", "legacy")
+        result = manager.set_enabled("legacy", True)
+        assert (manager.active_root / "legacy").is_dir()
+        assert not (manager.disabled_root / "legacy").exists()
+        assert result["enabled"] is True
+
+    def test_set_enabled_disable_legacy_stays_put(self, manager: SkillManager) -> None:
+        write_skill(manager.disabled_root / "legacy", "legacy")
+        result = manager.set_enabled("legacy", False)
+        assert (manager.disabled_root / "legacy").is_dir()
+        assert not (manager.active_root / "legacy").exists()
+        assert result["enabled"] is False
+
+    def test_set_enabled_rejects_skill_without_frontmatter(self, manager: SkillManager) -> None:
+        directory = manager.active_root / "broken"
+        directory.mkdir()
+        (directory / "SKILL.md").write_text("no frontmatter here", encoding="utf-8")
+        with pytest.raises(SkillManagerError) as caught:
+            manager.set_enabled("broken", False)
+        assert caught.value.kind == "bad_request"
 
     def test_set_enabled_is_idempotent(self, manager: SkillManager) -> None:
         write_skill(manager.disabled_root / "sample", "sample")
@@ -276,20 +329,23 @@ class TestImportFolder:
         ]
         item = manager.import_folder(payload)
         assert item["enabled"] is False
-        assert (manager.disabled_root / "sample/assets/raw.bin").read_bytes() == b"\x00\xff"
+        assert item["effective"] is False
+        assert (manager.active_root / "sample/assets/raw.bin").read_bytes() == b"\x00\xff"
+        landed = (manager.active_root / "sample/SKILL.md").read_text(encoding="utf-8")
+        assert "enabled: false" in landed
 
     def test_import_folder_accepts_root_skill_md(self, manager: SkillManager) -> None:
         payload = [{"path": "SKILL.md", "content_b64": b64(VALID_SKILL)}]
         item = manager.import_folder(payload)
         assert item["name"] == "sample"
-        assert (manager.disabled_root / "sample/SKILL.md").is_file()
+        assert (manager.active_root / "sample/SKILL.md").is_file()
         assert item["path"] == "/user/sample/SKILL.md"
 
     def test_import_folder_accepts_one_wrapper_directory(self, manager: SkillManager) -> None:
         payload = [{"path": "wrapper/SKILL.md", "content_b64": b64(VALID_SKILL)}]
         item = manager.import_folder(payload)
         assert item["name"] == "sample"
-        assert (manager.disabled_root / "sample/SKILL.md").is_file()
+        assert (manager.active_root / "sample/SKILL.md").is_file()
 
     def test_import_folder_rejects_multiple_roots(self, manager: SkillManager) -> None:
         payload = [
@@ -334,7 +390,7 @@ class TestImportFolder:
         ]
         item = manager.import_folder(payload)
         assert item["name"] == "sample"
-        assert not (manager.disabled_root / "sample/.DS_Store").exists()
+        assert not (manager.active_root / "sample/.DS_Store").exists()
 
     def test_import_folder_rejects_invalid_paths(self, manager: SkillManager) -> None:
         for bad in ("../escape.md", "/abs.md", "C:/win.md", "a//b.md", "a/./b.md", "", "a\x00b"):
@@ -405,19 +461,20 @@ class TestImportZip:
         archive = make_zip({"sample/SKILL.md": VALID_SKILL.encode("utf-8"), "sample/assets/a.bin": b"\x00\x01"})
         item = manager.import_zip("sample.zip", b64(archive))
         assert item["enabled"] is False
-        assert (manager.disabled_root / "sample/assets/a.bin").read_bytes() == b"\x00\x01"
+        assert (manager.active_root / "sample/assets/a.bin").read_bytes() == b"\x00\x01"
+        assert "enabled: false" in (manager.active_root / "sample/SKILL.md").read_text(encoding="utf-8")
 
     def test_import_zip_accepts_wrapper_and_root(self, manager: SkillManager) -> None:
         import shutil as _shutil
 
         item = manager.import_zip("root.zip", b64(make_zip({"SKILL.md": VALID_SKILL.encode("utf-8")})))
         assert item["name"] == "sample"
-        assert (manager.disabled_root / "sample/SKILL.md").is_file()
-        _shutil.rmtree(manager.disabled_root / "sample")
+        assert (manager.active_root / "sample/SKILL.md").is_file()
+        _shutil.rmtree(manager.active_root / "sample")
         wrapped = "---\nname: wrapped\ndescription: 包装目录。\n---\n\n# 指令\n"
         item = manager.import_zip("wrapped.zip", b64(make_zip({"wrapper/SKILL.md": wrapped.encode("utf-8")})))
         assert item["name"] == "wrapped"
-        assert (manager.disabled_root / "wrapped/SKILL.md").is_file()
+        assert (manager.active_root / "wrapped/SKILL.md").is_file()
         buffer = BytesIO()
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             info = zipfile.ZipInfo("sample/SKILL.md")

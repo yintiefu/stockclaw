@@ -142,11 +142,24 @@ class TestDetail:
 
 
 class TestPatchAndDelete:
-    def test_skill_patch_is_idempotent(self, manager, monkeypatch) -> None:
-        write_skill(manager.disabled_root / "sample", "sample")
+    def test_skill_patch_rewrites_frontmatter_in_place(self, manager, monkeypatch) -> None:
+        write_skill(manager.active_root / "sample", "sample")
         use_manager(monkeypatch, manager)
-        first = client.patch("/api/skills/user/sample", json={"enabled": True})
-        second = client.patch("/api/skills/user/sample", json={"enabled": True})
+        response = client.patch("/api/skills/user/sample", json={"enabled": False})
+        assert response.status_code == 200
+        body = response.json()
+        assert body["enabled"] is False
+        assert body["effective"] is False
+        # 目录不移动,frontmatter 被改写
+        assert (manager.active_root / "sample").is_dir()
+        assert not (manager.disabled_root / "sample").exists()
+        assert "enabled: false" in (manager.active_root / "sample/SKILL.md").read_text(encoding="utf-8")
+
+    def test_skill_patch_is_idempotent(self, manager, monkeypatch) -> None:
+        write_skill(manager.active_root / "sample", "sample")
+        use_manager(monkeypatch, manager)
+        first = client.patch("/api/skills/user/sample", json={"enabled": False})
+        second = client.patch("/api/skills/user/sample", json={"enabled": False})
         assert first.status_code == second.status_code == 200
         assert first.json() == second.json()
         assert (manager.active_root / "sample").is_dir()
@@ -183,7 +196,8 @@ class TestImport:
         response = client.post("/api/skills/import", json=payload)
         assert response.status_code == 200
         assert response.json()["enabled"] is False
-        assert (manager.disabled_root / "sample/SKILL.md").is_file()
+        assert (manager.active_root / "sample/SKILL.md").is_file()
+        assert "enabled: false" in (manager.active_root / "sample/SKILL.md").read_text(encoding="utf-8")
 
     def test_import_zip_defaults_disabled(self, manager, monkeypatch) -> None:
         use_manager(monkeypatch, manager)
@@ -194,7 +208,7 @@ class TestImport:
             "kind": "zip", "filename": "sample.zip", "content_b64": b64(buffer.getvalue()),
         })
         assert response.status_code == 200
-        assert (manager.disabled_root / "sample/SKILL.md").is_file()
+        assert (manager.active_root / "sample/SKILL.md").is_file()
 
     def test_import_rejects_unknown_kind(self, manager, monkeypatch) -> None:
         use_manager(monkeypatch, manager)

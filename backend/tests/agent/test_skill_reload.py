@@ -103,6 +103,22 @@ def test_reload_update_reports_builtin_count(roots: tuple[Path, Path]) -> None:
     assert str(builtin_count) in str(message.content)
 
 
+def test_reload_hides_frontmatter_disabled_skills(roots: tuple[Path, Path]) -> None:
+    """enabled: false 的技能位于挂载根内,但 reload 重枚举后不得出现在模型视图。"""
+    _, user = roots
+    write_skill(user / "stopped", "stopped")
+    disabled_md = user / "stopped/SKILL.md"
+    disabled_md.write_text(
+        disabled_md.read_text(encoding="utf-8").replace("---\n", "---\nenabled: false\n", 1),
+        encoding="utf-8",
+    )
+    middleware = make_middleware(roots)
+    state = {"messages": [HumanMessage(content="/reload-skills")]}
+    update = middleware.before_agent(state, runtime=None, config=None)  # type: ignore[arg-type]
+    names = {item["name"] for item in update["skills_metadata"]}
+    assert "stopped" not in names
+
+
 def test_reload_command_clears_previous_load_errors(roots: tuple[Path, Path]) -> None:
     middleware = make_middleware(roots)
     state = {

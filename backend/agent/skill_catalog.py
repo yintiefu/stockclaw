@@ -31,6 +31,9 @@ class SkillValidationError(ValueError):
 class ParsedSkill:
     metadata: SkillMetadata
     instructions: str
+    # frontmatter 可选字段 enabled（缺省 True）：False 表示用户停用，运行时与
+    # 管理面都以它为准；与「SKILL.md 能否通过解析」是两个独立概念。
+    enabled: bool = True
 
 
 def _skill_name_valid(name: str, directory_name: str | None) -> bool:
@@ -66,6 +69,9 @@ def parse_skill_document(content: str, directory_name: str | None, virtual_path:
         raise SkillValidationError("YAML frontmatter 解析失败") from None
     if not isinstance(raw, dict):
         raise SkillValidationError("YAML frontmatter 必须是对象")
+    enabled_raw = raw.get("enabled", True)
+    if not isinstance(enabled_raw, bool):
+        raise SkillValidationError("技能 enabled 必须是布尔值")
     name = raw.get("name")
     description = raw.get("description")
     if not isinstance(name, str) or not _skill_name_valid(name, directory_name):
@@ -99,7 +105,7 @@ def parse_skill_document(content: str, directory_name: str | None, virtual_path:
         compatibility=compatibility.strip() if compatibility is not None else None,
         metadata=dict(metadata_raw), allowed_tools=allowed_tools,
     )
-    return ParsedSkill(metadata=metadata, instructions=content)
+    return ParsedSkill(metadata=metadata, instructions=content, enabled=enabled_raw)
 
 
 def parse_skill_file(path: Path, virtual_path: str) -> ParsedSkill:
@@ -135,11 +141,13 @@ class FilteredSkillBackend(BackendProtocol):
         if name in self._excluded or skill_root.is_symlink():
             return False
         try:
-            parse_skill_file(skill_root / "SKILL.md", f"/{name}/SKILL.md")
+            parsed = parse_skill_file(skill_root / "SKILL.md", f"/{name}/SKILL.md")
             (self.root / str(normalized).lstrip("/")).resolve().relative_to(skill_root.resolve())
         except (OSError, UnicodeDecodeError, ValueError, SkillValidationError):
             return False
-        return True
+        # enabled: false 的技能对运行时「不存在」——ls/read/download 一律拒绝,
+        # SkillsMiddleware(含 /reload-skills 重枚举)因此看不到停用技能。
+        return parsed.enabled
 
     def ls(self, path: str) -> LsResult:
         if path.rstrip("/") in {"", "."}:

@@ -1,9 +1,11 @@
 """本地技能管理器：用户技能根的枚举、启停、删除与导入。
 
 只做本地磁盘操作：FastAPI 路由直接调用，不触 LangGraph、不调模型。
-启停由目录位置表达——活动根为启用，同级 `<name>.disabled` 根为停用；
+启停由 SKILL.md frontmatter 的 `enabled` 布尔字段表达（缺省 True）——
+切换即原地改写该行，技能目录不再移动；旧版「同级 `<name>.disabled`
+停用根」仅作遗留读取与启用时的一次性迁移，不再写入新技能。
 进程启动时对 settings.json 的 `skills.path` 做快照，任何变更操作前在
-锁内复核该路径未漂移，防止两个根被移动后写错位置。所有错误消息为
+锁内复核该路径未漂移，防止技能被写到错误位置。所有错误消息为
 固定中文，不含物理路径与原始异常内容。
 """
 from __future__ import annotations
@@ -73,6 +75,47 @@ def _map_oserror(exc: OSError) -> SkillManagerError:
     if exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
         return SkillManagerError("unavailable", "技能目录不可写")
     return SkillManagerError("internal", "本地文件操作失败")
+
+
+_ENABLED_LINE = re.compile(r"^enabled:[^\n]*?(?P<tail>[ \t\r]*)$", re.MULTILINE)
+
+
+def _write_enabled_flag(skill_md: Path, value: bool) -> None:
+    """原地改写 SKILL.md frontmatter 的 enabled 行；其余字节（含 CRLF/注释）原样保留。
+
+    已是目标值时幂等跳过；无 frontmatter 块则报 SkillValidationError。
+    同目录临时文件 + os.replace 原子落盘。整行替换（含行内注释），
+    避免旧值残留导致插入分支产生重复键。
+    """
+    content = skill_md.read_text(encoding="utf-8")
+    opening = re.match(r"^---[ \t]*\r?\n", content)
+    if opening is None:
+        raise SkillValidationError("SKILL.md 缺少 frontmatter，无法启停")
+    block = re.match(r"^(.*?\r?\n)---[ \t]*(?:\r?\n|$)", content[opening.end():], re.DOTALL)
+    if block is None:
+        raise SkillValidationError("SKILL.md 缺少 frontmatter，无法启停")
+    target = f"enabled: {'true' if value else 'false'}"
+    body = block.group(1)
+    if _ENABLED_LINE.search(body):
+        # 保留行尾空白（含 CRLF 的 \r），整行替换
+        rewritten_body = _ENABLED_LINE.sub(lambda m: target + m.group("tail"), body, count=1)
+    else:
+        newline = "\r\n" if "\r\n" in content else "\n"
+        rewritten_body = target + newline + body
+    rewritten = content[: opening.end()] + rewritten_body + content[opening.end() + len(body):]
+    if rewritten == content:
+        return
+    fd, temp_name = tempfile.mkstemp(dir=skill_md.parent, prefix=".skill-md-", suffix=".tmp")
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(rewritten)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, skill_md)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def decode_base64(value: str) -> bytes:
@@ -174,15 +217,15 @@ class SkillManager:
     # 枚举
     # ------------------------------------------------------------------
 
-    def _parse_user_skill(self, directory: Path, name: str) -> tuple[bool, str | None]:
-        """返回 (valid, safe_error)；解析失败给安全中文原因。"""
+    def _parse_user_skill(self, directory: Path, name: str) -> tuple[bool, bool, str | None]:
+        """返回 (valid, enabled, safe_error)；解析失败时 enabled 回退 True（保留停用入口）。"""
         try:
-            parse_skill_file(directory / "SKILL.md", f"/user/{name}/SKILL.md")
+            parsed = parse_skill_file(directory / "SKILL.md", f"/user/{name}/SKILL.md")
         except SkillValidationError as exc:
-            return False, str(exc)
+            return False, True, str(exc)
         except OSError:
-            return False, "SKILL.md 缺失或不可读"
-        return True, None
+            return False, True, "SKILL.md 缺失或不可读"
+        return True, parsed.enabled, None
 
     def _scan_root(self, root: Path) -> dict[str, Path]:
         entries: dict[str, Path] = {}
@@ -250,7 +293,7 @@ class SkillManager:
             in_disabled = name in disabled
             directory = active.get(name) or disabled.get(name)
             assert directory is not None
-            valid, error = self._parse_user_skill(directory, name)
+            valid, frontmatter_enabled, error = self._parse_user_skill(directory, name)
             description = None
             if valid:
                 try:
@@ -258,6 +301,9 @@ class SkillManager:
                     description = parsed.metadata["description"]
                 except (OSError, SkillValidationError):
                     pass
+            # enabled = 活动根 and frontmatter 标志；遗留停用根恒为 False，
+            # 解析失败的活动根技能回退 True（保持「停用」入口）。
+            enabled = in_active and frontmatter_enabled
             if in_active and in_disabled:
                 user.append(self._summary(
                     name=name, description=description, source="user",
@@ -265,7 +311,7 @@ class SkillManager:
                     error="活动与停用目录同时存在同名技能，请先手动清理",
                 ))
                 continue
-            if in_active and name in builtin_names:
+            if enabled and name in builtin_names:
                 user.append(self._summary(
                     name=name, description=description, source="user",
                     enabled=True, valid=valid, effective=False,
@@ -274,8 +320,8 @@ class SkillManager:
                 continue
             user.append(self._summary(
                 name=name, description=description, source="user",
-                enabled=in_active, valid=valid,
-                effective=in_active and valid and name not in builtin_names,
+                enabled=enabled, valid=valid,
+                effective=enabled and valid and name not in builtin_names,
                 error=error,
             ))
         return {"builtin": builtin, "user": user, "user_available": True}
@@ -306,7 +352,7 @@ class SkillManager:
         directory = active.get(name) or disabled.get(name)
         if directory is None:
             raise SkillManagerError("not_found", "用户技能不存在")
-        valid, error = self._parse_user_skill(directory, name)
+        valid, frontmatter_enabled, error = self._parse_user_skill(directory, name)
         description = None
         instructions = None
         if valid:
@@ -320,17 +366,18 @@ class SkillManager:
         builtin_names = valid_skill_names(self._builtin_root)
         in_active = name in active
         in_disabled = name in disabled
+        enabled = in_active and frontmatter_enabled
         if in_active and in_disabled:
             effective = False
             error = "活动与停用目录同时存在同名技能，请先手动清理"
-        elif in_active and name in builtin_names:
+        elif enabled and name in builtin_names:
             effective = False
             error = "与内置技能同名，已阻止加载"
         else:
-            effective = in_active and valid and name not in builtin_names
+            effective = enabled and valid and name not in builtin_names
         summary = self._summary(
             name=name, description=description, source="user",
-            enabled=in_active, valid=valid, effective=effective, error=error,
+            enabled=enabled, valid=valid, effective=effective, error=error,
         )
         summary["path"] = f"/user/{name}/SKILL.md"
         summary["location"] = str(directory / "SKILL.md")
@@ -364,14 +411,21 @@ class SkillManager:
                 raise SkillManagerError("bad_request", "不能修改内置技能")
             if active_dir is None and disabled_dir is None:
                 raise SkillManagerError("not_found", "用户技能不存在")
-            source_dir = active_dir or disabled_dir
-            assert source_dir is not None
-            target_root = roots.active if enabled else roots.disabled
-            if source_dir.parent == target_root:
-                return self.get_skill("user", name)
+            if disabled_dir is not None:
+                # 遗留停用根里的技能：启用时一次性迁移到活动根并置 enabled；
+                # 停用则保持原样（本就处于停用状态）。
+                if not enabled:
+                    return self.get_skill("user", name)
+                try:
+                    roots.active.mkdir(parents=True, exist_ok=True)
+                    os.replace(disabled_dir, roots.active / name)
+                except OSError as exc:
+                    raise _map_oserror(exc) from None
+            directory = roots.active / name
             try:
-                target_root.mkdir(parents=True, exist_ok=True)
-                os.replace(source_dir, target_root / name)
+                _write_enabled_flag(directory / "SKILL.md", enabled)
+            except SkillValidationError as exc:
+                raise SkillManagerError("bad_request", str(exc)) from None
             except OSError as exc:
                 raise _map_oserror(exc) from None
         return self.get_skill("user", name)
@@ -396,7 +450,7 @@ class SkillManager:
     # ------------------------------------------------------------------
 
     def import_folder(self, files: list[dict]) -> dict[str, object]:
-        """从浏览器目录读取的文件清单导入；默认落在停用根。"""
+        """从浏览器目录读取的文件清单导入；落活动根并默认停用（注入 enabled: false）。"""
         prepared: list[tuple[PurePosixPath, bytes]] = []
         seen_paths: set[PurePosixPath] = set()
         for item in files:
@@ -491,7 +545,7 @@ class SkillManager:
     def _stage_and_commit(self, stage: Callable[[Path], None]) -> dict[str, object]:
         """共享管道：临时根 staging → 严格解析 → 锁内碰撞检查 → 原子落位。"""
         roots = self._require_roots()
-        temp_root = Path(tempfile.mkdtemp(dir=roots.disabled.parent, prefix=".import-"))
+        temp_root = Path(tempfile.mkdtemp(dir=roots.active.parent, prefix=".import-"))
         try:
             stage(temp_root)
             staged_root = temp_root if temp_root.joinpath("SKILL.md").is_file() else None
@@ -512,6 +566,13 @@ class SkillManager:
             except SkillValidationError as exc:
                 raise SkillManagerError("bad_request", str(exc)) from None
             name = parsed.metadata["name"]
+            # 导入默认停用：在 staged 副本上注入 enabled: false（用户源文件不受影响）
+            try:
+                _write_enabled_flag(staged_root / "SKILL.md", False)
+            except SkillValidationError as exc:
+                raise SkillManagerError("bad_request", str(exc)) from None
+            except OSError as exc:
+                raise _map_oserror(exc) from None
             destination = self._commit_staged(roots, staged_root, name)
         finally:
             try:
@@ -521,6 +582,7 @@ class SkillManager:
         return self.get_skill("user", name)
 
     def _commit_staged(self, roots: SkillRoots, staged_root: Path, name: str) -> Path:
+        """落位到活动根（enabled: false 已在 staged 副本注入）；遗留停用根仅参与碰撞检查。"""
         with _LOCK:
             if _settings_skills_path(roots.settings_path) != roots.active:
                 raise SkillManagerError("conflict", "Agent 设置的技能路径已变更，请重启服务")
@@ -529,11 +591,11 @@ class SkillManager:
             if name in valid_skill_names(self._builtin_root):
                 raise SkillManagerError("conflict", "与内置技能同名，不能导入")
             try:
-                roots.disabled.mkdir(parents=True, exist_ok=True)
-                os.replace(staged_root, roots.disabled / name)
+                roots.active.mkdir(parents=True, exist_ok=True)
+                os.replace(staged_root, roots.active / name)
             except OSError as exc:
                 raise _map_oserror(exc) from None
-        return roots.disabled / name
+        return roots.active / name
 
 
 def _rmtree(path: Path) -> None:

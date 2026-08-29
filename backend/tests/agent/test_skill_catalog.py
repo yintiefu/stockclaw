@@ -206,6 +206,45 @@ def test_filtered_backend_hides_invalid_and_excluded_skills(tmp_path: Path) -> N
     assert backend.download_files(["/blocked/SKILL.md"])[0].error == "file_not_found"
 
 
+# ---------------------------------------------------------------- enabled 字段
+
+
+def test_parse_skill_document_enabled_defaults_to_true() -> None:
+    parsed = parse_skill_document(VALID, "sample-skill", "/user/sample-skill/SKILL.md")
+    assert parsed.enabled is True
+
+
+def test_parse_skill_document_reads_enabled_flag() -> None:
+    document = "---\nname: sample-skill\ndescription: x\nenabled: false\n---\n\n# 指令\n"
+    parsed = parse_skill_document(document, "sample-skill", "/user/sample-skill/SKILL.md")
+    assert parsed.enabled is False
+    assert parsed.metadata["name"] == "sample-skill"
+
+
+@pytest.mark.parametrize("value", ['"true"', "1", "yes-text", "[true]", "null"])
+def test_parse_skill_document_rejects_non_bool_enabled(value: str) -> None:
+    document = f"---\nname: sample-skill\ndescription: x\nenabled: {value}\n---\n\n# 指令\n"
+    with pytest.raises(SkillValidationError, match="enabled"):
+        parse_skill_document(document, "sample-skill", "/user/sample-skill/SKILL.md")
+
+
+def test_filtered_backend_hides_disabled_skill(tmp_path: Path) -> None:
+    from agent.skill_catalog import FilteredSkillBackend
+
+    write_skill(tmp_path / "live", "live")
+    write_skill(tmp_path / "stopped", "stopped")
+    disabled_md = tmp_path / "stopped/SKILL.md"
+    disabled_md.write_text(
+        disabled_md.read_text(encoding="utf-8").replace("---\n", "---\nenabled: false\n", 1),
+        encoding="utf-8",
+    )
+    backend = FilteredSkillBackend(tmp_path)
+    assert [entry["path"] for entry in backend.ls("/").entries or []] == ["/live/"]
+    assert backend.read("/stopped/SKILL.md").error is not None
+    assert backend.ls("/stopped").error == "path_not_found"
+    assert backend.download_files(["/stopped/SKILL.md"])[0].error == "file_not_found"
+
+
 def test_valid_skill_names_skips_invalid_directories(tmp_path: Path) -> None:
     from agent.skill_catalog import valid_skill_names
 

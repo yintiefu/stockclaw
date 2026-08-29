@@ -3,6 +3,18 @@
 本项目的版本号唯一来源是 `frontend/package.json`；后端 HTTP API、`/api/health`、
 前端界面与 MCP `serverInfo` 全部从它读取（见 `backend/version.py`）。
 
+## 未发布 — 2026-08-29：技能启停机制改为 frontmatter `enabled` 字段
+
+- 启用/停用不再移动技能目录：由 SKILL.md frontmatter 的可选布尔字段 `enabled`
+  表达（缺省 `true`，非布尔值解析报错）；切换为原地原子改写该行，其余内容
+  （含 CRLF、注释）逐字节保留。
+- Agent 视图同步收口：`enabled: false` 的技能经 `ls` / `read_file` / 下载一律
+  「不存在」，`/reload-skills` 重枚举自动排除（命令逻辑本身不变）。
+- 导入默认停用改为注入：staged 副本自动写入 `enabled: false` 后落**活动根**
+  （用户源文件不受影响）；同名碰撞检查仍覆盖活动根与旧停用根。
+- 兼容迁移：旧版 `skills.path.disabled` 停用根仅作遗留读取；从中「启用」会
+  一次性迁移到活动根并置 `enabled: true`，「停用」保持原样不再写入新技能。
+
 ## 未发布 — 2026-08-28：本地技能管理闭环（导入 / 启停 / 刷新）
 
 - 新增「技能管理」页（`/skills`）：区分只读内置技能与用户导入技能；支持从本地
