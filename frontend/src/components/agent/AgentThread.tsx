@@ -17,6 +17,7 @@ import {
 } from "@/components/assistant-ui/tool-group";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { Button } from "@/components/ui/button";
+import { ComposerSlashPopover, useSlashSkills } from "./AgentSlashSkills";
 
 /** 工作台 ToolGroup：demo 折叠组结构。 */
 const WorkspaceToolGroup: ComponentType<PropsWithChildren<{ group: ThreadGroupPart }>> = ({
@@ -44,12 +45,14 @@ const STATIC_COMPONENTS: ThreadComponents = {
 function WorkspaceComposer({ approvalPending }: { approvalPending: boolean }) {
   const isRunning = useAuiState((s) => s.thread.isRunning);
   const locked = isRunning || approvalPending;
+  const slashAdapter = useSlashSkills();
   return (
-    <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
-      <div
-        data-slot="aui_composer-shell"
-        className="border-border/60 focus-within:border-border dark:border-muted-foreground/15 dark:focus-within:border-muted-foreground/30 flex w-full cursor-text flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) transition-[border-color]"
-      >
+    <ComposerPrimitive.Unstable_TriggerPopoverRoot>
+      <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
+        <div
+          data-slot="aui_composer-shell"
+          className="border-border/60 focus-within:border-border dark:border-muted-foreground/15 dark:focus-within:border-muted-foreground/30 flex w-full cursor-text flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) transition-[border-color]"
+        >
         {approvalPending && (
           <p className="px-2.5 text-xs text-warning" role="status">
             请先处理待审批工具调用
@@ -100,9 +103,11 @@ function WorkspaceComposer({ approvalPending }: { approvalPending: boolean }) {
               </ComposerPrimitive.Cancel>
             </AuiIf>
           </div>
+          </div>
         </div>
-      </div>
-    </ComposerPrimitive.Root>
+        {slashAdapter ? <ComposerSlashPopover adapter={slashAdapter} /> : null}
+      </ComposerPrimitive.Root>
+    </ComposerPrimitive.Unstable_TriggerPopoverRoot>
   );
 }
 
