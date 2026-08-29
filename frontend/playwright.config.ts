@@ -23,14 +23,22 @@ export const FRONTEND_PORT = 5873;
 const dataRoot = process.env.VR_E2E_DATA_ROOT
   ?? mkdtempSync(path.join(os.tmpdir(), "vr-agent-e2e-"));
 process.env.VR_E2E_DATA_ROOT = dataRoot;
+/** 隔离数据根：上传 fixture 等测试资产只允许出现在这里 */
+export const DATA_ROOT = dataRoot;
 const langGraphRoot = path.join(dataRoot, "langgraph");
 /** 隔离临时根内的 trace 目录（start_langgraph.py 的 settings.trace.dir 指向这里） */
 export const TRACES_ROOT = path.join(langGraphRoot, "traces");
+/**
+ * Task 11：FastAPI 与 LangGraph 共享同一份隔离 settings（start_langgraph.py
+ * 是唯一写入者，先建目录/文件再拉起 FastAPI——webServer 按声明顺序启动，
+ * FastAPI 的技能管理器懒初始化，读同一文件即得同一技能根快照）。
+ */
+export const E2E_SETTINGS_PATH = path.join(langGraphRoot, "settings.json");
 
 export default defineConfig({
   testDir: "./e2e",
   timeout: 90_000,
-  expect: { timeout: 15_000 },
+  expect: { timeout: 30_000 },
   fullyParallel: false,
   workers: 1,
   retries: 0,
@@ -48,8 +56,8 @@ export default defineConfig({
       env: {
         VR_DATA_DIR: dataRoot,
         VR_REPORTS_DIR: path.join(dataRoot, "myreports"),
-        // /api/agent/status 只读摘要也要走隔离配置：绝不读真实 ~/.vibe-research
-        VR_AGENT_SETTINGS: path.join(dataRoot, "fastapi-agent-settings.json"),
+        // /api/skills 与 /api/agent/status 共用 LangGraph 侧同一份隔离配置
+        VR_AGENT_SETTINGS: E2E_SETTINGS_PATH,
       },
       reuseExistingServer: false,
       stdout: "ignore",

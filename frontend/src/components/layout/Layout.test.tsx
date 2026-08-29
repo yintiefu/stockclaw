@@ -147,3 +147,36 @@ describe("Layout 导航选中态", () => {
     expect(screen.getByRole("link", { name: "产业信号" })).not.toHaveClass("bg-primary/15");
   });
 });
+
+describe("Layout 设置中心导航", () => {
+  function renderAt(path: string) {
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route element={<Layout />}>
+            <Route path="*" element={<div />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  function navLinks() {
+    return Array.from(screen.getByRole("navigation").querySelectorAll(":scope > a, :scope > div > a"));
+  }
+
+  it("/settings 子路由高亮设置且不串扰其他一级菜单", () => {
+    renderAt("/settings/skills/user/sample");
+    expect(screen.getByRole("link", { name: "设置" })).toHaveClass("bg-primary/15");
+    expect(screen.getByRole("link", { name: "α-mind" })).not.toHaveClass("bg-primary/15");
+    expect(screen.queryByRole("link", { name: "技能管理" })).toBeNull();
+  });
+
+  it("技能管理已移入设置中心,不再占据顶级导航", () => {
+    renderAt("/settings");
+    const links = navLinks().map((node) => node.textContent);
+    expect(links.some((text) => text?.includes("技能管理"))).toBe(false);
+    expect(links.some((text) => text?.includes("α-mind"))).toBe(true);
+    expect(links.some((text) => text?.includes("设置"))).toBe(true);
+  });
+});

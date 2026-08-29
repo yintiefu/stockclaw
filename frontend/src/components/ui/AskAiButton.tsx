@@ -195,7 +195,7 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI", scope
                   分析结论由你自己配置的 AI 给出，本产品只负责把本页数据打包成上下文、并让 AI 能调数据工具，
                   <b className="text-foreground">不校准、不背书、不对结果负责</b>。
                 </div>
-                <Link to="/settings" className="flex items-center justify-center gap-2 rounded-lg bg-primary/15 px-3 py-2 text-sm font-medium text-primary hover:bg-primary/25">
+                <Link to="/settings/model" className="flex items-center justify-center gap-2 rounded-lg bg-primary/15 px-3 py-2 text-sm font-medium text-primary hover:bg-primary/25">
                   <Settings className="h-4 w-4" /> 查看 Agent 服务配置
                 </Link>
               </div>

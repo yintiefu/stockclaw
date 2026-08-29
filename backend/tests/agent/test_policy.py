@@ -40,14 +40,17 @@ def test_policy_with_tools_keeps_tool_catalog_by_default() -> None:
 
 
 def test_skill_backend_exposes_separate_read_only_namespaces(tmp_path: Path) -> None:
+    from agent.skill_catalog import FilteredSkillBackend
+
     builtin = tmp_path / "builtin"
     user = tmp_path / "user"
     builtin.mkdir()
     user.mkdir()
     backend = build_skill_backend(builtin, user)
     assert set(backend.routes) == {"/builtin/", "/user/"}
-    assert backend.routes["/builtin/"].virtual_mode is True
-    assert backend.routes["/user/"].virtual_mode is True
+    for routed in backend.routes.values():
+        assert isinstance(routed, FilteredSkillBackend)
+        assert routed._delegate.virtual_mode is True
 
 
 def test_stock_analysis_skill_contains_dimensions_and_boundary() -> None:

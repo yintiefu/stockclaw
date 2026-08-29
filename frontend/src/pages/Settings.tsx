@@ -6,7 +6,7 @@ import { toast } from "sonner";
 import { api, loadAccessKey, saveAccessKey, type AgentStatusSummary } from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
 
-// 「设置」已改为 Agent 只读状态页：模型与密钥只在服务端
+// 「模型设置」（设置中心分区）为 Agent 只读状态页：模型与密钥只在服务端
 // ~/.vibe-research/agent/settings.json（权限 0600）里配置，浏览器不再保存、
 // 不再回读任何密钥；页面只展示脱敏摘要 + 启动指引 + 独立的 FastAPI 访问密钥。
 
@@ -66,7 +66,7 @@ export function Settings() {
   return (
     <div>
       <PageHeader
-        title="设置"
+        title="模型设置"
         subtitle="模型与密钥只配置在服务端 Agent 设置文件里；本页只读展示状态与启动指引"
         actions={
           <button onClick={load} className="text-muted-foreground hover:text-primary" title="刷新状态">

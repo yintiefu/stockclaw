@@ -5,12 +5,12 @@ from pathlib import Path, PurePosixPath
 import re
 from typing import Any, Literal, Union
 
-from deepagents.middleware.skills import _parse_skill_metadata, _validate_skill_name
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError
 import yaml
 
 import tools as legacy_tools
 from agent.skill_backends import BUILTIN_SKILLS_DIR
+from agent.skill_catalog import SkillValidationError, parse_skill_file
 
 HARD_LIMITS: dict[str, int] = {
     "section_chars": 4000,
@@ -171,16 +171,10 @@ def _verify_instruction(
     skill_file = skill_root / "SKILL.md"
     if not skill_file.is_file():
         raise _config_error(field, "引用的内置技能指令文件不存在：Skill 根 SKILL.md 缺失")
-    metadata = _parse_skill_metadata(
-        skill_file.read_text(encoding="utf-8"),
-        "SKILL.md",
-        skill_root.name,
-    )
-    if metadata is None or not metadata.get("name") or not metadata.get("description"):
-        raise _config_error(field, "Skill 根 SKILL.md frontmatter 元数据无效")
-    name_valid, _ = _validate_skill_name(metadata["name"], skill_root.name)
-    if not name_valid:
-        raise _config_error(field, "Skill 根 SKILL.md frontmatter 的 name 与目录不一致")
+    try:
+        parse_skill_file(skill_file, virtual_path=f"/builtin/{skill_root.name}/SKILL.md")
+    except (OSError, UnicodeDecodeError, SkillValidationError):
+        raise _config_error(field, "Skill 根 SKILL.md frontmatter 元数据无效") from None
     if not target.is_file():
         raise _config_error(field, "引用的内置技能指令文件不存在")
 

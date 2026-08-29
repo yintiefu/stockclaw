@@ -11,7 +11,6 @@ import asyncio
 from pathlib import Path
 from typing import Annotated, Any
 
-from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.skills import SkillsMiddleware
 from langchain.agents import AgentState, create_agent
@@ -23,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from agent.model_factory import build_model
 from agent.policy import fixed_system_policy
 from agent.settings import load_agent_settings
-from agent.skill_backends import BUILTIN_SKILLS_DIR
+from agent.skill_backends import BUILTIN_SKILLS_DIR, SKILLS_SYSTEM_PROMPT, build_builtin_skill_backend
 from agent.tool_registry import build_builtin_tools
 from agent.workflow_events import utc_now
 
@@ -287,15 +286,14 @@ async def build_embedded_graph(
     settings = load_agent_settings()
     skills_root = builtin_skills_root or BUILTIN_SKILLS_DIR
 
-    backend = CompositeBackend(
-        default=StateBackend(),
-        routes={
-            "/builtin/": FilesystemBackend(root_dir=str(skills_root), virtual_mode=True),
-        },
-    )
+    backend = build_builtin_skill_backend(skills_root)
 
     middleware = [
-        SkillsMiddleware(backend=backend, sources=["/builtin/"]),
+        SkillsMiddleware(
+            backend=backend,
+            sources=["/builtin/"],
+            system_prompt=SKILLS_SYSTEM_PROMPT,
+        ),
         FilesystemMiddleware(backend=backend, tools=["ls", "read_file"]),
         embedded_context_prompt,
         record_snapshot_ref,

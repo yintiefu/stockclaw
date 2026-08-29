@@ -1,4 +1,4 @@
-import { createBrowserRouter, Navigate } from "react-router-dom";
+import { createBrowserRouter, Navigate, useParams, type RouteObject } from "react-router-dom";
 import { Layout } from "@/components/layout/Layout";
 import { DailyReview } from "@/pages/DailyReview";
 import { Intel } from "@/pages/Intel";
@@ -12,9 +12,18 @@ import { Watchlist } from "@/pages/Watchlist";
 import { MyReports } from "@/pages/MyReports";
 import { Notes } from "@/pages/Notes";
 import { Settings } from "@/pages/Settings";
+import { SettingsLayout } from "@/pages/SettingsLayout";
 import { Agent } from "@/pages/Agent";
+import { Skills } from "@/pages/Skills";
+import { SkillDetail } from "@/pages/SkillDetail";
 
-export const router = createBrowserRouter([
+/** 旧路径兼容重定向：按路由参数拼出新地址。 */
+function Redirect({ to }: { to: (params: Record<string, string | undefined>) => string }) {
+  const params = useParams();
+  return <Navigate to={to(params)} replace />;
+}
+
+export const routes: RouteObject[] = [
   {
     element: <Layout />,
     children: [
@@ -32,8 +41,24 @@ export const router = createBrowserRouter([
       { path: "/watchlist", element: <Watchlist /> },
       { path: "/my-reports", element: <MyReports /> },
       { path: "/notes", element: <Notes /> },
-      { path: "/settings", element: <Settings /> },
+      {
+        path: "/settings",
+        element: <SettingsLayout />,
+        children: [
+          { index: true, element: <Navigate to="/settings/model" replace /> },
+          { path: "model", element: <Settings /> },
+          { path: "skills", element: <Skills /> },
+          { path: "skills/:source/:name", element: <SkillDetail /> },
+        ],
+      },
       { path: "/agent", element: <Agent /> },
+      { path: "/skills", element: <Navigate to="/settings/skills" replace /> },
+      {
+        path: "/skills/:source/:name",
+        element: <Redirect to={(params) => `/settings/skills/${params.source}/${params.name}`} />,
+      },
     ],
   },
-]);
+];
+
+export const router = createBrowserRouter(routes);

@@ -4,6 +4,10 @@
 VR_E2E_LANGGRAPH_PORT；复制浏览器图/配置/共享 Skills、写入 0600 测试设置
 （无效模型凭据 + stdio 假 MCP 绝对路径），然后 execve 到固定版本的
 langgraph CLI。不引入第四个网络服务。
+
+Task 11 起 settings.json 同时是 FastAPI 侧 /api/skills 的共享配置
+（E2E_SETTINGS_PATH）：本脚本保持唯一写入者，创建活动技能根与同级
+停用根；两侧服务的技能管理器都懒初始化，读同一文件即得同一快照。
 """
 from __future__ import annotations
 
@@ -32,7 +36,12 @@ root.mkdir(parents=True, exist_ok=True)
 shutil.copy2(E2E / "graph.py", root / "graph.py")
 shutil.copy2(E2E / "unified_graphs.py", root / "unified_graphs.py")
 shutil.copy2(E2E / "langgraph.json", root / "langgraph.json")
-shutil.copytree(E2E / "skills", root / "skills", dirs_exist_ok=True)
+active_skills = root / "skills"
+shutil.copytree(E2E / "skills", active_skills, dirs_exist_ok=True)
+# 同级停用根：/api/skills 导入默认落点，由本脚本预先建立（0700）
+disabled_skills = active_skills.parent / f"{active_skills.name}.disabled"
+disabled_skills.mkdir(mode=0o700, exist_ok=True)
+disabled_skills.chmod(0o700)
 
 settings_path = root / "settings.json"
 settings_path.write_text(json.dumps({
@@ -43,7 +52,7 @@ settings_path.write_text(json.dumps({
         "baseURL": "https://example.invalid/v1",
         "temperature": 0.2,
     },
-    "skills": {"path": str(root / "skills")},
+    "skills": {"path": str(active_skills)},
     "mcpServers": {
         "fixture": {
             "transport": "stdio",
