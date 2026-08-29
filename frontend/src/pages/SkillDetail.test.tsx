@@ -27,7 +27,8 @@ function userDetail(overrides: Partial<SkillDetailType> = {}): SkillDetailType {
     effective: true,
     error: null,
     path: "/user/research/SKILL.md",
-    instructions: "# 指令\n\n- 项目一\n- 项目二\n\n| 列 A | 列 B |\n| --- | --- |\n| 1 | 2 |\n",
+    location: "/home/admin/.vibe-research/agent/skills/research/SKILL.md",
+    instructions: "---\nname: research\ndescription: 研究技能。\n---\n\n# 指令\n\n- 项目一\n- 项目二\n\n| 列 A | 列 B |\n| --- | --- |\n| 1 | 2 |\n",
     ...overrides,
   };
 }
@@ -42,6 +43,7 @@ function builtinDetail(): SkillDetailType {
     effective: true,
     error: null,
     path: "/builtin/debate/SKILL.md",
+    location: "/opt/vibe-research/backend/builtin-skills/debate/SKILL.md",
     instructions: "# 内置指令\n",
   };
 }
@@ -50,8 +52,8 @@ function renderAt(path: string) {
   return render(
     <MemoryRouter initialEntries={[path]}>
       <Routes>
-        <Route path="/skills/:source/:name" element={<SkillDetail />} />
-        <Route path="/skills" element={<div>技能列表页</div>} />
+        <Route path="/settings/skills/:source/:name" element={<SkillDetail />} />
+        <Route path="/settings/skills" element={<div>技能列表页</div>} />
       </Routes>
     </MemoryRouter>,
   );
@@ -66,22 +68,34 @@ afterEach(() => cleanup());
 describe("SkillDetail", () => {
   it("用户技能渲染 Markdown/GFM 与虚拟路径", async () => {
     mocked.skillDetail.mockResolvedValue(userDetail());
-    renderAt("/skills/user/research");
+    renderAt("/settings/skills/user/research");
     await waitFor(() => expect(screen.getByRole("heading", { level: 1, name: "research" })).toBeInTheDocument());
     expect(screen.getByRole("heading", { level: 1, name: "指令" })).toBeInTheDocument();
     expect(screen.getByRole("table")).toBeInTheDocument();
-    expect(screen.getByText("/user/research/SKILL.md")).toBeInTheDocument();
-    // 绝不出现宿主机物理路径
-    expect(document.body.textContent ?? "").not.toMatch(/\/home\/|\/Users\/|C:\\\\/);
+    // 头部展示真实磁盘路径，而非虚拟路径
+    expect(screen.getByText("/home/admin/.vibe-research/agent/skills/research/SKILL.md")).toBeInTheDocument();
+    // 内容区剥离 frontmatter：不渲染元信息行
+    expect(screen.queryByText(/name: research/)).toBeNull();
   });
 
   it("内置技能只读：无开关无删除，仅展示始终启用", async () => {
     mocked.skillDetail.mockResolvedValue(builtinDetail());
-    renderAt("/skills/builtin/debate");
-    await waitFor(() => expect(screen.getByText("debate")).toBeInTheDocument());
-    expect(screen.getByText(/内置 \/ 始终启用/)).toBeInTheDocument();
+    renderAt("/settings/skills/builtin/debate");
+    await waitFor(() => expect(screen.getByRole("heading", { level: 1, name: "debate" })).toBeInTheDocument());
+    expect(screen.getByText(/内置 · 始终启用/)).toBeInTheDocument();
     expect(screen.queryByRole("switch")).toBeNull();
     expect(screen.queryByRole("button", { name: "删除技能" })).toBeNull();
+  });
+
+  it("名称/描述/技能内容三分区各自独立展示", async () => {
+    mocked.skillDetail.mockResolvedValue(userDetail());
+    renderAt("/settings/skills/user/research");
+    await waitFor(() => expect(screen.getByRole("heading", { level: 1, name: "research" })).toBeInTheDocument());
+    expect(screen.getByRole("region", { name: "名称" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "描述" })).toHaveTextContent("研究技能。");
+    expect(screen.getByRole("region", { name: /技能内容/ })).toBeInTheDocument();
+    // 用户技能显示「全局」徽章
+    expect(screen.getByText("全局")).toBeInTheDocument();
   });
 
   it("无效技能显示安全错误且无 Markdown 正文", async () => {
@@ -89,7 +103,7 @@ describe("SkillDetail", () => {
       valid: false, enabled: true, effective: false,
       error: "技能 name 格式无效或与目录名不一致", instructions: null, description: null,
     }));
-    renderAt("/skills/user/broken");
+    renderAt("/settings/skills/user/broken");
     await waitFor(() => expect(screen.getByText(/name 格式无效/)).toBeInTheDocument());
     expect(screen.queryByRole("table")).toBeNull();
     // 活动无效：有停用命令、无启用开关
@@ -99,14 +113,14 @@ describe("SkillDetail", () => {
 
   it("合法用户技能提供开关与删除", async () => {
     mocked.skillDetail.mockResolvedValue(userDetail());
-    renderAt("/skills/user/research");
+    renderAt("/settings/skills/user/research");
     await waitFor(() => expect(screen.getByRole("switch")).toBeInTheDocument());
     expect(screen.getByRole("button", { name: "删除技能" })).toBeInTheDocument();
   });
 
   it("404 时显示不存在并提供返回", async () => {
     mocked.skillDetail.mockRejectedValue(Object.assign(new Error("用户技能不存在"), { status: 404 }));
-    renderAt("/skills/user/absent");
+    renderAt("/settings/skills/user/absent");
     await waitFor(() => expect(screen.getByText(/不存在/)).toBeInTheDocument());
     expect(screen.getByRole("link", { name: /返回技能列表/ })).toBeInTheDocument();
   });
@@ -115,7 +129,7 @@ describe("SkillDetail", () => {
     mocked.skillDetail.mockResolvedValue(userDetail());
     mocked.setSkillEnabled.mockReturnValue(new Promise(() => {}));
     const user = userEvent.setup();
-    renderAt("/skills/user/research");
+    renderAt("/settings/skills/user/research");
     const toggle = await screen.findByRole("switch");
     await user.click(toggle);
     await waitFor(() => expect(toggle).toBeDisabled());
@@ -125,7 +139,7 @@ describe("SkillDetail", () => {
     mocked.skillDetail.mockResolvedValue(userDetail({ enabled: false, effective: false }));
     mocked.deleteSkill.mockResolvedValue({ ok: true });
     const user = userEvent.setup();
-    renderAt("/skills/user/research");
+    renderAt("/settings/skills/user/research");
     await user.click(await screen.findByRole("button", { name: "删除技能" }));
     expect(await screen.findByText(/永久删除/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /确认删除/ }));
@@ -137,7 +151,7 @@ describe("SkillDetail", () => {
     mocked.skillDetail.mockResolvedValue(userDetail({ enabled: false, effective: false }));
     mocked.deleteSkill.mockRejectedValue(new Error("技能目录不可写"));
     const user = userEvent.setup();
-    renderAt("/skills/user/research");
+    renderAt("/settings/skills/user/research");
     await user.click(await screen.findByRole("button", { name: "删除技能" }));
     await user.click(await screen.findByRole("button", { name: /确认删除/ }));
     await waitFor(() => expect(screen.getByText(/技能目录不可写/)).toBeInTheDocument());
@@ -145,7 +159,7 @@ describe("SkillDetail", () => {
   });
 
   it("非法 source 直接拒绝", () => {
-    renderAt("/skills/other/research");
+    renderAt("/settings/skills/other/research");
     expect(screen.getByText(/来源无效/)).toBeInTheDocument();
     expect(mocked.skillDetail).not.toHaveBeenCalled();
   });

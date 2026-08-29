@@ -24,58 +24,58 @@ function SkillCard({
 }) {
   const navigate = useNavigate();
   const isUser = skill.source === "user";
-  const sourceBar = isUser
+  // 启用了却未生效：技能无效，或与内置技能/停用目录冲突
+  const blocked = isUser && skill.enabled && !skill.effective;
+  // 左侧状态条即启停/生效状态（hover 提亮加宽，替代「已加载」标签的冗余信息）
+  const statusBar = isUser
     ? skill.effective
-      ? "bg-success"
+      ? "bg-success/60 group-hover:bg-success"
       : skill.enabled
-        ? "bg-warning"
-        : "bg-border"
-    : "bg-border/60";
+        ? "bg-warning/60 group-hover:bg-warning"
+        : "bg-border/50 group-hover:bg-border"
+    : "bg-border/40 group-hover:bg-border/70";
   return (
     <div
       role="button"
       tabIndex={0}
-      onClick={() => navigate(`/skills/${skill.source}/${encodeURIComponent(skill.name)}`)}
+      onClick={() => navigate(`/settings/skills/${skill.source}/${encodeURIComponent(skill.name)}`)}
       onKeyDown={(event) => {
-        if (event.key === "Enter") navigate(`/skills/${skill.source}/${encodeURIComponent(skill.name)}`);
+        if (event.key === "Enter") navigate(`/settings/skills/${skill.source}/${encodeURIComponent(skill.name)}`);
       }}
       className={cn(
-        "flex min-h-24 cursor-pointer items-stretch gap-3 rounded-xl border border-border/60 bg-card/60 p-4 text-left transition-colors hover:border-border",
+        "group flex min-h-20 cursor-pointer items-stretch gap-3 rounded-xl border border-border/60 bg-card/60 p-4 text-left transition-colors hover:border-border",
         !isUser && "border-border/40",
       )}
     >
-      <span aria-hidden="true" className={cn("w-[3px] shrink-0 rounded-full", sourceBar)} />
+      <span
+        aria-hidden="true"
+        className={cn("w-[3px] shrink-0 rounded-full transition-all group-hover:w-1.5", statusBar)}
+      />
       <div className="flex min-w-0 flex-1 flex-col gap-1.5">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <span className="font-mono text-sm font-semibold break-all text-foreground">{skill.name}</span>
-          {isUser ? (
-            <span
-              className={cn(
-                "rounded px-1.5 py-0.5 text-[11px]",
-                skill.effective ? "bg-success/15 text-success"
-                  : skill.enabled ? "bg-warning/15 text-warning"
-                  : "bg-muted text-muted-foreground",
-              )}
-            >
-              {skill.effective ? "已加载" : skill.enabled ? (skill.valid ? "已停用" : "已阻止") : "已停用"}
+          {blocked && (
+            <span className="rounded bg-warning/15 px-1.5 py-0.5 text-[11px] text-warning">
+              {skill.valid ? "未生效" : "已阻止"}
             </span>
-          ) : (
+          )}
+          {!isUser && (
             <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">内置 · 始终启用</span>
+          )}
+          {isUser && skill.valid && onToggle && (
+            <div className="ml-auto">
+              <SkillToggle
+                checked={skill.enabled}
+                disabled={pending}
+                onCheckedChange={(next) => onToggle(skill, next)}
+                label={skill.enabled ? "已启用" : "已停用"}
+              />
+            </div>
           )}
         </div>
         <p className="line-clamp-2 text-xs leading-relaxed break-words text-muted-foreground">
           {skill.error ?? skill.description ?? "（无描述）"}
         </p>
-        {isUser && skill.valid && onToggle && (
-          <div className="mt-auto pt-1.5">
-            <SkillToggle
-              checked={skill.enabled}
-              disabled={pending}
-              onCheckedChange={(next) => onToggle(skill, next)}
-              label={skill.enabled ? "已启用" : "已停用"}
-            />
-          </div>
-        )}
         {isUser && !skill.valid && skill.enabled && (
           <div className="mt-auto flex items-center gap-2 pt-1.5">
             <Button
@@ -98,7 +98,7 @@ function SkillCard({
               disabled={pending}
               onClick={(event) => {
                 event.stopPropagation();
-                navigate(`/skills/user/${encodeURIComponent(skill.name)}`);
+                navigate(`/settings/skills/user/${encodeURIComponent(skill.name)}`);
               }}
             >
               <Trash2 className="h-4 w-4" />
@@ -222,7 +222,7 @@ export function Skills() {
         onImported={() => {
           setImportOpen(false);
           void load();
-          navigate("/skills");
+          navigate("/settings/skills");
         }}
       />
     </div>

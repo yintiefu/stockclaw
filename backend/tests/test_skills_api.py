@@ -110,6 +110,7 @@ class TestDetail:
         assert response.status_code == 200
         body = response.json()
         assert body["path"] == "/user/sample/SKILL.md"
+        assert body["location"] == str(manager.active_root / "sample" / "SKILL.md")
         assert body["instructions"].startswith("---\nname: sample")
         assert body["source"] == "user"
 
@@ -118,6 +119,7 @@ class TestDetail:
         response = client.get("/api/skills/builtin/builtin-skill")
         assert response.status_code == 200
         assert response.json()["path"].startswith("/builtin/builtin-skill/")
+        assert response.json()["location"].endswith("/builtin-skill/SKILL.md")
 
     def test_invalid_detail_has_null_instructions_and_body(self, manager, monkeypatch) -> None:
         write_skill(manager.active_root / "broken", "mismatched-name")

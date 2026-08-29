@@ -41,10 +41,10 @@ function sampleResponse(overrides: Partial<SkillsResponse> = {}): SkillsResponse
 
 function renderPage() {
   return render(
-    <MemoryRouter initialEntries={["/skills"]}>
+    <MemoryRouter initialEntries={["/settings/skills"]}>
       <Routes>
-        <Route path="/skills" element={<Skills />} />
-        <Route path="/skills/:source/:name" element={<div>详情页</div>} />
+        <Route path="/settings/skills" element={<Skills />} />
+        <Route path="/settings/skills/:source/:name" element={<div>详情页</div>} />
       </Routes>
     </MemoryRouter>,
   );
@@ -112,6 +112,29 @@ describe("Skills 列表页", () => {
     expect(screen.getByText(/已阻止/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "停用" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "删除技能" })).toBeInTheDocument();
+  });
+
+  it("启停状态只由开关表达：无「已加载」标签，冲突卡显示未生效徽章", async () => {
+    mocked.skills.mockResolvedValue(sampleResponse({
+      user: [
+        {
+          name: "research", description: "研究技能。", source: "user",
+          enabled: true, valid: true, effective: true, error: null,
+        },
+        {
+          name: "conflict", description: "与内置同名。", source: "user",
+          enabled: true, valid: true, effective: false, error: "与内置技能同名，已阻止加载",
+        },
+      ],
+    }));
+    renderPage();
+    await waitFor(() => expect(screen.getByText("research")).toBeInTheDocument());
+    // 生效状态由开关表达，不再有冗余标签
+    expect(screen.queryByText("已加载")).toBeNull();
+    // 启用但未生效（冲突）→ 警示徽章 + 正文显示冲突原因
+    expect(screen.getByText("未生效")).toBeInTheDocument();
+    expect(screen.getByText(/与内置技能同名/)).toBeInTheDocument();
+    expect(screen.getAllByRole("switch")).toHaveLength(2);
   });
 
   it("卡片点击进入详情，开关点击不导航", async () => {

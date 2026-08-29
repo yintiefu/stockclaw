@@ -311,6 +311,8 @@ export interface SkillSummary {
 }
 export interface SkillDetail extends SkillSummary {
   path: string;
+  /** 真实磁盘路径（宿主机上的 SKILL.md 位置）；path 是 agent 沙箱内的虚拟路径 */
+  location: string | null;
   instructions: string | null;
 }
 export interface SkillsResponse {

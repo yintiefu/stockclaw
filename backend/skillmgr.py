@@ -150,6 +150,10 @@ class SkillManager:
         self._user_error = user_error
 
     @property
+    def builtin_root(self) -> Path:
+        return self._builtin_root
+
+    @property
     def active_root(self) -> Path:
         self._require_roots()
         assert self._roots is not None
@@ -292,6 +296,7 @@ class SkillManager:
                 enabled=True, valid=True, effective=True, error=None,
             )
             summary["path"] = f"/builtin/{name}/SKILL.md"
+            summary["location"] = str(directory / "SKILL.md")
             summary["instructions"] = parsed.instructions
             return summary
 
@@ -328,6 +333,7 @@ class SkillManager:
             enabled=in_active, valid=valid, effective=effective, error=error,
         )
         summary["path"] = f"/user/{name}/SKILL.md"
+        summary["location"] = str(directory / "SKILL.md")
         summary["instructions"] = instructions
         return summary
 

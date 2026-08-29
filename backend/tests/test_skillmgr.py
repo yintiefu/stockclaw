@@ -125,6 +125,7 @@ class TestDetail:
         write_skill(manager.active_root / "sample", "sample")
         detail = manager.get_skill("user", "sample")
         assert detail["path"] == "/user/sample/SKILL.md"
+        assert detail["location"] == str(manager.active_root / "sample" / "SKILL.md")
         assert detail["instructions"] == (manager.active_root / "sample" / "SKILL.md").read_text(encoding="utf-8")
         assert detail["source"] == "user"
         assert detail["enabled"] is True
@@ -132,6 +133,7 @@ class TestDetail:
     def test_get_builtin_detail_uses_builtin_namespace(self, manager: SkillManager) -> None:
         detail = manager.get_skill("builtin", "builtin-skill")
         assert detail["path"].startswith("/builtin/builtin-skill/")
+        assert detail["location"] == str(manager.builtin_root / "builtin-skill" / "SKILL.md")
         assert detail["enabled"] is True
         assert detail["error"] is None
 
