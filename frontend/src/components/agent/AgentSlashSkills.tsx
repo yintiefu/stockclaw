@@ -8,8 +8,7 @@
  *
  * 空候选或整消息级保留命令时不挂 Action（behavior 是弹层 open 的必要条件），
  * Enter 回退 Composer 自带发送——裸命令与含「 /词」的普通消息不被吞键。 */
-import { useEffect, useMemo, useState } from "react";
-import {
+import { useEffect, useMemo, useState } from "react";import {
   ComposerPrimitive,
   unstable_useTriggerPopoverScopeContextOptional,
   useAuiState,
@@ -133,6 +132,24 @@ function SkillPopoverBehavior({ adapter }: { adapter: SkillSlashAdapter }) {
   // reactive 全文（store 官方范例选择器）：保留命令按整消息 trim 判定，
   // 与后端 content.strip() 语义一致——不能读 DOM 快照，前导空白会漏判
   const composerText = useAuiState((s) => s.composer.text);
+  const open = scope?.open ?? false;
+  const close = scope?.close;
+
+  // 点弹层与输入框之外的页面区域收起（框架只内置 Esc，无 outside dismiss）。
+  // close() 与 Esc 同路径：caret 移回 / 之前使检测失效，composer 文本不动。
+  useEffect(() => {
+    if (!open || !close) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target;
+      if (!(target instanceof Element)) return;
+      if (target.closest('[role="listbox"]')) return;
+      if (target.closest(".aui-composer-root")) return;
+      close();
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    return () => document.removeEventListener("pointerdown", onPointerDown, true);
+  }, [open, close]);
+
   if (!scope) return null;
   const query = scope.query.trim();
   if (isReservedCommand(query, composerText) || adapter.search(query).length === 0) {

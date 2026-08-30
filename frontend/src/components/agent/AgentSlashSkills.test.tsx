@@ -192,6 +192,30 @@ describe("AgentThread 斜杠技能弹层", () => {
     });
   });
 
+  it("点击弹层与输入框之外的页面区域收起弹层，输入文本保留", async () => {
+    const user = userEvent.setup();
+    const input = await renderAgent();
+    await user.type(input, "/");
+    expect(screen.getByRole("listbox", { name: "技能命令" })).toBeVisible();
+    // 线程视口在 composer root 之外，视为弹层外
+    const viewport = document.querySelector('[data-slot="aui_thread-viewport"]');
+    expect(viewport).not.toBeNull();
+    fireEvent.pointerDown(viewport!);
+    await waitFor(() => {
+      expect(screen.queryByRole("listbox")).toBeNull();
+    });
+    expect(input).toHaveValue("/");
+  });
+
+  it("点击输入框本身不收起弹层", async () => {
+    const user = userEvent.setup();
+    const input = await renderAgent();
+    await user.type(input, "/");
+    expect(screen.getByRole("listbox", { name: "技能命令" })).toBeVisible();
+    fireEvent.pointerDown(input);
+    expect(screen.getByRole("listbox", { name: "技能命令" })).toBeVisible();
+  });
+
   it("零匹配：弹层不出现，Enter 直接发送（含输入+回车最小间隙的单次调用回归）", async () => {
     const user = userEvent.setup();
     const input = await renderAgent();
