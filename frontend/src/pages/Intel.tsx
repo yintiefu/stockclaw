@@ -36,8 +36,9 @@ function InvestmentNewsPanel() {
   const [runIndustry, setRunIndustry] = useState<string | null>(null);
   const [bulk, setBulk] = useState<{ running: boolean; done: number; total: number }>({ running: false, done: 0, total: 0 });
 
-  // 资讯提炼工作流：把当前赛道已加载的新闻快照交给 news_digest 图，不让图再抓数据。
-  // thread 按 subject=<industry.key> 隔离，历史只在对应赛道下查看。
+  // 资讯提炼工作流：只传赛道 key，资讯由 news_digest 图的 dossier 确定性调用
+  // query_news_radar 抓取（读雷达缓存）。thread 按 subject=<industry.key> 隔离，
+  // 历史只在对应赛道下查看。
   const digestRun = useWorkflowRun({ assistantId: "news_digest" });
 
   useEffect(() => {
@@ -56,10 +57,13 @@ function InvestmentNewsPanel() {
   const hasData = !!data?.generated_at;
 
   const genDigest = async (ind: Industry) => {
+    if (ind.items.length === 0) {
+      setDigests((d) => ({ ...d, [ind.key]: { err: `近 ${data?.recent_days ?? 7} 天「${ind.name}」赛道暂无更新，无需提炼` } }));
+      return;
+    }
     setRunIndustry(ind.key);
-    const ctx = ind.items.slice(0, 25).map((it) => `[${it.time}] ${it.source}｜${it.zh || it.title}`).join("\n");
     const outcome = await digestRun.start({
-      input: { news_snapshot: ctx },
+      input: { track: ind.key },
       metadata: { title: `${ind.name} 今日要点`, subject: ind.key },
     });
     if (outcome.error) {
@@ -176,12 +180,9 @@ function InvestmentNewsPanel() {
                     onOpen={(_thread, state) => {
                       setDigests((d) => ({ ...d, [cur.key]: { text: stageContent(state ?? EMPTY_STATE, "news_digest") ?? "" } }));
                     }}
-                    onRerun={(_thread, state) => {
-                      const snapshot = typeof state.input?.news_snapshot === "string"
-                        ? state.input.news_snapshot
-                        : cur.items.slice(0, 25).map((it) => `[${it.time}] ${it.source}｜${it.zh || it.title}`).join("\n");
+                    onRerun={(_thread, _state) => {
                       void digestRun.start({
-                        input: { news_snapshot: snapshot },
+                        input: { track: cur.key },
                         metadata: { title: `${cur.name} 今日要点`, subject: cur.key },
                       }).then((outcome) => {
                         if (outcome.error) {

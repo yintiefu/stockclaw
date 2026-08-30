@@ -148,11 +148,14 @@ def _resolve_args(args: dict[str, Any], input_dict: dict[str, Any]) -> dict[str,
 
 
 async def collect_dossier_sections(
-    code: str,
+    input_values: dict[str, Any],
     config: DossierConfig,
 ) -> tuple[list[DossierSection], list[str]]:
-    """确定性执行底稿抓取并直发进度事件（custom 通道，可丢弃）。"""
-    input_dict = {"code": code}
+    """确定性执行底稿抓取并直发进度事件（custom 通道，可丢弃）。
+
+    input_values 是工作流 input 通道的完整值，section.args 里的
+    ${input.<field>} 模板从这里解析。"""
+    input_dict = input_values
     all_sections: list[DossierSection] = []
     total_count = len(config.sections)
     loaded_count = 0

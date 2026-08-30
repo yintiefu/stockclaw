@@ -98,8 +98,8 @@ TOOLS: list[dict] = [
        {"scope": {"type": "string", "enum": ["indices", "global", "emotion", "turnover", "overview"],
                   "description": "要查的范围，默认 overview"}}),
     _t("query_news_radar",
-       "查资讯雷达：12 条赛道的行业资讯聚合（非个股新闻，看产业面动态用）。可传 track 只看某条赛道（如「半导体」「AI」）。",
-       {"track": {"type": "string", "description": "赛道名关键词，留空看全部"},
+       "查资讯雷达：12 条赛道的行业资讯聚合（非个股新闻，看产业面动态用）。可传 track 只看某条赛道（如 key「ai」「semi」或名称「半导体」「AI」）。",
+       {"track": {"type": "string", "description": "赛道 key（如 ai）或赛道名关键词，留空看全部"},
         "per_track": {"type": "integer", "description": "每条赛道取最新几条，默认 5"}}),
 
     # —— 产业信号 ——
@@ -398,16 +398,17 @@ def _gpu_rent(args: dict):
 
 def _radar(args: dict):
     """资讯雷达：数据按 12 条赛道分组，这里摊平成一张扁平清单（每条带赛道名）方便模型阅读。
-    可传 track 只看某条赛道；每赛道取最新若干条，避免 12×几十条把上下文吃光。"""
+    可传 track 只看某条赛道（key 精确匹配或名称关键词子串匹配）；每赛道取最新若干条，
+    避免 12×几十条把上下文吃光。"""
     d = newsradar.get_radar(force=False) or {}
     want = str(args.get("track") or "").strip()
-    per = max(1, min(int(args.get("per_track") or 5), 20))
+    per = max(1, min(int(args.get("per_track") or 5), 25))
     out, total = [], 0
     for ind in d.get("industries") or []:
         name = ind.get("name", "")
         items = ind.get("items") or []
         total += len(items)
-        if want and want not in name:
+        if want and want != ind.get("key") and want not in name:
             continue
         for it in items[:per]:
             out.append({"track": name, "title": it.get("title"),

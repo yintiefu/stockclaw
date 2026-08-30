@@ -358,9 +358,8 @@ test("每日复盘与资讯提炼消费页面快照并展示各自历史", async
   const digests = await searchThreads({ channel: "workflow", workflow_type: "news_digest", subject: "ai" });
   expect(digests.length).toBe(1);
   const digestState = await threadState(digests[0].thread_id);
-  const snapshot = (digestState.values.input as Record<string, unknown>)?.news_snapshot;
-  expect(String(snapshot)).toContain("AI news one");
-  expect(String(snapshot)).not.toContain("Energy news");
+  // 图只吃赛道 key：资讯由后端 dossier 抓取，前端不再拼接快照
+  expect((digestState.values.input as Record<string, unknown>)?.track).toBe("ai");
 });
 
 // ---------------------------------------------------------------- T10 设置页只读脱敏

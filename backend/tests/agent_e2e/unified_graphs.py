@@ -32,6 +32,10 @@ FAKE_TOOL_RESULTS: dict[str, object] = {
     "query_concepts": {},  # 制造一个真实数据缺口：页面应显示「未取到」
     "query_reports": [{"date": "2026-08-18", "title": "确定性研报标题"}],
     "query_news": [{"发布时间": "2026-08-25", "新闻标题": "确定性新闻标题"}],
+    "query_news_radar": {"generated_at": "2026-08-25 11:00", "total_cached": 2,
+                         "tracks": ["AI 算力", "能源"],
+                         "items": [{"track": "AI 算力", "title": "AI news one",
+                                    "time": "08-24", "source": "源A"}]},
 }
 
 

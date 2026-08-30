@@ -13,7 +13,7 @@ from agent.skill_backends import BUILTIN_SKILLS_DIR
 from agent.skill_catalog import SkillValidationError, parse_skill_file
 
 HARD_LIMITS: dict[str, int] = {
-    "section_chars": 4000,
+    "section_chars": 8000,
     "dossier_summary_chars": 12000,
     "stage_output_chars": 4000,
     "stage_context_chars": 60000,
@@ -25,6 +25,8 @@ HARD_LIMITS: dict[str, int] = {
 # 加载器只负责通用 schema 校验（工具注册名、参数引用、预算上限等）。
 
 _INPUT_REFERENCE_RE = re.compile(r"^\$\{input\.([A-Za-z_][A-Za-z0-9_]*)\}$")
+# subject 模板允许内联混排文字，逐段校验每个 ${...} 片段
+_TEMPLATE_FRAGMENT_RE = re.compile(r"\$\{[^}]*\}")
 _BUILTIN_SKILL_RE = re.compile(r"^builtin/[a-z0-9][a-z0-9-]*$")
 _CONTEXT_NAMES = frozenset({"dossier", "dossier.summary", "dossier.missing", "stages"})
 
@@ -79,6 +81,8 @@ class StagedResearchConfig(BaseModel):
     id: str
     kind: Literal["staged_research"] = "staged_research"
     result_stage: str
+    # 阶段用户消息中的分析主体模板（内联 ${input.<field>}）；缺省回退「标的 ${input.code}」
+    subject: str | None = None
     input: dict[str, InputFieldConfig]
     dossier: DossierConfig
     stages: list[StageConfig]
@@ -212,6 +216,14 @@ def _validate_staged_config(cfg: StagedResearchConfig, skills_root: Path) -> Non
             re.compile(input_cfg.pattern)
         except re.error:
             raise _config_error(f"input.{name}.pattern", "不是有效正则表达式") from None
+
+    if cfg.subject is not None:
+        for fragment in _TEMPLATE_FRAGMENT_RE.findall(cfg.subject):
+            match = _INPUT_REFERENCE_RE.fullmatch(fragment)
+            if match is None:
+                raise _config_error("subject", "只支持 ${input.<field>} 引用")
+            if match.group(1) not in cfg.input:
+                raise _config_error("subject", "input 引用指向未声明字段")
 
     section_ids = [section.id for section in cfg.dossier.sections]
     if len(section_ids) != len(set(section_ids)):

@@ -1,9 +1,34 @@
 schema_version: 1
-config_version: 2
+config_version: 3
 id: news_digest
-kind: single_pass
-skill: builtin/news-digest
-instruction: SKILL.md
+kind: staged_research
+result_stage: news_digest
+# 前端只传赛道 key；资讯由 dossier 确定性调用 query_news_radar 从雷达缓存抓取
+subject: "资讯赛道（track=${input.track}）"
 input:
-  text_field: news_snapshot
-  max_chars: 24000
+  track:
+    type: string
+    pattern: "^[a-z][a-z0-9_-]*$"
+dossier:
+  section_chars: 6000
+  dossier_summary_chars: 2000
+  sections:
+    - id: news_radar
+      tool: query_news_radar
+      title: 赛道资讯
+      args:
+        track: "${input.track}"
+        per_track: 25
+      empty_policy: gap_if_empty
+stages:
+  - id: news_digest
+    label: 资讯要点提炼
+    skill: builtin/news-digest
+    instruction: SKILL.md
+    context: [dossier]
+    on_error: fail
+    output_chars: 4000
+    context_chars: 24000
+variants:
+  standard:
+    - news_digest
