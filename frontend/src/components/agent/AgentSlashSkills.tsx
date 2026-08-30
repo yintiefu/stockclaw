@@ -168,7 +168,7 @@ export function ComposerSlashPopover({
               item={item}
               index={i}
               onMouseDown={(e) => e.preventDefault()} // 阻止焦点离开输入框（combobox 惯例）
-              className="data-highlighted:bg-accent data-highlighted:text-accent-foreground flex w-full cursor-pointer flex-col items-start gap-0.5 rounded-lg px-3 py-2 text-left text-sm outline-none select-none"
+              className="data-highlighted:bg-muted flex w-full cursor-pointer flex-col items-start gap-0.5 rounded-lg px-3 py-2 text-left text-sm outline-none select-none"
             >
               <span className="text-primary font-medium">/{item.label}</span>
               {item.description ? (
