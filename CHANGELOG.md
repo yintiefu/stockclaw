@@ -3,6 +3,21 @@
 本项目的版本号唯一来源是 `frontend/package.json`；后端 HTTP API、`/api/health`、
 前端界面与 MCP `serverInfo` 全部从它读取（见 `backend/version.py`）。
 
+## 未发布 — 2026-08-30：资讯提炼改为 Skill+tools 组合（dossier 确定性抓取）
+
+- `news_digest` 从 `single_pass` 改为 `staged_research`（config_version 2→3）：前端只传
+  `{track: <赛道 key>}`，不再拼接资讯快照；资讯由工作流 dossier 确定性调用
+  `query_news_radar`（读雷达缓存，`per_track: 25`）抓取，阶段照旧不绑定工具，
+  输出结构沿用 `builtin/news-digest` SKILL.md。
+- `query_news_radar` 的 `track` 支持按赛道 key 精确匹配（原仅中文名子串匹配），
+  `per_track` 钳制上限 20→25。
+- staged 运行时泛化：`collect_dossier_sections` 改接收整个 input dict（原写死
+  `{"code": ...}`），`${input.<field>}` 对任意声明输入字段生效；新增可选 `subject`
+  模板字段（内联 `${input.*}` 引用，缺省保持 debate「针对标的 <code>」旧文案）；
+  底稿全空熔断文案按工作流 id 通用化；`HARD_LIMITS.section_chars` 4000→8000。
+- 旧线程兼容：提炼历史仍可查看，「重新运行」按当前赛道发起新 run；对旧
+  config_version 线程的 resume 被 `auto_resume` 门控按设计拒绝。
+
 ## 未发布 — 2026-08-29：技能启停机制改为 frontmatter `enabled` 字段
 
 - 启用/停用不再移动技能目录：由 SKILL.md frontmatter 的可选布尔字段 `enabled`

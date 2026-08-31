@@ -373,8 +373,21 @@ def test_load_all_production_workflows_returns_four_configs() -> None:
     assert configs["reflection"].input.text_field == "source"
     assert isinstance(configs["daily_review"], SinglePassConfig)
     assert configs["daily_review"].input.text_field == "market_snapshot"
-    assert isinstance(configs["news_digest"], SinglePassConfig)
-    assert configs["news_digest"].input.text_field == "news_snapshot"
+
+    # news_digest：staged_research，前端只传赛道 key，资讯由底稿确定性抓取
+    news_digest = configs["news_digest"]
+    assert isinstance(news_digest, StagedResearchConfig)
+    assert news_digest.config_version == 3
+    assert news_digest.subject == "资讯赛道（track=${input.track}）"
+    assert set(news_digest.input.keys()) == {"track"}
+    assert news_digest.result_stage == "news_digest"
+    assert [s.id for s in news_digest.stages] == ["news_digest"]
+    assert [(s.id, s.tool, s.args) for s in news_digest.dossier.sections] == [
+        ("news_radar", "query_news_radar", {"track": "${input.track}", "per_track": 25}),
+    ]
+    validate_staged_input(news_digest, {"track": "ai"})
+    with pytest.raises(ValueError, match="input.track"):
+        validate_staged_input(news_digest, {"track": "AI 大模型"})
 
 
 def test_production_skills_contain_neutral_boundaries() -> None:
@@ -685,3 +698,31 @@ def test_workflow_loader_does_not_import_private_skill_helpers() -> None:
     source = Path(workflow_loader.__file__).read_text(encoding="utf-8")
     assert "_parse_skill_metadata" not in source
     assert "_validate_skill_name" not in source
+
+
+def test_accept_subject_with_inline_input_reference() -> None:
+    doc = yaml.safe_load((PRODUCTION_WORKFLOWS_DIR / "debate.yaml").read_text(encoding="utf-8"))
+    doc["id"] = "good_subject"
+    doc["subject"] = "标的 ${input.code}（六位代码）"
+
+    cfg = validate_workflow_config(doc, workflow_id="good_subject")
+    assert isinstance(cfg, StagedResearchConfig)
+    assert cfg.subject == "标的 ${input.code}（六位代码）"
+
+
+def test_reject_subject_referencing_undeclared_input() -> None:
+    doc = yaml.safe_load((PRODUCTION_WORKFLOWS_DIR / "debate.yaml").read_text(encoding="utf-8"))
+    doc["id"] = "bad_subject"
+    doc["subject"] = "赛道（${input.track}）"
+
+    with pytest.raises(WorkflowConfigError, match="subject"):
+        validate_workflow_config(doc, workflow_id="bad_subject")
+
+
+def test_reject_subject_with_malformed_template_fragment() -> None:
+    doc = yaml.safe_load((PRODUCTION_WORKFLOWS_DIR / "debate.yaml").read_text(encoding="utf-8"))
+    doc["id"] = "bad_subject_frag"
+    doc["subject"] = "标的（code=${input.code}、源=${source}）"
+
+    with pytest.raises(WorkflowConfigError, match="subject"):
+        validate_workflow_config(doc, workflow_id="bad_subject_frag")

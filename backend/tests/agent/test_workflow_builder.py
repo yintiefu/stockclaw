@@ -654,3 +654,64 @@ async def test_resume_rejected_on_empty_checkpoint():
     assert result["workflow_status"] == "failed"
     assert result["errors"][0].message == "该工作流没有可恢复的状态：请重新发起工作流"
     assert result["errors"][0].code == "RESUME_NO_STATE"
+
+
+# ---------------------------------------------------------------------------
+# news_digest（staged_research：前端只传 track，底稿确定性抓取）
+# ---------------------------------------------------------------------------
+
+NEWS_DIGEST_YAML = WORKFLOWS_DIR / "news_digest.yaml"
+
+
+def _news_digest_cfg():
+    return load_workflow_config_from_file(NEWS_DIGEST_YAML, builtin_skills_root=BUILTIN_SKILLS_DIR)
+
+
+def _human_text(invocation) -> str:
+    return str(next(m for m in invocation if getattr(m, "type", "") == "human").content)
+
+
+@pytest.mark.asyncio
+async def test_debate_subject_default_keeps_legacy_wording():
+    """debate 未声明 subject：用户消息保持「针对标的 <code>」旧文案（防回归）。"""
+    model = StageAwareModel(replies=[])
+    graph = build_workflow_graph(_debate_cfg(), model=model,
+                                 checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
+    await graph.ainvoke({"input": {"code": "600519"}, "variant": "standard"}, config=_thread("t-subj"))
+    assert "针对标的 600519 进行分析并输出。" in _human_text(model.invocations[0])
+
+
+@pytest.mark.asyncio
+async def test_news_digest_staged_fetches_track_and_completes():
+    """dossier 按 ${input.track} 抓资讯，subject 解析进用户消息，阶段正文落 messages。"""
+    model = ScriptedChatModel([AIMessage(content="资讯要点脚本输出")])
+    graph = build_workflow_graph(_news_digest_cfg(), model=model,
+                                 checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
+    result = await graph.ainvoke({"input": {"track": "ai"}}, config=_thread("nd1"))
+
+    assert result["workflow_status"] == "completed"
+    stage = result["stages"]["news_digest"]
+    assert stage.status == "completed"
+    assert message_text(next(m for m in result["messages"] if m.id == stage.message_id)) == "资讯要点脚本输出"
+
+    # 用户消息：subject 模板解析（不再是前端拼接的快照正文）
+    assert "针对资讯赛道（track=ai）进行分析并输出。" in _human_text(model.invocations[0])
+    # 底稿正文进入系统提示上下文
+    assert "确定性资讯标题" in _system_text(model.invocations[0])
+
+
+@pytest.mark.asyncio
+async def test_news_digest_empty_track_aborts_without_model_calls(monkeypatch):
+    """赛道无资讯（底稿空）：熔断进 failed 终态，绝不调用模型。"""
+    import tools as legacy_tools
+
+    monkeypatch.setattr(legacy_tools, "exec_tool", lambda name, args: {"items": [], "tracks": []})
+    model = ScriptedChatModel([AIMessage(content="不应被调用")])
+    graph = build_workflow_graph(_news_digest_cfg(), model=model,
+                                 checkpointer=InMemorySaver(), builtin_skills_root=BUILTIN_SKILLS_DIR)
+    result = await graph.ainvoke({"input": {"track": "space"}}, config=_thread("nd2"))
+
+    assert result["workflow_status"] == "failed"
+    assert any(err.code == "NO_SUBSTANTIVE_DATA" for err in result["errors"])
+    assert result["result_summary"] == "news_digest 中止：无客观数据底稿"
+    assert model.invocations == []

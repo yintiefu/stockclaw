@@ -87,7 +87,7 @@ async def test_collect_dossier_preserves_order_and_handles_policies(monkeypatch)
         ],
     )
 
-    sections, missing = await collect_dossier_sections("600519", dossier_cfg)
+    sections, missing = await collect_dossier_sections({"code": "600519"}, dossier_cfg)
 
     # Check preserved order
     assert [s.id for s in sections] == ["quote", "margin", "fin"]
@@ -142,7 +142,7 @@ async def test_collect_dossier_section_respects_tiny_limit(monkeypatch):
         )],
     )
 
-    sections, _ = await collect_dossier_sections("600519", dossier_cfg)
+    sections, _ = await collect_dossier_sections({"code": "600519"}, dossier_cfg)
 
     assert len(sections[0].body) <= 1
 
@@ -286,9 +286,33 @@ async def test_collect_dossier_emits_progress_directly(monkeypatch):
         sections=[DossierSectionConfig(id="q", tool="query_quote",
                                        args={"codes": ["${input.code}"]}, empty_policy="gap_if_empty")],
     )
-    sections, missing = await collect_dossier_sections("600519", config)
+    sections, missing = await collect_dossier_sections({"code": "600519"}, config)
     assert emitted and emitted[0][0] == "q"
     assert sections[0].status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_collect_dossier_resolves_non_code_input_fields(monkeypatch):
+    """非 code 输入（如 news_digest 的 track）同样能解析 ${input.<field>} 模板。"""
+    captured: dict[str, dict] = {}
+
+    def fake_tool(name, args):
+        captured[name] = args
+        return {"items": [{"title": "确定性资讯"}]}
+
+    monkeypatch.setattr(legacy_tools, "exec_tool", fake_tool)
+    config = DossierConfig(
+        section_chars=1000, dossier_summary_chars=1000,
+        sections=[DossierSectionConfig(
+            id="news_radar", tool="query_news_radar",
+            args={"track": "${input.track}", "per_track": 25}, empty_policy="gap_if_empty",
+        )],
+    )
+
+    sections, missing = await collect_dossier_sections({"track": "ai"}, config)
+    assert captured["query_news_radar"] == {"track": "ai", "per_track": 25}
+    assert sections[0].status == "completed"
+    assert missing == []
 
 
 def test_build_stage_messages_budgets_the_final_serialized_prompt() -> None:

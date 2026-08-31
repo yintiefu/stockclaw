@@ -108,6 +108,12 @@ beforeEach(() => {
         accent: "#08f",
         items: [{ time: "08-25", source: "源C", title: "Energy news", url: "https://example.com/3" }],
       },
+      {
+        key: "space",
+        name: "航天",
+        accent: "#8f8",
+        items: [],
+      },
     ],
   } as never);
   mocked.searchWorkflowHistory.mockResolvedValue([]);
@@ -123,7 +129,7 @@ async function renderIntelWithRadar() {
 }
 
 describe("Intel news digest workflow", () => {
-  it("sends the industry's already-loaded news snapshot", async () => {
+  it("sends only the industry track key (dossier fetches news server-side)", async () => {
     await renderIntelWithRadar();
 
     await userEvent.click(screen.getByRole("button", { name: "让 AI 提炼今日要点" }));
@@ -131,9 +137,17 @@ describe("Intel news digest workflow", () => {
     await waitFor(() => expect(runMock.start).toHaveBeenCalled());
     const params = runMock.start.mock.calls[0]?.[0];
     expect(params?.metadata).toEqual({ title: "AI 算力 今日要点", subject: "ai" });
-    expect(params?.input.news_snapshot).toContain("AI news one");
-    expect(params?.input.news_snapshot).toContain("AI news two");
-    expect(params?.input.news_snapshot).not.toContain("Energy news");
+    expect(params?.input).toEqual({ track: "ai" });
+  });
+
+  it("does not start a run for an empty track", async () => {
+    await renderIntelWithRadar();
+
+    await userEvent.click(screen.getByRole("button", { name: /航天/ }));
+    await userEvent.click(screen.getByRole("button", { name: "让 AI 提炼今日要点" }));
+
+    expect(runMock.start).not.toHaveBeenCalled();
+    expect(await screen.findByText(/暂无更新，无需提炼/)).toBeInTheDocument();
   });
 
   it("renders the digest markdown with save-note preserved", async () => {

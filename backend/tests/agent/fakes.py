@@ -161,6 +161,10 @@ FAKE_TOOL_RESULTS: dict[str, object] = {
     "query_concepts": {},
     "query_reports": [{"date": "2026-08-18", "title": "确定性研报标题"}],
     "query_news": [{"发布时间": "2026-08-25", "新闻标题": "确定性新闻标题"}],
+    "query_news_radar": {"generated_at": "2026-08-30 08:00", "total_cached": 40,
+                         "tracks": ["AI / 大模型"],
+                         "items": [{"track": "AI / 大模型", "title": "确定性资讯标题",
+                                    "time": "08-30 08:00", "source": "脚本源"}]},
 }
 
 

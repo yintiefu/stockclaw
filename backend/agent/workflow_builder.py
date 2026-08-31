@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,19 @@ def _load_instruction_text(skill_name: str, instruction_path: str, root: Path) -
 def _is_resume(state: WorkflowState) -> bool:
     """resume 走独立顶层通道，绝不动 input（原始 code/source 必须跨重试保留）。"""
     return state.get("resume") is True
+
+
+_SUBJECT_REF_RE = re.compile(r"\$\{input\.([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _stage_user_text(subject: str | None, input_values: dict[str, Any]) -> str:
+    """构造阶段用户消息：subject 模板内联替换 ${input.<field>}；未声明时保持
+    旧语义（标的 = input.code），debate 提示词逐字节不变。"""
+    if subject is None:
+        code = input_values.get("code", "")
+        return f"请基于允许的客观底稿与前序上下文，针对标的 {code} 进行分析并输出。"
+    resolved = _SUBJECT_REF_RE.sub(lambda m: str(input_values.get(m.group(1), "")), subject)
+    return f"请基于允许的客观底稿与前序上下文，针对{resolved}进行分析并输出。"
 
 
 def _resume_rejection(state: WorkflowState, expected_version: int) -> WorkflowError | None:
@@ -172,8 +186,7 @@ def _build_staged_graph(
 
     # 2. 收集底稿节点
     async def collect_dossier(state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
-        code = state["input"]["code"]
-        sections, missing = await collect_dossier_sections(code, cfg.dossier)
+        sections, missing = await collect_dossier_sections(state.get("input", {}), cfg.dossier)
         summary = summarize_dossier(sections, missing, cfg.dossier.dossier_summary_chars)
         dossier_res = DossierResult(
             sections=sections,
@@ -195,7 +208,7 @@ def _build_staged_graph(
         return {
             "workflow_status": "failed",
             "completed_at": utc_now(),
-            "result_summary": "多空辩论中止：无客观底稿数据",
+            "result_summary": f"{cfg.id} 中止：无客观数据底稿",
             "errors": [err],
         }
 
@@ -233,12 +246,12 @@ def _build_staged_graph(
                     preceding_ids.append(vid)
 
                 try:
-                    code = state.get("input", {}).get("code", "")
+                    user_text = _stage_user_text(cfg.subject, state.get("input", {}))
                     messages, context_truncated = build_stage_messages(
                         workflow_id=cfg.id,
                         stage=stage_config,
                         instruction_text=instr,
-                        user_text=f"请基于允许的客观底稿与前序上下文，针对标的 {code} 进行分析并输出。",
+                        user_text=user_text,
                         dossier=dossier,
                         stages=state.get("stages", {}),
                         preceding_stage_ids=preceding_ids,

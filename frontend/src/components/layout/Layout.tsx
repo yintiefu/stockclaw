@@ -81,9 +81,12 @@ export function Layout() {
     });
   };
 
-  useEffect(() => {
-    storageSet("vr-sidebar", collapsed ? "collapsed" : "expanded");
-  }, [collapsed]);
+  // 偏好只在用户主动切换时持久化：首渲不创建 key；Agent 窄页的临时折叠
+  // （effectiveCollapsed 的视口分量）不改写偏好。
+  const toggleCollapsed = (next: boolean) => {
+    setCollapsed(next);
+    storageSet("vr-sidebar", next ? "collapsed" : "expanded");
+  };
 
   const [constrainedAgentWidth, setConstrainedAgentWidth] = useState(() =>
     typeof window !== "undefined"
@@ -194,7 +197,7 @@ export function Layout() {
               <a href={X_URL} target="_blank" rel="noreferrer" className="rounded p-1.5 text-muted-foreground transition-colors hover:text-foreground" title="联系作者 · X @linsizhen">
                 <UserRound className="h-4 w-4" />
               </a>
-              <button onClick={() => setCollapsed(false)} className="rounded p-1.5 text-muted-foreground transition-colors hover:text-foreground" title="展开">
+              <button onClick={() => toggleCollapsed(false)} className="rounded p-1.5 text-muted-foreground transition-colors hover:text-foreground" title="展开">
                 <ChevronsRight className="h-4 w-4" />
               </button>
             </>
@@ -212,7 +215,7 @@ export function Layout() {
                   <a href={REPO_URL} target="_blank" rel="noreferrer" className="text-muted-foreground transition-colors hover:text-foreground" title="GitHub">
                     <Github className="h-3.5 w-3.5" />
                   </a>
-                  <button onClick={() => setCollapsed(true)} className="rounded p-1 text-muted-foreground transition-colors hover:text-foreground" title="收起">
+                  <button onClick={() => toggleCollapsed(true)} className="rounded p-1 text-muted-foreground transition-colors hover:text-foreground" title="收起">
                     <ChevronsLeft className="h-3.5 w-3.5" />
                   </button>
                 </div>
